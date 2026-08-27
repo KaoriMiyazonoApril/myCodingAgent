@@ -38,7 +38,12 @@ class WorkspaceFilesystem:
         if candidate.is_absolute():
             raise ToolOperationError("WORKSPACE_ESCAPE", "absolute paths are not allowed")
 
-        target = (self.root / candidate).resolve()
+        try:
+            target = (self.root / candidate).resolve()
+        except RuntimeError as error:
+            raise ToolOperationError("WORKSPACE_ESCAPE", "path cannot be resolved safely") from error
+        except OSError as error:
+            raise ToolOperationError("IO_ERROR", "could not resolve path") from error
         try:
             relative = target.relative_to(self.root)
         except ValueError as error:
@@ -68,7 +73,10 @@ class WorkspaceFilesystem:
             raise ToolOperationError("NOT_TEXT", "new file content must not contain NUL bytes")
 
         target, relative = self.resolve(raw_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise ToolOperationError("IO_ERROR", f"could not create parent directory: {relative}") from error
         if target.exists() and not target.is_file():
             raise ToolOperationError("NOT_A_FILE", f"not a regular file: {relative}")
 

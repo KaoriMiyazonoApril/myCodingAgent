@@ -110,6 +110,86 @@ def test_grep_returns_matching_paths_line_numbers_and_lines(tmp_path) -> None:
     assert result.metadata == {"path": ".", "matches": 1, "truncated": False}
 
 
+def test_grep_returns_lines_in_file_order(tmp_path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text("\n".join(["needle"] * 10) + "\n", encoding="utf-8")
+    registry = create_local_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(id="call_order", name="grep", arguments={"pattern": "needle"})
+    )
+
+    assert result.error_code is None
+    assert result.content.splitlines() == [f"main.py:{line}: needle" for line in range(1, 11)]
+
+
+def test_grep_reports_non_text_files_through_filesystem_validation(tmp_path) -> None:
+    (tmp_path / "binary.bin").write_bytes(b"needle\x00")
+    registry = create_local_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(id="call_binary_search", name="grep", arguments={"pattern": "needle"})
+    )
+
+    assert result.error_code == "NOT_TEXT"
+
+
+def test_glob_uses_relative_pathlib_matching_for_recursive_patterns(tmp_path) -> None:
+    (tmp_path / "src" / "nested").mkdir(parents=True)
+    (tmp_path / "src" / "root.py").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "nested" / "deep.py").write_text("", encoding="utf-8")
+    registry = create_local_tool_registry(tmp_path)
+
+    direct = registry.execute(
+        ToolCallBlock(
+            id="call_direct_glob",
+            name="glob",
+            arguments={"path": "src", "pattern": "*.py"},
+        )
+    )
+    recursive = registry.execute(
+        ToolCallBlock(
+            id="call_recursive_glob",
+            name="glob",
+            arguments={"path": "src", "pattern": "**/*.py"},
+        )
+    )
+
+    assert direct.error_code is None
+    assert direct.content == "src/root.py"
+    assert recursive.error_code is None
+    assert recursive.content == "src/nested/deep.py\nsrc/root.py"
+
+
+def test_glob_rejects_absolute_or_escaping_patterns(tmp_path) -> None:
+    registry = create_local_tool_registry(tmp_path)
+
+    for pattern in ("/outside/*.py", "../*.py"):
+        result = registry.execute(
+            ToolCallBlock(
+                id="call_invalid_glob",
+                name="glob",
+                arguments={"pattern": pattern},
+            )
+        )
+        assert result.error_code == "INVALID_ARGUMENTS"
+
+
+def test_write_file_reports_a_file_parent_as_an_operational_error(tmp_path) -> None:
+    (tmp_path / "parent").write_text("not a directory", encoding="utf-8")
+    registry = create_local_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="call_file_parent",
+            name="write_file",
+            arguments={"path": "parent/child.txt", "content": "text"},
+        )
+    )
+
+    assert result.error_code == "IO_ERROR"
+
+
 def test_run_command_captures_separate_output_and_nonzero_exit(tmp_path) -> None:
     (tmp_path / "work").mkdir()
     registry = create_local_tool_registry(tmp_path)
@@ -252,6 +332,17 @@ def test_workspace_escapes_unknown_tools_and_duplicate_registration_are_structur
         raise AssertionError("duplicate registration must fail")
 
 
+def test_symlink_loops_are_reported_as_workspace_path_errors(tmp_path) -> None:
+    (tmp_path / "loop").symlink_to("loop")
+    registry = create_local_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(id="call_loop", name="read_file", arguments={"path": "loop"})
+    )
+
+    assert result.error_code == "WORKSPACE_ESCAPE"
+
+
 def test_all_six_definitions_are_closed_object_schemas(tmp_path) -> None:
     registry = create_local_tool_registry(tmp_path)
     definitions = registry.definitions()
@@ -267,6 +358,15 @@ def test_all_six_definitions_are_closed_object_schemas(tmp_path) -> None:
     assert all(definition.parameters["additionalProperties"] is False for definition in definitions)
     assert registry.lookup("read_file").name == "read_file"
     assert registry.lookup("missing") is None
+
+
+def test_path_schemas_reject_empty_paths_like_local_validation(tmp_path) -> None:
+    registry = create_local_tool_registry(tmp_path)
+
+    for name in ("read_file", "write_file", "edit_file"):
+        assert registry.lookup(name).parameters["properties"]["path"]["minLength"] == 1
+    for name, property_name in (("glob", "path"), ("grep", "path"), ("run_command", "cwd")):
+        assert registry.lookup(name).parameters["properties"][property_name]["minLength"] == 1
 
 
 def test_run_command_timeout_keeps_available_output_and_marks_tool_failure(tmp_path) -> None:

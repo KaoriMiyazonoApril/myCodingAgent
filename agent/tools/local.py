@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from fnmatch import fnmatchcase
 from pathlib import Path
 from pathlib import PurePosixPath
 import re
@@ -21,6 +22,29 @@ def _object_schema(
         "required": required,
         "additionalProperties": False,
     }
+
+
+def _matches_relative_glob(path: str, pattern: str) -> bool:
+    """Match path segments using pathlib-style relative glob semantics."""
+
+    path_parts = PurePosixPath(path).parts
+    pattern_parts = PurePosixPath(pattern).parts
+
+    def match(path_index: int, pattern_index: int) -> bool:
+        if pattern_index == len(pattern_parts):
+            return path_index == len(path_parts)
+        segment = pattern_parts[pattern_index]
+        if segment == "**":
+            return match(path_index, pattern_index + 1) or (
+                path_index < len(path_parts) and match(path_index + 1, pattern_index)
+            )
+        return (
+            path_index < len(path_parts)
+            and fnmatchcase(path_parts[path_index], segment)
+            and match(path_index + 1, pattern_index + 1)
+        )
+
+    return match(0, 0)
 
 
 def _read_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> ToolResult:
@@ -98,14 +122,20 @@ def _glob(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> Tool
     pattern = arguments["pattern"]
     if not isinstance(pattern, str) or not pattern:
         raise ToolOperationError("INVALID_ARGUMENTS", "pattern must be a non-empty string")
+    pattern_path = PurePosixPath(pattern)
+    if pattern_path.is_absolute() or ".." in pattern_path.parts:
+        raise ToolOperationError("INVALID_ARGUMENTS", "pattern must be a relative glob")
     selected_path = arguments.get("path", ".")
     selected, selected_relative = filesystem.resolve(selected_path)
     matches = [
         relative
         for _, relative in filesystem.regular_files(selected_path)
-        if PurePosixPath(relative).relative_to(
-            PurePosixPath(selected.relative_to(filesystem.root).as_posix())
-        ).match(pattern)
+        if _matches_relative_glob(
+            PurePosixPath(relative)
+            .relative_to(PurePosixPath(selected.relative_to(filesystem.root).as_posix()))
+            .as_posix(),
+            pattern,
+        )
     ]
     matches.sort()
     returned = matches[:200]
@@ -135,23 +165,18 @@ def _grep(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> Tool
 
     selected_path = arguments.get("path", ".")
     _, selected_relative = filesystem.resolve(selected_path)
-    matches: list[str] = []
-    for file_path, relative in filesystem.regular_files(selected_path):
+    matches: list[tuple[str, int, str]] = []
+    for _, relative in filesystem.regular_files(selected_path):
         if include is not None and not PurePosixPath(relative).match(include):
             continue
-        try:
-            content = file_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        if "\0" in content:
-            continue
+        content, relative = filesystem.read_text_file(relative)
         for line_number, line in enumerate(content.splitlines(), 1):
             if expression.search(line):
-                matches.append(f"{relative}:{line_number}: {line}")
-    matches.sort()
+                matches.append((relative, line_number, line))
+    matches.sort(key=lambda match: (match[0], match[1]))
     returned = matches[:200]
     return ToolResult(
-        content="\n".join(returned),
+        content="\n".join(f"{relative}:{line_number}: {line}" for relative, line_number, line in returned),
         metadata={
             "path": selected_relative,
             "matches": len(returned),
@@ -180,7 +205,7 @@ def create_local_tool_registry(workspace_root: Path) -> ToolRegistry:
             description="Read a UTF-8 text file with one-based line pagination.",
             parameters=_object_schema(
                 {
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "minLength": 1},
                     "offset": {"type": "integer", "minimum": 1, "default": 1},
                     "limit": {
                         "type": "integer",
@@ -199,7 +224,10 @@ def create_local_tool_registry(workspace_root: Path) -> ToolRegistry:
             name="write_file",
             description="Atomically write UTF-8 text to a workspace-relative file.",
             parameters=_object_schema(
-                {"path": {"type": "string"}, "content": {"type": "string"}},
+                {
+                    "path": {"type": "string", "minLength": 1},
+                    "content": {"type": "string"},
+                },
                 ["path", "content"],
             ),
         ),
@@ -211,7 +239,7 @@ def create_local_tool_registry(workspace_root: Path) -> ToolRegistry:
             description="Replace one or every exact string occurrence in a UTF-8 text file.",
             parameters=_object_schema(
                 {
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "minLength": 1},
                     "old_string": {"type": "string", "minLength": 1},
                     "new_string": {"type": "string"},
                     "replace_all": {"type": "boolean", "default": False},
@@ -227,7 +255,7 @@ def create_local_tool_registry(workspace_root: Path) -> ToolRegistry:
             description="Find regular workspace files matching a relative glob pattern.",
             parameters=_object_schema(
                 {
-                    "path": {"type": "string", "default": "."},
+                    "path": {"type": "string", "minLength": 1, "default": "."},
                     "pattern": {"type": "string", "minLength": 1},
                 },
                 ["pattern"],
@@ -241,7 +269,7 @@ def create_local_tool_registry(workspace_root: Path) -> ToolRegistry:
             description="Search UTF-8 workspace files with a Python regular expression.",
             parameters=_object_schema(
                 {
-                    "path": {"type": "string", "default": "."},
+                    "path": {"type": "string", "minLength": 1, "default": "."},
                     "pattern": {"type": "string", "minLength": 1},
                     "include": {"type": "string", "minLength": 1},
                 },
@@ -257,7 +285,7 @@ def create_local_tool_registry(workspace_root: Path) -> ToolRegistry:
             parameters=_object_schema(
                 {
                     "command": {"type": "string", "minLength": 1},
-                    "cwd": {"type": "string", "default": "."},
+                    "cwd": {"type": "string", "minLength": 1, "default": "."},
                     "timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
