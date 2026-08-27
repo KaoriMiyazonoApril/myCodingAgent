@@ -66,11 +66,6 @@ class OpenAICompatibleProvider(LLMProvider):
 
     async def chat(self, request: LLMRequest) -> LLMResponse:
         """Create one non-streaming completion and translate it to local types."""
-        if request.stream:
-            raise LLMStreamingNotImplementedError(
-                "Set stream=False and use chat(); streaming transport is not implemented yet"
-            )
-
         payload = self._build_request_payload(request, stream=False)
         try:
             raw_response = await self._client.chat.completions.create(**payload)
@@ -115,18 +110,6 @@ class OpenAICompatibleProvider(LLMProvider):
 
         text_parts = [block.text for block in message.content if isinstance(block, TextBlock)]
         tool_calls = [block for block in message.content if isinstance(block, ToolCallBlock)]
-        unsupported = [
-            block
-            for block in message.content
-            if not isinstance(block, (TextBlock, ReasoningBlock, ToolCallBlock))
-        ]
-        if unsupported:
-            raise LLMRequestError(
-                f"{message.role!r} messages cannot contain {type(unsupported[0]).__name__}"
-            )
-        if tool_calls and message.role != "assistant":
-            raise LLMRequestError("ToolCallBlock is only valid in an assistant message")
-
         # Reasoning fields are not part of the common Chat Completions request
         # schema. They remain in local history but are intentionally not sent.
         encoded: dict[str, Any] = {"role": message.role, "content": "".join(text_parts)}

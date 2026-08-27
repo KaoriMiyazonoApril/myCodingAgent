@@ -35,8 +35,9 @@ OpenAI Python SDK 只在 `OpenAICompatibleProvider` 内用作 HTTP 客户端。S
 - `ToolCallBlock`：工具调用 ID、名称和已解析的 `dict` 参数；
 - `ToolResultBlock`：未来本地工具执行的结果。
 
-`LLMRequest` 目前只抽象共同子集：messages、tools、stream、temperature、
-max_tokens 与 `extra_body`。`extra_body` 是经过刻意保留的厂商私有参数逃生口，
+`LLMRequest` 目前只抽象共同子集：messages、tools、temperature、max_tokens 与
+`extra_body`。调用 `chat()` 或 `stream()` 决定传输模式，避免请求数据同时包含两种
+模式的开关。`extra_body` 是经过刻意保留的厂商私有参数逃生口，
 不会污染核心类型。`Usage` 的三个 token 字段都允许为 `None`。
 
 ## 编码与解析
@@ -64,6 +65,11 @@ max_tokens 与 `extra_body`。`extra_body` 是经过刻意保留的厂商私有�
 `https://api.moonshot.cn/v1`、GLM `https://open.bigmodel.cn/api/paas/v4`；调用者
 仍可用 `base_url` 覆盖。API key 不会出现在 `ProviderConfig` 的默认 repr 中，示例
 也只从环境变量读取 key。
+
+`ProviderConfig` 和预设选择的所有配置错误都统一抛出
+`LLMConfigurationError`。`Message` 在创建时校验 role 与 block 的组合：system/user
+只能包含文本，assistant 可包含文本、reasoning 和 tool call，tool 只能包含 tool
+result；非法组合抛出 `LLMRequestError`，不会在编码时被静默忽略。
 
 ## Streaming 状态
 

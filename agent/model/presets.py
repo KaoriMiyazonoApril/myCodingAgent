@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import MappingProxyType
 
+from .errors import LLMConfigurationError
 from .types import ProviderConfig
 
 
@@ -31,7 +32,9 @@ def create_provider_config(
         preset = PROVIDER_PRESETS[normalized_provider]
     except KeyError as error:
         choices = ", ".join(PROVIDER_PRESETS)
-        raise ValueError(f"Unsupported provider {provider!r}. Expected one of: {choices}") from error
+        raise LLMConfigurationError(
+            f"Unsupported provider {provider!r}. Expected one of: {choices}"
+        ) from error
 
     return ProviderConfig(
         provider=normalized_provider,

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
 
-from agent.model.errors import LLMToolArgumentsParseError
+from agent.model.errors import LLMConfigurationError, LLMRequestError, LLMToolArgumentsParseError
 from agent.model.openai_compatible import OpenAICompatibleProvider
+from agent.model.presets import create_provider_config
 from agent.model.types import (
     LLMRequest,
     Message,
@@ -13,6 +15,7 @@ from agent.model.types import (
     TextBlock,
     ToolCallBlock,
     ToolDefinition,
+    ToolResultBlock,
 )
 
 
@@ -116,3 +119,37 @@ def test_request_encoding_keeps_sdk_shapes_at_provider_boundary() -> None:
     assert payload["tools"][0]["function"]["name"] == "read_file"
     assert payload["temperature"] == 0.2
     assert payload["max_tokens"] == 100
+
+
+def test_chat_or_stream_method_not_request_field_selects_transport_mode() -> None:
+    assert "stream" not in {field.name for field in fields(LLMRequest)}
+
+
+def test_message_rejects_invalid_role_and_content_block_combinations() -> None:
+    with pytest.raises(LLMRequestError, match="user.*TextBlock"):
+        Message(
+            role="user",
+            content=[ToolCallBlock(id="call_1", name="read_file", arguments={})],
+        )
+
+    with pytest.raises(LLMRequestError, match="tool.*ToolResultBlock"):
+        Message(role="tool", content=[TextBlock(text="not a tool result")])
+
+    Message(
+        role="tool",
+        content=[ToolResultBlock(tool_call_id="call_1", content="file contents")],
+    )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: ProviderConfig(
+            provider="", base_url="https://example.invalid", api_key="key", model="model"
+        ),
+        lambda: create_provider_config("unsupported", api_key="key", model="model"),
+    ],
+)
+def test_configuration_errors_use_project_exception(factory) -> None:
+    with pytest.raises(LLMConfigurationError):
+        factory()

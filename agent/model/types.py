@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
+from .errors import LLMConfigurationError, LLMRequestError
+
 
 Role: TypeAlias = Literal["system", "user", "assistant", "tool"]
 
@@ -20,18 +22,31 @@ class ProviderConfig:
     timeout: float | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.provider, str):
+            raise LLMConfigurationError("provider must be a string")
+        if not isinstance(self.base_url, str):
+            raise LLMConfigurationError("base_url must be a string")
+        if not isinstance(self.api_key, str):
+            raise LLMConfigurationError("api_key must be a string")
+        if not isinstance(self.model, str):
+            raise LLMConfigurationError("model must be a string")
+
         self.provider = self.provider.strip().lower()
-        self.base_url = self.base_url.rstrip("/")
+        self.base_url = self.base_url.strip().rstrip("/")
         if not self.provider:
-            raise ValueError("provider must not be empty")
+            raise LLMConfigurationError("provider must not be empty")
         if not self.base_url:
-            raise ValueError("base_url must not be empty")
+            raise LLMConfigurationError("base_url must not be empty")
         if not self.api_key:
-            raise ValueError("api_key must not be empty")
+            raise LLMConfigurationError("api_key must not be empty")
         if not self.model:
-            raise ValueError("model must not be empty")
-        if self.timeout is not None and self.timeout <= 0:
-            raise ValueError("timeout must be positive")
+            raise LLMConfigurationError("model must not be empty")
+        if self.timeout is not None and (
+            isinstance(self.timeout, bool)
+            or not isinstance(self.timeout, (int, float))
+            or self.timeout <= 0
+        ):
+            raise LLMConfigurationError("timeout must be a positive number")
 
 
 @dataclass(slots=True)
@@ -70,6 +85,24 @@ class Message:
     role: Role
     content: list[ContentBlock]
 
+    def __post_init__(self) -> None:
+        allowed_blocks: dict[str, tuple[type[ContentBlock], ...]] = {
+            "system": (TextBlock,),
+            "user": (TextBlock,),
+            "assistant": (TextBlock, ReasoningBlock, ToolCallBlock),
+            "tool": (ToolResultBlock,),
+        }
+        allowed = allowed_blocks.get(self.role)
+        if allowed is None:
+            raise LLMRequestError(f"Unsupported message role: {self.role!r}")
+        invalid = next((block for block in self.content if not isinstance(block, allowed)), None)
+        if invalid is not None:
+            allowed_names = ", ".join(block_type.__name__ for block_type in allowed)
+            raise LLMRequestError(
+                f"{self.role!r} messages may contain only {allowed_names}; "
+                f"got {type(invalid).__name__}"
+            )
+
 
 @dataclass(slots=True)
 class ToolDefinition:
@@ -82,7 +115,6 @@ class ToolDefinition:
 class LLMRequest:
     messages: list[Message]
     tools: list[ToolDefinition] | None = None
-    stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None
     extra_body: dict[str, Any] | None = None
