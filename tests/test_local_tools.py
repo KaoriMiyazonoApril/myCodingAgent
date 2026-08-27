@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import shutil
+import time
+
+import pytest
 
 from agent.core.messages import ToolCallBlock
 from agent.tools.local import create_local_tool_registry
 from agent.tools.registry import ToolRegistry
-from agent.tools.types import ToolDefinition
+from agent.tools.types import ToolDefinition, ToolResult
 
 
 def test_read_file_returns_numbered_page_and_metadata(tmp_path) -> None:
@@ -123,15 +128,17 @@ def test_grep_returns_lines_in_file_order(tmp_path) -> None:
     assert result.content.splitlines() == [f"main.py:{line}: needle" for line in range(1, 11)]
 
 
-def test_grep_reports_non_text_files_through_filesystem_validation(tmp_path) -> None:
+def test_grep_skips_non_text_files_and_keeps_searching(tmp_path) -> None:
     (tmp_path / "binary.bin").write_bytes(b"needle\x00")
+    (tmp_path / "main.py").write_text("needle\n", encoding="utf-8")
     registry = create_local_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(id="call_binary_search", name="grep", arguments={"pattern": "needle"})
     )
 
-    assert result.error_code == "NOT_TEXT"
+    assert result.error_code is None
+    assert result.content == "main.py:1: needle"
 
 
 def test_glob_uses_relative_pathlib_matching_for_recursive_patterns(tmp_path) -> None:
@@ -211,6 +218,96 @@ def test_run_command_captures_separate_output_and_nonzero_exit(tmp_path) -> None
     assert result.metadata["timed_out"] is False
     assert result.metadata["stdout"] == "out"
     assert result.metadata["stderr"] == "err"
+    assert result.metadata["command_succeeded"] is False
+    assert result.content.startswith("command exited with status 7")
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap is unavailable")
+def test_run_command_cannot_read_outside_workspace(tmp_path) -> None:
+    registry = create_local_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="call_isolation",
+            name="run_command",
+            arguments={
+                "command": (
+                    "if test -r /etc/passwd; then printf exposed; "
+                    "else printf isolated; fi"
+                )
+            },
+        )
+    )
+
+    assert result.error_code is None
+    assert result.metadata["stdout"] == "isolated"
+    assert result.metadata["sandboxed"] is True
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap is unavailable")
+def test_run_command_can_write_inside_without_modifying_host_sibling(tmp_path) -> None:
+    outside = tmp_path.parent / "outside-command.txt"
+    outside.write_text("unchanged", encoding="utf-8")
+    registry = create_local_tool_registry(tmp_path)
+
+    inside = registry.execute(
+        ToolCallBlock(
+            id="call_inside_write",
+            name="run_command",
+            arguments={"command": "printf created > generated.txt"},
+        )
+    )
+    outside_attempt = registry.execute(
+        ToolCallBlock(
+            id="call_outside_write",
+            name="run_command",
+            arguments={"command": "printf changed > ../outside-command.txt"},
+        )
+    )
+
+    assert inside.metadata["command_succeeded"] is True
+    assert (tmp_path / "generated.txt").read_text(encoding="utf-8") == "created"
+    assert outside_attempt.error_code is None
+    assert outside.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_run_command_fails_closed_when_isolation_is_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("agent.tools.process.shutil.which", lambda _: None)
+    registry = create_local_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="call_no_sandbox",
+            name="run_command",
+            arguments={"command": "printf must-not-run > must-not-run"},
+        )
+    )
+
+    assert result.error_code == "PROCESS_START_FAILED"
+    assert not (tmp_path / "must-not-run").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="setsid is POSIX-only")
+def test_timeout_returns_even_if_detached_descendant_keeps_pipe_open(tmp_path) -> None:
+    registry = create_local_tool_registry(tmp_path)
+    start = time.monotonic()
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="call_detached_timeout",
+            name="run_command",
+            arguments={
+                "command": "setsid sh -c 'sleep 1' & printf begun; sleep 1",
+                "timeout_ms": 30,
+            },
+        )
+    )
+
+    assert result.error_code == "TIMEOUT"
+    assert time.monotonic() - start < 0.5
+    assert result.metadata["stdout"] == "begun"
 
 
 def test_read_out_of_range_and_non_text_files_return_structured_results(tmp_path) -> None:
@@ -358,6 +455,82 @@ def test_all_six_definitions_are_closed_object_schemas(tmp_path) -> None:
     assert all(definition.parameters["additionalProperties"] is False for definition in definitions)
     assert registry.lookup("read_file").name == "read_file"
     assert registry.lookup("missing") is None
+
+
+def test_registry_uses_tool_schema_for_validation_and_defaults() -> None:
+    registry = ToolRegistry()
+    received: list[dict[str, object]] = []
+    registry.register(
+        ToolDefinition(
+            name="sample",
+            description="sample",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 1},
+                    "limit": {"type": "integer", "default": 3},
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        ),
+        lambda arguments: received.append(arguments) or ToolResult("ok", {}),
+    )
+
+    valid = registry.execute(
+        ToolCallBlock(id="valid", name="sample", arguments={"name": "value"})
+    )
+    invalid = registry.execute(
+        ToolCallBlock(id="invalid", name="sample", arguments={"name": ""})
+    )
+
+    assert valid.error_code is None
+    assert received == [{"name": "value", "limit": 3}]
+    assert invalid.error_code == "INVALID_ARGUMENTS"
+
+
+def test_invalid_parsed_arguments_become_recoverable_tool_error(tmp_path) -> None:
+    registry = create_local_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="call_bad",
+            name="read_file",
+            arguments={},
+            arguments_error="invalid JSON arguments",
+        )
+    )
+
+    assert result.error_code == "INVALID_ARGUMENTS"
+    assert result.metadata == {"tool": "read_file", "tool_call_id": "call_bad"}
+
+
+def test_async_registry_execution_does_not_block_event_loop() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="slow",
+            description="slow",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        ),
+        lambda _: (time.sleep(0.1), ToolResult("done", {}))[1],
+    )
+
+    async def scenario() -> bool:
+        execution = asyncio.create_task(
+            registry.execute_async(ToolCallBlock(id="slow", name="slow", arguments={}))
+        )
+        await asyncio.sleep(0.02)
+        responsive = not execution.done()
+        await execution
+        return responsive
+
+    assert asyncio.run(scenario()) is True
 
 
 def test_path_schemas_reject_empty_paths_like_local_validation(tmp_path) -> None:

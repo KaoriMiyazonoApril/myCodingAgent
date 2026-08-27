@@ -112,12 +112,23 @@ class OpenAICompatibleProvider(LLMProvider):
             return self._encode_tool_results(message.content)
 
         text_parts = [block.text for block in message.content if isinstance(block, TextBlock)]
+        reasoning_parts = [
+            block.text for block in message.content if isinstance(block, ReasoningBlock)
+        ]
         tool_calls = [block for block in message.content if isinstance(block, ToolCallBlock)]
-        # Reasoning fields are not part of the common Chat Completions request
-        # schema. They remain in local history but are intentionally not sent.
         encoded: dict[str, Any] = {"role": message.role, "content": "".join(text_parts)}
         if tool_calls:
-            encoded["content"] = "".join(text_parts) if text_parts else None
+            capabilities = self.config.capabilities
+            if text_parts or capabilities.requires_assistant_content_for_tool_calls:
+                encoded["content"] = "".join(text_parts)
+            else:
+                encoded["content"] = None
+            if (
+                reasoning_parts
+                and capabilities.preserve_reasoning_for_tool_calls
+                and capabilities.reasoning_input_field is not None
+            ):
+                encoded[capabilities.reasoning_input_field] = "".join(reasoning_parts)
             encoded["tool_calls"] = [self._encode_tool_call(call) for call in tool_calls]
         return [encoded]
 
@@ -150,11 +161,24 @@ class OpenAICompatibleProvider(LLMProvider):
         for result in results:
             if not result.tool_call_id:
                 raise LLMRequestError("ToolResultBlock.tool_call_id must not be empty")
+            try:
+                content = json.dumps(
+                    {
+                        "content": result.content,
+                        "metadata": result.metadata,
+                        "error_code": result.error_code,
+                    },
+                    ensure_ascii=False,
+                )
+            except (TypeError, ValueError) as error:
+                raise LLMRequestError(
+                    f"Tool result {result.tool_call_id!r} is not JSON serializable"
+                ) from error
             encoded.append(
                 {
                     "role": "tool",
                     "tool_call_id": result.tool_call_id,
-                    "content": result.content,
+                    "content": content,
                 }
             )
         return encoded
@@ -235,11 +259,32 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise LLMResponseParseError(f"Tool call at index {index} has no valid id")
             if not isinstance(name, str) or not name:
                 raise LLMResponseParseError(f"Tool call {call_id!r} has no valid function name")
-            arguments = self._parse_tool_arguments(
-                self._get_field(function, "arguments", ""), call_id, name
+            arguments_error: str | None = None
+            try:
+                arguments = self._parse_tool_arguments(
+                    self._get_field(function, "arguments", ""), call_id, name
+                )
+            except LLMToolArgumentsParseError as error:
+                arguments = {}
+                arguments_error = self._tool_arguments_error_reason(error)
+            parsed.append(
+                ToolCallBlock(
+                    id=call_id,
+                    name=name,
+                    arguments=arguments,
+                    arguments_error=arguments_error,
+                )
             )
-            parsed.append(ToolCallBlock(id=call_id, name=name, arguments=arguments))
         return parsed
+
+    @staticmethod
+    def _tool_arguments_error_reason(error: LLMToolArgumentsParseError) -> str:
+        message = str(error)
+        if "invalid JSON arguments" in message:
+            return "invalid JSON arguments"
+        if "must decode to a JSON object" in message:
+            return "arguments must decode to a JSON object"
+        return "arguments must be a JSON string"
 
     @staticmethod
     def _parse_tool_arguments(raw_arguments: Any, call_id: str, name: str) -> dict[str, Any]:

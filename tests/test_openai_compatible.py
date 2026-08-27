@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import fields
 from types import SimpleNamespace
 
@@ -8,18 +9,19 @@ import pytest
 from agent.core.messages import (
     Message,
     MessageValidationError,
+    ReasoningBlock,
     TextBlock,
     ToolCallBlock,
     ToolResultBlock,
 )
-from agent.model.errors import LLMConfigurationError, LLMToolArgumentsParseError
+from agent.model.errors import LLMConfigurationError
 from agent.model.openai_compatible import OpenAICompatibleProvider
 from agent.model.presets import create_provider_config
 from agent.model.types import (
     LLMRequest,
     ProviderConfig,
 )
-from agent.tools.types import ToolDefinition
+from agent.tools.types import ToolDefinition, ToolResult
 
 
 def provider() -> OpenAICompatibleProvider:
@@ -73,8 +75,35 @@ def test_invalid_tool_arguments_raise_clear_project_error() -> None:
         function=SimpleNamespace(name="read_file", arguments='{"path":'),
     )
 
-    with pytest.raises(LLMToolArgumentsParseError, match="invalid JSON arguments"):
-        provider()._parse_response(response(content=None, tool_calls=[tool_call]))
+    parsed = provider()._parse_response(response(content=None, tool_calls=[tool_call]))
+
+    assert parsed.message.content == [
+        ToolCallBlock(
+            id="call_123",
+            name="read_file",
+            arguments={},
+            arguments_error="invalid JSON arguments",
+        )
+    ]
+
+
+def test_one_invalid_tool_call_does_not_discard_other_calls() -> None:
+    invalid = SimpleNamespace(
+        id="call_bad",
+        function=SimpleNamespace(name="read_file", arguments='{"path":'),
+    )
+    valid = SimpleNamespace(
+        id="call_good",
+        function=SimpleNamespace(name="read_file", arguments='{"path":"main.py"}'),
+    )
+
+    parsed = provider()._parse_response(
+        response(content=None, tool_calls=[invalid, valid])
+    )
+
+    assert len(parsed.message.content) == 2
+    assert parsed.message.content[0].arguments_error == "invalid JSON arguments"
+    assert parsed.message.content[1].arguments == {"path": "main.py"}
 
 
 def test_usage_is_converted_to_local_usage() -> None:
@@ -122,6 +151,65 @@ def test_request_encoding_keeps_sdk_shapes_at_provider_boundary() -> None:
     assert payload["tools"][0]["function"]["name"] == "read_file"
     assert payload["temperature"] == 0.2
     assert payload["max_tokens"] == 100
+
+
+def test_reasoning_is_preserved_for_thinking_tool_call_turns() -> None:
+    deepseek = OpenAICompatibleProvider(
+        create_provider_config(
+            "deepseek", api_key="test-key", model="deepseek-reasoner"
+        ),
+        client=object(),
+    )
+    request = LLMRequest(
+        messages=[
+            Message(
+                role="assistant",
+                content=[
+                    ReasoningBlock(text="need to inspect the file"),
+                    ToolCallBlock(
+                        id="call_1", name="read_file", arguments={"path": "main.py"}
+                    ),
+                ],
+            )
+        ]
+    )
+
+    encoded = deepseek._build_request_payload(request, stream=False)["messages"][0]
+
+    assert encoded["reasoning_content"] == "need to inspect the file"
+    assert encoded["content"] == ""
+
+
+def test_provider_presets_declare_protocol_capabilities() -> None:
+    deepseek = create_provider_config("deepseek", api_key="key", model="model")
+    kimi = create_provider_config("kimi", api_key="key", model="model")
+    glm = create_provider_config("glm", api_key="key", model="model")
+
+    assert deepseek.capabilities.preserve_reasoning_for_tool_calls is True
+    assert kimi.capabilities.preserve_reasoning_for_tool_calls is True
+    assert glm.capabilities.preserve_reasoning_for_tool_calls is True
+    assert deepseek.capabilities.requires_assistant_content_for_tool_calls is True
+    assert kimi.capabilities.requires_assistant_content_for_tool_calls is False
+
+
+def test_tool_result_protocol_preserves_metadata_and_error_code_for_model() -> None:
+    result = ToolResult(
+        content="command failed",
+        metadata={"exit_code": 2, "stderr_truncated": True},
+        error_code="COMMAND_FAILED",
+    )
+    block = result.to_message_block("call_1")
+    message = Message(role="tool", content=[block])
+
+    encoded = provider()._encode_messages([message])
+    envelope = json.loads(encoded[0]["content"])
+
+    assert envelope == {
+        "content": "command failed",
+        "metadata": {"exit_code": 2, "stderr_truncated": True},
+        "error_code": "COMMAND_FAILED",
+    }
+    assert block.is_error is True
 
 
 def test_chat_or_stream_method_not_request_field_selects_transport_mode() -> None:

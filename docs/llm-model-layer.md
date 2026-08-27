@@ -34,8 +34,8 @@ OpenAI Python SDK 只在 `OpenAICompatibleProvider` 内用作 HTTP 客户端。S
 
 - `TextBlock`：普通文本；
 - `ReasoningBlock`：兼容供应商可能返回的 reasoning/thinking 文本；
-- `ToolCallBlock`：工具调用 ID、名称和已解析的 `dict` 参数；
-- `ToolResultBlock`：未来本地工具执行的结果。
+- `ToolCallBlock`：工具调用 ID、名称、已解析的 `dict` 参数，以及可恢复的参数解析错误；
+- `ToolResultBlock`：绑定调用 ID 的本地工具结果，保留 content、metadata 与 error code。
 
 `Message`、`Role` 和各 content block 是 Agent 领域类型，而非 Model-specific
 类型；它们可被未来 Conversation、Runtime、Tool Dispatcher 或 UI/API adapter 使用。
@@ -56,22 +56,36 @@ OpenAI Python SDK 只在 `OpenAICompatibleProvider` 内用作 HTTP 客户端。S
 - 一个 `ToolResultBlock` 编码成一个 role 为 `tool`、带 `tool_call_id` 的消息；
 - `ToolDefinition` 编码为 OpenAI 的 `{type: "function", function: {...}}` 格式。
 
-`ReasoningBlock` 保留在本地历史中，但不发回请求。reasoning/thinking 不是三家
-共同的 Chat Completions 请求字段；供应商私有开关应使用 `extra_body`。
+普通对话中的 `ReasoningBlock` 只保留在本地历史中。对于带工具调用的 thinking turn，
+适配器依据 `ProviderCapabilities` 将 reasoning 以供应商声明的字段（当前三家均为
+`reasoning_content`）发回请求，避免交错思考在工具结果轮次中断。供应商私有的 thinking
+启用参数仍由调用方通过 `extra_body` 指定。
 
 解析响应时，文本变成 `TextBlock`，`reasoning_content` 或字符串形式的
-`thinking` 变成 `ReasoningBlock`。工具调用参数用 `json.loads` 解析为 `dict`：
-空参数变成 `{}`，无效 JSON、非对象 JSON、缺失调用 ID 或函数名都会抛出清晰的
-项目异常 `LLMToolArgumentsParseError`/`LLMResponseParseError`，而不是 SDK 异常。
-`content=None` 加 `tool_calls` 是有效的工具调用响应。
+`thinking` 变成 `ReasoningBlock`。工具调用参数用 `json.loads` 解析为 `dict`。空参数
+变成 `{}`；无效 JSON、非对象 JSON 或非字符串参数不会废弃整条模型响应，而是产生带
+`arguments_error` 的 `ToolCallBlock`。Registry 随后将其转成 `INVALID_ARGUMENTS`
+工具结果，让模型可在下一轮自行修复。缺失调用 ID 或函数名因无法绑定工具结果，仍抛出
+`LLMResponseParseError`。`content=None` 加 `tool_calls` 是有效响应。
+
+执行域 `ToolResult.to_message_block()` 明确完成结果绑定。适配器把 block 编码成 JSON
+envelope：`content`、`metadata`、`error_code` 会一起进入 tool message；`is_error` 只由
+`error_code` 推导。因此分页、截断、exit code 等控制信息不会只停留在本地对象中。
 
 ## 供应商切换
 
 所有供应商均实例化同一个 `OpenAICompatibleProvider`。`create_provider_config`
 提供当前官方默认端点：DeepSeek `https://api.deepseek.com`、Kimi/Moonshot
 `https://api.moonshot.cn/v1`、GLM `https://open.bigmodel.cn/api/paas/v4`；调用者
-仍可用 `base_url` 覆盖。API key 不会出现在 `ProviderConfig` 的默认 repr 中，示例
-也只从环境变量读取 key。
+仍可用 `base_url` 覆盖。Preset 同时携带显式 `ProviderCapabilities`：DeepSeek、Kimi 和
+GLM 的 thinking tool-call turn 都需保留 `reasoning_content`；DeepSeek 还要求 tool-call
+assistant message 提供非 null content。API key 不会出现在 `ProviderConfig` 的默认 repr
+中，示例也只从环境变量读取 key。
+
+能力声明依据供应商的 thinking + tool-call 协议文档：
+[DeepSeek Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/)、
+[Kimi K2.6 Tool Use Compatibility](https://platform.kimi.com/docs/guide/kimi-k2-6-quickstart)、
+[GLM 思考模式](https://docs.bigmodel.cn/cn/guide/capabilities/thinking-mode)。
 
 `ProviderConfig` 和预设选择的所有配置错误都统一抛出
 `LLMConfigurationError`。`Message` 在创建时校验 role 与 block 的组合：system/user

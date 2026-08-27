@@ -11,6 +11,15 @@ from agent.tools.types import ToolDefinition
 from .errors import LLMConfigurationError
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderCapabilities:
+    """Protocol behavior that differs between OpenAI-compatible providers."""
+
+    preserve_reasoning_for_tool_calls: bool = False
+    reasoning_input_field: str | None = None
+    requires_assistant_content_for_tool_calls: bool = False
+
+
 @dataclass(slots=True)
 class ProviderConfig:
     """Connection settings for one OpenAI-compatible API endpoint."""
@@ -20,6 +29,7 @@ class ProviderConfig:
     api_key: str = field(repr=False)
     model: str
     timeout: float | None = None
+    capabilities: ProviderCapabilities = field(default_factory=ProviderCapabilities)
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider, str):
@@ -30,6 +40,8 @@ class ProviderConfig:
             raise LLMConfigurationError("api_key must be a string")
         if not isinstance(self.model, str):
             raise LLMConfigurationError("model must be a string")
+        if not isinstance(self.capabilities, ProviderCapabilities):
+            raise LLMConfigurationError("capabilities must be ProviderCapabilities")
 
         self.provider = self.provider.strip().lower()
         self.base_url = self.base_url.strip().rstrip("/")
@@ -47,6 +59,7 @@ class ProviderConfig:
             or self.timeout <= 0
         ):
             raise LLMConfigurationError("timeout must be a positive number")
+
 
 @dataclass(slots=True)
 class LLMRequest:

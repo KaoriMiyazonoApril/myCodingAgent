@@ -30,6 +30,7 @@ class ToolCallBlock:
     id: str
     name: str
     arguments: dict[str, Any]
+    arguments_error: str | None = None
     type: Literal["tool_call"] = field(default="tool_call", init=False)
 
 
@@ -37,8 +38,13 @@ class ToolCallBlock:
 class ToolResultBlock:
     tool_call_id: str
     content: str
-    is_error: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+    error_code: str | None = None
     type: Literal["tool_result"] = field(default="tool_result", init=False)
+
+    @property
+    def is_error(self) -> bool:
+        return self.error_code is not None
 
 
 ContentBlock: TypeAlias = TextBlock | ReasoningBlock | ToolCallBlock | ToolResultBlock

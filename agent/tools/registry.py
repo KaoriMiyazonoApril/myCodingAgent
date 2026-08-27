@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 
 from agent.core.messages import ToolCallBlock
 from agent.tools.filesystem import ToolOperationError
-from agent.tools.types import ToolDefinition, ToolResult
+from agent.tools.types import (
+    ToolArgumentsValidationError,
+    ToolDefinition,
+    ToolResult,
+)
 
 
 ToolExecutor = Callable[[dict[str, object]], ToolResult]
@@ -38,8 +43,17 @@ class ToolRegistry:
                 metadata={"tool": call.name},
                 error_code="UNKNOWN_TOOL",
             )
+        if call.arguments_error is not None:
+            return ToolResult(
+                content=f"invalid tool arguments: {call.arguments_error}",
+                metadata={"tool": call.name, "tool_call_id": call.id},
+                error_code="INVALID_ARGUMENTS",
+            )
         try:
-            return registered[1](call.arguments)
+            arguments = registered[0].validate_arguments(call.arguments)
+            return registered[1](arguments)
+        except ToolArgumentsValidationError as error:
+            return ToolResult(content=str(error), metadata={}, error_code="INVALID_ARGUMENTS")
         except ToolOperationError as error:
             return ToolResult(content=str(error), metadata={}, error_code=error.code)
         except Exception:
@@ -48,3 +62,8 @@ class ToolRegistry:
                 metadata={},
                 error_code="INTERNAL_ERROR",
             )
+
+    async def execute_async(self, call: ToolCallBlock) -> ToolResult:
+        """Dispatch without blocking an async Agent Loop or UI event loop."""
+
+        return await asyncio.to_thread(self.execute, call)

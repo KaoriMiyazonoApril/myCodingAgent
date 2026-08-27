@@ -6,6 +6,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from pathlib import PurePosixPath
 import re
+from typing import cast
 
 from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem
 from agent.tools.process import CommandRunner
@@ -48,15 +49,8 @@ def _matches_relative_glob(path: str, pattern: str) -> bool:
 
 
 def _read_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> ToolResult:
-    allowed = {"path", "offset", "limit"}
-    if set(arguments) - allowed:
-        raise ToolOperationError("INVALID_ARGUMENTS", "read_file received unknown arguments")
-    offset = arguments.get("offset", 1)
-    limit = arguments.get("limit", 200)
-    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 1:
-        raise ToolOperationError("INVALID_ARGUMENTS", "offset must be an integer of at least 1")
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 2000:
-        raise ToolOperationError("INVALID_ARGUMENTS", "limit must be an integer from 1 through 2000")
+    offset = cast(int, arguments["offset"])
+    limit = cast(int, arguments["limit"])
 
     content, relative = filesystem.read_text_file(arguments.get("path"))
     lines = content.splitlines()
@@ -78,8 +72,6 @@ def _read_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) ->
 
 
 def _write_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> ToolResult:
-    if set(arguments) - {"path", "content"} or {"path", "content"} - set(arguments):
-        raise ToolOperationError("INVALID_ARGUMENTS", "write_file requires path and content only")
     relative, bytes_written = filesystem.write_text_file(
         arguments["path"], arguments["content"]
     )
@@ -90,16 +82,9 @@ def _write_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -
 
 
 def _edit_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> ToolResult:
-    required = {"path", "old_string", "new_string"}
-    if set(arguments) - (required | {"replace_all"}) or required - set(arguments):
-        raise ToolOperationError("INVALID_ARGUMENTS", "edit_file requires path, old_string, and new_string")
-    old_string = arguments["old_string"]
-    new_string = arguments["new_string"]
-    replace_all = arguments.get("replace_all", False)
-    if not isinstance(old_string, str) or not old_string:
-        raise ToolOperationError("INVALID_ARGUMENTS", "old_string must be a non-empty string")
-    if not isinstance(new_string, str) or not isinstance(replace_all, bool):
-        raise ToolOperationError("INVALID_ARGUMENTS", "new_string must be a string and replace_all a boolean")
+    old_string = cast(str, arguments["old_string"])
+    new_string = cast(str, arguments["new_string"])
+    replace_all = cast(bool, arguments["replace_all"])
 
     content, relative = filesystem.read_text_file(arguments["path"])
     occurrences = content.count(old_string)
@@ -117,15 +102,11 @@ def _edit_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) ->
 
 
 def _glob(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> ToolResult:
-    if set(arguments) - {"path", "pattern"} or "pattern" not in arguments:
-        raise ToolOperationError("INVALID_ARGUMENTS", "glob requires pattern and optional path only")
-    pattern = arguments["pattern"]
-    if not isinstance(pattern, str) or not pattern:
-        raise ToolOperationError("INVALID_ARGUMENTS", "pattern must be a non-empty string")
+    pattern = cast(str, arguments["pattern"])
     pattern_path = PurePosixPath(pattern)
     if pattern_path.is_absolute() or ".." in pattern_path.parts:
         raise ToolOperationError("INVALID_ARGUMENTS", "pattern must be a relative glob")
-    selected_path = arguments.get("path", ".")
+    selected_path = arguments["path"]
     selected, selected_relative = filesystem.resolve(selected_path)
     matches = [
         relative
@@ -150,26 +131,25 @@ def _glob(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> Tool
 
 
 def _grep(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> ToolResult:
-    if set(arguments) - {"path", "pattern", "include"} or "pattern" not in arguments:
-        raise ToolOperationError("INVALID_ARGUMENTS", "grep requires pattern and optional path and include only")
-    pattern = arguments["pattern"]
+    pattern = cast(str, arguments["pattern"])
     include = arguments.get("include")
-    if not isinstance(pattern, str) or not pattern:
-        raise ToolOperationError("INVALID_ARGUMENTS", "pattern must be a non-empty string")
-    if include is not None and (not isinstance(include, str) or not include):
-        raise ToolOperationError("INVALID_ARGUMENTS", "include must be a non-empty string")
     try:
         expression = re.compile(pattern)
     except re.error as error:
         raise ToolOperationError("INVALID_REGEX", f"invalid regular expression: {error}") from error
 
-    selected_path = arguments.get("path", ".")
+    selected_path = arguments["path"]
     _, selected_relative = filesystem.resolve(selected_path)
     matches: list[tuple[str, int, str]] = []
     for _, relative in filesystem.regular_files(selected_path):
         if include is not None and not PurePosixPath(relative).match(include):
             continue
-        content, relative = filesystem.read_text_file(relative)
+        try:
+            content, relative = filesystem.read_text_file(relative)
+        except ToolOperationError as error:
+            if error.code == "NOT_TEXT":
+                continue
+            raise
         for line_number, line in enumerate(content.splitlines(), 1):
             if expression.search(line):
                 matches.append((relative, line_number, line))
@@ -186,10 +166,10 @@ def _grep(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> Tool
 
 
 def _run_command(runner: CommandRunner, arguments: dict[str, object]) -> ToolResult:
-    if set(arguments) - {"command", "cwd", "timeout_ms"} or "command" not in arguments:
-        raise ToolOperationError("INVALID_ARGUMENTS", "run_command requires command and optional cwd and timeout_ms only")
     return runner.run(
-        arguments["command"], arguments.get("cwd", "."), arguments.get("timeout_ms", 60000)
+        cast(str, arguments["command"]),
+        cast(str, arguments["cwd"]),
+        cast(int, arguments["timeout_ms"]),
     )
 
 

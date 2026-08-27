@@ -5,15 +5,47 @@ from __future__ import annotations
 from types import MappingProxyType
 
 from .errors import LLMConfigurationError
-from .types import ProviderConfig
+from .types import ProviderCapabilities, ProviderConfig
+
+
+REASONING_TOOL_CALLS = ProviderCapabilities(
+    preserve_reasoning_for_tool_calls=True,
+    reasoning_input_field="reasoning_content",
+)
+
+DEEPSEEK_CAPABILITIES = ProviderCapabilities(
+    preserve_reasoning_for_tool_calls=True,
+    reasoning_input_field="reasoning_content",
+    requires_assistant_content_for_tool_calls=True,
+)
 
 
 PROVIDER_PRESETS = MappingProxyType(
     {
-        "deepseek": MappingProxyType({"base_url": "https://api.deepseek.com"}),
-        "kimi": MappingProxyType({"base_url": "https://api.moonshot.cn/v1"}),
-        "moonshot": MappingProxyType({"base_url": "https://api.moonshot.cn/v1"}),
-        "glm": MappingProxyType({"base_url": "https://open.bigmodel.cn/api/paas/v4"}),
+        "deepseek": MappingProxyType(
+            {
+                "base_url": "https://api.deepseek.com",
+                "capabilities": DEEPSEEK_CAPABILITIES,
+            }
+        ),
+        "kimi": MappingProxyType(
+            {
+                "base_url": "https://api.moonshot.cn/v1",
+                "capabilities": REASONING_TOOL_CALLS,
+            }
+        ),
+        "moonshot": MappingProxyType(
+            {
+                "base_url": "https://api.moonshot.cn/v1",
+                "capabilities": REASONING_TOOL_CALLS,
+            }
+        ),
+        "glm": MappingProxyType(
+            {
+                "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                "capabilities": REASONING_TOOL_CALLS,
+            }
+        ),
     }
 )
 
@@ -42,4 +74,5 @@ def create_provider_config(
         api_key=api_key,
         model=model,
         timeout=timeout,
+        capabilities=preset["capabilities"],
     )

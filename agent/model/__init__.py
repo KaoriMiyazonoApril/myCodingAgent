@@ -5,6 +5,7 @@ from .presets import PROVIDER_PRESETS, create_provider_config
 from .types import (
     LLMRequest,
     LLMResponse,
+    ProviderCapabilities,
     ProviderConfig,
     Usage,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "LLMResponse",
     "OpenAICompatibleProvider",
     "PROVIDER_PRESETS",
+    "ProviderCapabilities",
     "ProviderConfig",
     "Usage",
     "create_provider_config",

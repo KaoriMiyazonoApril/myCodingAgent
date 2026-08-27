@@ -7,8 +7,9 @@
 Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能力层来执行它们。
 
 用户需要六项基础能力：读取文件、写入文件、精确编辑、按 glob 查找文件、按正则搜索
-内容，以及执行一次非交互式 shell 命令。所有文件与初始命令目录必须受配置的工作区根
-目录约束；常见操作失败必须成为结构化结果，而不是未控制的异常或会话副作用。
+内容，以及执行一次非交互式 shell 命令。所有文件和命令可见的持久化可写目录必须受
+配置的工作区根目录约束；常见操作失败必须成为结构化结果，而不是未控制的异常或会话
+副作用。
 
 ## Solution
 
@@ -48,28 +49,33 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 24. As an agent-loop author, I want stable error codes for invalid arguments, path violations, text-file failures, edits, regexes, and process failures, so that recovery logic can act without parsing prose.
 25. As a maintainer, I want tools to return results rather than append messages or request approvals, so that capability execution remains separate from policy, UI, and conversation orchestration.
 26. As a maintainer, I want temporary-directory tests at the tool registry and tool execution seams, so that results do not depend on a developer machine's paths or files.
+27. As an async runtime author, I want a non-blocking dispatch entry point, so that local execution does not freeze the Agent Loop or UI event loop.
+28. As a model, I want commands to access persistent files only in the configured workspace, so that a generated command cannot inspect or alter unrelated host files.
 
 ## Implementation Decisions
 
 - The tool subsystem extends the existing tool-domain definition model rather than creating another model-facing schema type. Existing parsed tool-call and conversation result blocks retain their current responsibilities.
 - A new execution-domain result carries model-readable content, JSON-compatible metadata, and an optional stable error code. Error state is derived exclusively from the presence of that code; no independently mutable error boolean exists.
+- `ToolResult.to_message_block` binds an execution result to a tool call. The model adapter serializes content, metadata, and error code together as a JSON tool-message envelope.
 - The common executable-tool interface accepts an existing, already accepted tool call and returns an execution result. Individual tools contain capability behavior only: they do not perform approval, permission-policy, UI, agent-loop, or conversation-history work.
 - The registry is a deep module with a small interface: registration, lookup, definition enumeration, and consistent execution dispatch. It owns no workspace configuration, file system, process service, policy, or runtime state.
+- The registry offers synchronous `execute` for CLI/tests and worker-thread-backed `execute_async` for async Agent Loop/UI callers.
 - Runtime composition is explicit: it constructs shared filesystem and process modules from the configured workspace, injects those modules into tools, then registers tools. No global workspace configuration is introduced.
 - A filesystem module centralizes relative-path normalization, absolute-path rejection, workspace containment, final symlink containment, UTF-8 validation, regular-file validation, atomic text replacement, and controlled traversal. It accepts `/` path separators at the tool interface and returns workspace-relative POSIX paths.
 - Absolute paths and any lexical or resolved path escaping the workspace are rejected. An internal symlink is usable only when its resolved target remains inside the configured workspace.
-- Text files are strict UTF-8 regular files without NUL bytes. Directories, missing files, binary or non-UTF-8 files, and unsafe paths become structured operational errors. New write content containing NUL is also rejected as non-text.
+- Text files are strict UTF-8 regular files without NUL bytes. Direct reads of directories, missing files, binary or non-UTF-8 files, and unsafe paths become structured operational errors. Search traversal skips non-text files and continues with remaining files. New write content containing NUL is rejected as non-text.
 - Existing-file writes use a same-directory temporary file plus atomic replacement. Existing mode and executable permission are preserved where practical; ACLs, extended attributes, fsync durability protocols, and broader metadata preservation are not implemented.
 - `read` uses one-based offsets and a default limit of 200. The limit must be an integer from 1 through 2,000, expressed in both the model schema and local validation. Out-of-range offsets return an empty success page. Read metadata contains `requested_limit`, `returned_lines`, `total_lines`, `start_line`, `end_line`, and `truncated`; an empty page uses `start_line = offset` and `end_line = offset - 1`.
 - `edit` performs exact, case-sensitive string replacement. `old_string` must be nonempty without trimming; whitespace-only strings are valid. `new_string` may be empty. A non-global edit requires exactly one match, while global edit replaces all matches. Failed matching never writes the file.
 - `glob` and `grep` use a single platform-neutral Python traversal implementation rather than selecting between ripgrep and a fallback. They return only regular files, use stable workspace-relative POSIX ordering, limit results to 200, and expose truncation.
 - Default traversal excludes `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `build`, and `dist`. The exclusion is overridden only when the caller explicitly chooses such a directory as `path`; a matching-looking pattern does not override it.
 - `glob` treats its pattern as a relative pathlib-style glob below the selected path. `grep` treats `pattern` as a Python regular expression and optional `include` as a glob against workspace-relative POSIX paths. Invalid regexes produce `INVALID_REGEX`.
-- The process module resolves `cwd` through the filesystem module. It runs non-interactive commands with `bash -c` on Linux/macOS, falling back to `sh -c`; on Windows it prefers `pwsh` and falls back to `powershell` with profiles and interactive behavior disabled.
+- The process module resolves `cwd` through the filesystem module. Production composition requires Linux bubblewrap and runs `bash --noprofile --norc -c` in a new namespace with only `/usr`, process/device support, an ephemeral `/tmp`, and the workspace mounted read-write. Host environment variables, host paths, capabilities, and network namespaces are not inherited. If isolation is unavailable, execution fails closed with `PROCESS_START_FAILED`; it never silently falls back to a host shell.
 - Command timeout defaults to 60,000 ms and is constrained to 1 through 300,000 ms. The process module captures stdout and stderr independently, preserving bounded head and tail portions of each 100 KiB stream. It reports duration, exit code, timeout, and truncation. A non-zero exit code is a completed execution, not a tool error.
-- On timeout the process module makes a best effort to terminate the spawned process group and retain already captured output. Platform-specific process-tree termination is best effort only.
+- On timeout the process module terminates the sandbox process group, bounds all subsequent waits, and retains already captured output. Reader threads are daemonized and bounded so a detached descendant retaining a pipe cannot indefinitely block the Agent.
 - Error codes include at least invalid arguments, unknown tool, workspace escape, not found, not a file, not text, invalid regex, missing edit match, ambiguous edit, I/O failure, process start failure, timeout, and unexpected internal failure. Expected operational failures are converted into execution results at the registry/tool seam.
 - Every model-visible tool schema is an object with `additionalProperties: false`. Required fields, defaults, numeric ranges, and `edit.old_string` minimum length agree with local validation.
+- `ToolDefinition.validate_arguments` is the runtime source of truth for the supported JSON Schema subset. It validates types, required/unknown fields, string lengths and numeric ranges, and applies defaults before dispatch; capability functions retain only semantic checks such as regex compilation and workspace containment.
 
 ## Testing Decisions
 
@@ -83,9 +89,9 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 
 ## Out of Scope
 
-- Approval workflows, user interaction, general permission policy, sandboxing, filesystem access control, and command authorization.
+- Approval workflows, user interaction, general permission policy, and command authorization beyond the mandatory workspace sandbox.
 - Agent-loop control, conversation-history mutation, UI communication, and conversion of execution results into conversation result blocks.
-- Persistent command sessions, stdin streaming, job management, process reattachment, and full cross-platform process-tree guarantees.
+- Persistent command sessions, stdin streaming, job management, process reattachment, and non-Linux command sandbox backends.
 - `apply_patch`, git-specific, browser, web, MCP, or subagent tools.
 - Arbitrary shell-command translation between operating systems.
 - Ripgrep integration, pluggable search backends, parallel tool execution, deferred-tool exposure, tool search, and registry production features beyond the MVP.
@@ -93,7 +99,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 
 ## Further Notes
 
-- The configured command cwd constrains only the initial working directory. Until a later sandbox or policy layer exists, `exec_command` can still access host paths, network resources, and child processes allowed by the host shell. It provides no isolation guarantee.
+- `run_command` uses a Linux bubblewrap namespace. `/workspace` is the sole persistent writable mount; `/tmp` is ephemeral, other host paths are absent, and the network is unshared. This is capability isolation, not an approval or intent policy.
 - Model-facing paths should remain workspace-relative POSIX paths even when the runtime executes on Windows. The runtime does not translate arbitrary command syntax between shells.
 - The result limit for glob and grep is 200; each stdout and stderr capture budget is 100 KiB. These are resource limits, not approval or permission decisions, and all truncation is exposed to the model.
 - This specification is local by explicit request and has not been published as a GitHub Issue.
@@ -107,7 +113,8 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 - `filesystem.py` 的 `WorkspaceFilesystem` 是工作区路径、文本文件和原子写入的唯一
   入口；`ToolOperationError` 将预期的本地操作失败编码为稳定错误码。
 - `process.py` 的 `CommandRunner` 通过受验证的初始目录运行一次 shell 命令，并分别在
-  metadata 中返回 stdout、stderr、持续时间、退出码、超时和截断状态。
+  metadata 中返回 stdout、stderr、持续时间、退出码、`command_succeeded`、sandbox、
+  超时和截断状态。非零退出是已完成但失败的命令，不是工具基础设施错误。
 - `registry.py` 的 `ToolRegistry` 提供注册、查找、定义列举及对既有
   `ToolCallBlock` 的统一分派；它不保存任何工作区配置。
 - `local.py` 显式组合共享的文件系统与进程服务，并注册
