@@ -10,6 +10,7 @@ from .types import (
     ProviderConfig,
     ProviderProfile,
     ReasoningRetention,
+    ThinkingCapabilities,
     Usage,
 )
 
@@ -23,6 +24,7 @@ __all__ = [
     "ProviderConfig",
     "ProviderProfile",
     "ReasoningRetention",
+    "ThinkingCapabilities",
     "Usage",
     "create_provider_config",
 ]

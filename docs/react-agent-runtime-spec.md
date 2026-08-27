@@ -52,8 +52,11 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Ticket 03 已实现多 Turn 与设置冻结：`Conversation` 独占合法历史，Runtime 通过公开
   provider 配置 ID 和模型解析每个 Turn 的 `LLMProvider`，`ModelInvoker` 将冻结的
   temperature、max tokens 与 allowlisted thinking 设置应用于整个工具链。默认设置更新
-  使用单调版本和 `SETTINGS_CONFLICT`，一次性完整 override 不改写 Thread 默认值；API key、
-  base URL 与任意 `extra_body` 均不属于公开设置。
+  使用单调版本和 `SETTINGS_CONFLICT`；`TurnSettingsOverride` 以 `UNSET` 区分继承和显式
+  `None`，因此可以只覆盖一个字段且不改写 Thread 默认值。每个 provider 实例暴露所选
+  模型的 `ThinkingCapabilities`，Runtime 在请求前验证 thinking 开关、budget 和 keep，
+  不支持的组合以 `UNSUPPORTED_MODEL_SETTING` 失败。API key、base URL 与任意
+  `extra_body` 均不属于公开设置。
 
 ## User Stories
 
@@ -157,8 +160,9 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - A repeated failure fingerprint consists of tool name, canonically normalized arguments, and error code. Only three consecutive identical fingerprints stop a Turn. Different failed operations do not count as one repeated sequence.
 - Normal completion occurs only when the assistant response contains no tool calls. Budget exhaustion and repeated failure produce `LIMIT_REACHED` with an exact stop reason. Cancellation produces `CANCELLED`. Non-retryable model or Runtime failures produce `FAILED`. Ordinary tool errors remain in the loop.
 - `ThreadSettings` contains the public defaults used by future Turns and has a monotonically increasing version. An update supplies its expected version; stale writes fail with `SETTINGS_CONFLICT`. Settings accepted during an active Turn affect only subsequent Turns.
-- `TurnConfig` is an immutable snapshot created when a Turn starts. It contains provider configuration reference, public model name, temperature, maximum output tokens, supported thinking options, PromptBuilder output, reasoning visibility, and effective Agent limits. Values cannot change during the Turn.
+- `TurnConfig` is an immutable snapshot created when a Turn starts. A field-level `TurnSettingsOverride` is merged with Thread defaults first; an internal `UNSET` sentinel means inherit while explicit `None` clears an optional value for that Turn. The snapshot contains provider configuration reference, public model name, temperature, maximum output tokens, supported thinking options, PromptBuilder output, reasoning visibility, and effective Agent limits. Values cannot change during the Turn.
 - Frontend-controllable provider data is allowlisted. The public settings include provider configuration ID, public model, temperature, maximum output tokens, supported thinking options, and bounded Agent limits. API keys, base URLs, raw provider bodies, credentials, and backend hard ceilings are not public settings.
+- Thinking request fields are fail-closed against the selected model's `ThinkingCapabilities` before the first model request. Provider defaults may be refined by exact-model `ModelProfile` overrides; unsupported thinking, budget, or keep values return `UNSUPPORTED_MODEL_SETTING` rather than passing an unchecked private body to the provider.
 - The workspace reference is immutable after Thread creation. Selecting another folder requires another Thread so old message paths and diffs never change meaning.
 - `WorkspaceLeaseManager` normalizes real workspace roots and treats equal paths or ancestor/descendant relationships as overlapping. Multiple Threads may refer to overlapping roots, but only one overlapping Turn may hold a lease. A conflict fails immediately with `WORKSPACE_BUSY`; there is no implicit queue. A lease is held during `RUNNING` and `WAITING_APPROVAL` and released on every terminal path.
 - Before a Turn enters the loop, workspace validation rejects a symlink root, any symlink path entry, regular files whose hard-link count exceeds one, and nested mount or bind-mount points. Validation is complete within configured entry and time budgets; reaching either budget fails closed with `WORKSPACE_VALIDATION_LIMIT`.

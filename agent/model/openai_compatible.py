@@ -48,6 +48,7 @@ class OpenAICompatibleProvider(LLMProvider):
 
     def __init__(self, config: ProviderConfig, client: Any | None = None) -> None:
         self.config = config
+        self.capabilities = config.capabilities
         self._client = client or self._create_client(config)
 
     @staticmethod

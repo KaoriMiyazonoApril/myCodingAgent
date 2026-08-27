@@ -8,6 +8,7 @@
 
 - [x] Thread 完成一个 Turn 后回到可接受下一条消息的状态，并保留合法对话历史。
 - [x] `ThreadSettings` 使用版本检查拒绝过期更新。
-- [x] `TurnConfig` 在启动时冻结，运行中的设置修改只影响下一 Turn。
+- [x] `TurnSettingsOverride` 支持字段级单 Turn 覆盖，`TurnConfig` 在启动时冻结，运行中的设置修改只影响下一 Turn。
 - [x] 两个 Turn 之间可以切换 provider 配置与模型，并按新模型能力处理旧 reasoning。
+- [x] Thinking 设置在请求前按所选模型 capability 校验，不支持的选项 fail closed。
 - [x] API key、base URL 和原始 provider 参数不进入公开设置。

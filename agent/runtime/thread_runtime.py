@@ -15,7 +15,12 @@ from .errors import SettingsConflictError, ThreadBusyError
 from .loop import AgentLoop
 from .model_invoker import ModelInvoker
 from .prompt import PromptBuilder
-from .settings import ModelSettings, ThreadSettings, TurnConfig
+from .settings import (
+    ModelSettings,
+    ThreadSettings,
+    TurnConfig,
+    TurnSettingsOverride,
+)
 from .types import ThreadSnapshot, ThreadStatus, TurnStatus, TurnSummary
 
 
@@ -79,7 +84,7 @@ class ThreadRuntime:
         thread_id: str,
         user_text: str,
         *,
-        settings_override: ModelSettings | None = None,
+        settings_override: TurnSettingsOverride | None = None,
     ) -> TurnSummary:
         record = self._threads[thread_id]
         if record.status is not ThreadStatus.IDLE:
@@ -92,7 +97,7 @@ class ThreadRuntime:
             )
             if settings_override is None
             else TurnConfig.from_model_settings(
-                settings_override,
+                settings_override.apply(record.settings),
                 settings_version=record.settings.version,
                 system_prompt=self._system_prompt,
             )

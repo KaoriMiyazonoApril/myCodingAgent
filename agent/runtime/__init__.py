@@ -1,6 +1,6 @@
 """Public interface for the in-memory ReAct Agent Runtime."""
 
-from .errors import SettingsConflictError, ThreadBusyError
+from .errors import SettingsConflictError, ThreadBusyError, UnsupportedModelSettingError
 from .prompt import PromptBuilder
 from .settings import (
     ModelSettings,
@@ -8,6 +8,7 @@ from .settings import (
     ThinkingSettings,
     ThreadSettings,
     TurnConfig,
+    TurnSettingsOverride,
 )
 from .thread_runtime import ThreadRuntime
 from .types import ThreadSnapshot, ThreadStatus, TurnStatus, TurnSummary
@@ -22,6 +23,8 @@ __all__ = [
     "ThinkingSettings",
     "ThreadSettings",
     "TurnConfig",
+    "TurnSettingsOverride",
+    "UnsupportedModelSettingError",
     "ThreadSnapshot",
     "ThreadStatus",
     "TurnStatus",

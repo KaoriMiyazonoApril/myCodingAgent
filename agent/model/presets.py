@@ -10,23 +10,30 @@ from .types import (
     ProviderConfig,
     ProviderProfile,
     ReasoningRetention,
+    ThinkingCapabilities,
 )
 
-
-REASONING_TOOL_CALLS = ProviderCapabilities(
-    reasoning_retention=ReasoningRetention.TOOL_CHAIN_ONLY,
-    reasoning_input_field="reasoning_content",
-)
-
-PRESERVED_REASONING = ProviderCapabilities(
-    reasoning_retention=ReasoningRetention.ALWAYS,
-    reasoning_input_field="reasoning_content",
-)
 
 DEEPSEEK_CAPABILITIES = ProviderCapabilities(
     reasoning_retention=ReasoningRetention.TOOL_CHAIN_ONLY,
     reasoning_input_field="reasoning_content",
     requires_assistant_content_for_tool_calls=True,
+    thinking=ThinkingCapabilities(supported=True),
+)
+
+KIMI_CAPABILITIES = ProviderCapabilities(
+    reasoning_retention=ReasoningRetention.ALWAYS,
+    reasoning_input_field="reasoning_content",
+    thinking=ThinkingCapabilities(
+        supported=True,
+        supported_keep_values=("none", "all"),
+    ),
+)
+
+GLM_CAPABILITIES = ProviderCapabilities(
+    reasoning_retention=ReasoningRetention.TOOL_CHAIN_ONLY,
+    reasoning_input_field="reasoning_content",
+    thinking=ThinkingCapabilities(supported=True),
 )
 
 PROVIDER_PRESETS = MappingProxyType(
@@ -37,15 +44,15 @@ PROVIDER_PRESETS = MappingProxyType(
         ),
         "kimi": ProviderProfile(
             base_url="https://api.moonshot.cn/v1",
-            default_capabilities=PRESERVED_REASONING,
+            default_capabilities=KIMI_CAPABILITIES,
         ),
         "moonshot": ProviderProfile(
             base_url="https://api.moonshot.cn/v1",
-            default_capabilities=PRESERVED_REASONING,
+            default_capabilities=KIMI_CAPABILITIES,
         ),
         "glm": ProviderProfile(
             base_url="https://open.bigmodel.cn/api/paas/v4",
-            default_capabilities=REASONING_TOOL_CALLS,
+            default_capabilities=GLM_CAPABILITIES,
         ),
     }
 )

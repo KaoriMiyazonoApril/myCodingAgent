@@ -66,6 +66,9 @@ reasoning 历史由 `ProviderCapabilities.reasoning_retention` 的三态策略�
 `reasoning_details` 等非默认字段，只需配置 capability，无需修改适配器。供应商私有的
 thinking 启用参数在该底层边界仍通过 `extra_body` 指定。Agent Runtime 不向前端公开这个
 任意参数逃生口，而是从 allowlisted `ThinkingSettings` 生成受限的 `thinking` 对象。
+`ProviderCapabilities.thinking` 使用 `ThinkingCapabilities` 声明所选模型是否支持开关、
+`budget_tokens` 以及允许的 `keep` 值；`ModelInvoker` 在第一次请求前逐项校验，未知或
+不支持的组合 fail closed 为 `UNSUPPORTED_MODEL_SETTING`。
 
 解析响应时，文本变成 `TextBlock`，能力声明匹配到的字符串 reasoning 字段变成
 `ReasoningBlock`。工具调用参数用 `json.loads` 解析为 `dict`。空参数
@@ -89,15 +92,18 @@ envelope：`ok`、`content`、`metadata`、`error_code` 会一起进入 tool mes
 仍可用 `base_url` 覆盖。每个 `ProviderProfile` 提供默认 capabilities，并可通过精确模型
 名映射到 `ModelProfile` 的逐字段覆盖；未覆盖字段继承 provider 默认值。对于可空字段，
 内部 `UNSET` 表示继承，而显式 `None` 表示禁用，因此 model profile 可以清除 provider
-默认的 reasoning 输入字段。调用方也可在创建配置时显式传入完整 capabilities。
+默认的 reasoning 输入字段。Thinking 能力同样可由精确模型 profile 整体覆盖，Runtime
+据此校验当前选择，而不是按 provider 名称猜测。调用方也可在创建配置时显式传入完整
+capabilities。
 
 当前 DeepSeek 预设面向 `deepseek-v4-flash` 与 `deepseek-v4-pro` 等当前模型，不再保留已
 退役的 `deepseek-chat` / `deepseek-reasoner` 特例；其 reasoning 使用
 `TOOL_CHAIN_ONLY`，且 tool-call assistant message 需要非 null content。Kimi/Moonshot
-预设使用 `ALWAYS`，与 preserved thinking 默认保留完整历史的行为对齐；只有调用方实际
-开启 thinking 时，底层调用方可通过 `extra_body` 传入相应的 `thinking.keep` 等私有参数；
-Runtime 调用方则使用安全的 `ThinkingSettings`。GLM
-预设继续使用 `TOOL_CHAIN_ONLY`。API key 不会出现在 `ProviderConfig` 的默认 repr 中，
+预设使用 `ALWAYS`，与 preserved thinking 默认保留完整历史的行为对齐，并声明其
+`thinking.keep` allowlist；DeepSeek 与 GLM 声明支持 thinking 开关，但不声称支持当前
+OpenAI-compatible 协议未列出的 budget/keep 字段。Runtime 调用方只使用安全的
+`ThinkingSettings`。GLM 预设继续使用 `TOOL_CHAIN_ONLY`。API key 不会出现在
+`ProviderConfig` 的默认 repr 中，
 示例也只从环境变量读取 key。
 
 能力声明依据供应商的 thinking + tool-call 协议文档：

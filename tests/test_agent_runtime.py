@@ -22,6 +22,7 @@ from agent.model.types import (
     ProviderCapabilities,
     ProviderConfig,
     ReasoningRetention,
+    ThinkingCapabilities,
     Usage,
 )
 from agent.runtime import (
@@ -32,7 +33,9 @@ from agent.runtime import (
     ThreadBusyError,
     ThreadRuntime,
     ThreadStatus,
+    TurnSettingsOverride,
     TurnStatus,
+    UnsupportedModelSettingError,
 )
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
@@ -331,6 +334,13 @@ def test_one_turn_override_changes_provider_and_thinking_without_rewriting_defau
             ),
         ]
     )
+    provider.capabilities = ProviderCapabilities(
+        thinking=ThinkingCapabilities(
+            supported=True,
+            supports_budget_tokens=True,
+            supported_keep_values=("all",),
+        )
+    )
     resolved: list[tuple[str, str]] = []
 
     def resolve_provider(provider_config_id: str, model: str) -> LLMProvider:
@@ -343,7 +353,7 @@ def test_one_turn_override_changes_provider_and_thinking_without_rewriting_defau
         temperature=0.2,
         max_tokens=1000,
     )
-    override = ModelSettings(
+    override = TurnSettingsOverride(
         provider_config_id="provider-b",
         model="model-b",
         temperature=0.9,
@@ -385,6 +395,129 @@ def test_one_turn_override_changes_provider_and_thinking_without_rewriting_defau
     snapshot = runtime.get_snapshot(thread.thread_id)
     assert snapshot.settings.provider_config_id == "provider-a"
     assert snapshot.settings.version == 0
+
+
+def test_one_turn_override_can_change_only_temperature_and_inherit_defaults(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(role="assistant", content=[TextBlock(text="Done.")]),
+                finish_reason="stop",
+                usage=Usage(),
+            )
+        ]
+    )
+    resolved: list[tuple[str, str]] = []
+    runtime = ThreadRuntime(
+        provider_resolver=lambda config_id, model: (
+            resolved.append((config_id, model)) or provider
+        ),
+        default_settings=ModelSettings(
+            provider_config_id="provider-a",
+            model="model-a",
+            temperature=0.2,
+            max_tokens=1000,
+        ),
+        tool_registry_factory=empty_tools,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    asyncio.run(
+        runtime.run_turn(
+            thread.thread_id,
+            "Use a temporary temperature.",
+            settings_override=TurnSettingsOverride(temperature=0.9),
+        )
+    )
+
+    assert resolved == [("provider-a", "model-a")]
+    assert provider.requests[0].temperature == 0.9
+    assert provider.requests[0].max_tokens == 1000
+    assert runtime.get_snapshot(thread.thread_id).settings.temperature == 0.2
+
+
+def test_one_turn_override_can_explicitly_disable_an_inherited_optional_value(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(role="assistant", content=[TextBlock(text="Done.")]),
+                finish_reason="stop",
+                usage=Usage(),
+            )
+        ]
+    )
+    provider.capabilities = ProviderCapabilities(
+        thinking=ThinkingCapabilities(supported=True)
+    )
+    runtime = runtime_for_provider(
+        provider,
+        default_settings=ModelSettings(
+            provider_config_id="provider",
+            model="thinking-model",
+            thinking=ThinkingSettings(enabled=True),
+        ),
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    asyncio.run(
+        runtime.run_turn(
+            thread.thread_id,
+            "Do not think for this Turn.",
+            settings_override=TurnSettingsOverride(thinking=None),
+        )
+    )
+
+    assert provider.requests[0].extra_body is None
+    assert runtime.get_snapshot(thread.thread_id).settings.thinking == ThinkingSettings(
+        enabled=True
+    )
+
+
+def test_thinking_settings_are_rejected_when_selected_model_does_not_support_them(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider([])
+    runtime = runtime_for_provider(
+        provider,
+        default_settings=ModelSettings(
+            provider_config_id="provider",
+            model="model-without-thinking",
+            thinking=ThinkingSettings(enabled=True),
+        ),
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    with pytest.raises(UnsupportedModelSettingError, match="does not support thinking"):
+        asyncio.run(runtime.run_turn(thread.thread_id, "Think."))
+
+    assert provider.requests == []
+
+
+def test_thinking_option_is_checked_against_selected_model_capabilities(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider([])
+    provider.capabilities = ProviderCapabilities(
+        thinking=ThinkingCapabilities(supported=True),
+    )
+    runtime = runtime_for_provider(
+        provider,
+        default_settings=ModelSettings(
+            provider_config_id="provider",
+            model="thinking-model",
+            thinking=ThinkingSettings(enabled=True, budget_tokens=512),
+        ),
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    with pytest.raises(UnsupportedModelSettingError, match="budget_tokens"):
+        asyncio.run(runtime.run_turn(thread.thread_id, "Think longer."))
+
+    assert provider.requests == []
 
 
 def test_switching_models_reencodes_old_reasoning_and_keeps_secrets_private(

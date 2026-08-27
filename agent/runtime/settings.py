@@ -5,6 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from agent.model.types import ThinkingCapabilities
+
+from .errors import UnsupportedModelSettingError
+
+
+class _Unset:
+    """Sentinel separating inheritance from an explicit ``None`` override."""
+
+
+_UNSET = _Unset()
+
 
 class ThinkingKeep(str, Enum):
     """Allowlisted provider history-preservation request values."""
@@ -46,6 +57,25 @@ class ThinkingSettings:
         if self.keep is not None:
             thinking["keep"] = self.keep.value
         return {"thinking": thinking}
+
+    def validate_for(self, capabilities: ThinkingCapabilities) -> None:
+        if not capabilities.supported:
+            raise UnsupportedModelSettingError(
+                "selected model does not support thinking"
+            )
+        if (
+            self.budget_tokens is not None
+            and not capabilities.supports_budget_tokens
+        ):
+            raise UnsupportedModelSettingError(
+                "selected model does not support thinking.budget_tokens"
+            )
+        if self.keep is not None and (
+            self.keep.value not in capabilities.supported_keep_values
+        ):
+            raise UnsupportedModelSettingError(
+                f"selected model does not support thinking.keep={self.keep.value!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +132,39 @@ class ThreadSettings(ModelSettings):
             thinking=settings.thinking,
             version=version,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class TurnSettingsOverride:
+    """Field-level settings patch applied to exactly one Turn."""
+
+    provider_config_id: str | _Unset = _UNSET
+    model: str | _Unset = _UNSET
+    temperature: float | None | _Unset = _UNSET
+    max_tokens: int | None | _Unset = _UNSET
+    thinking: ThinkingSettings | None | _Unset = _UNSET
+
+    def apply(self, defaults: ModelSettings) -> ModelSettings:
+        return ModelSettings(
+            provider_config_id=(
+                defaults.provider_config_id
+                if self.provider_config_id is _UNSET
+                else self.provider_config_id
+            ),
+            model=defaults.model if self.model is _UNSET else self.model,
+            temperature=(
+                defaults.temperature
+                if self.temperature is _UNSET
+                else self.temperature
+            ),
+            max_tokens=(
+                defaults.max_tokens if self.max_tokens is _UNSET else self.max_tokens
+            ),
+            thinking=(
+                defaults.thinking if self.thinking is _UNSET else self.thinking
+            ),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class TurnConfig(ModelSettings):

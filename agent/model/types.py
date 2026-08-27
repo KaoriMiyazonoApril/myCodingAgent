@@ -28,6 +28,36 @@ _UNSET = _Unset()
 
 
 @dataclass(frozen=True, slots=True)
+class ThinkingCapabilities:
+    """Allowlisted thinking request features supported by one model."""
+
+    supported: bool = False
+    supports_budget_tokens: bool = False
+    supported_keep_values: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.supported, bool):
+            raise LLMConfigurationError("thinking supported must be a boolean")
+        if not isinstance(self.supports_budget_tokens, bool):
+            raise LLMConfigurationError(
+                "thinking supports_budget_tokens must be a boolean"
+            )
+        if not isinstance(self.supported_keep_values, tuple) or any(
+            not isinstance(value, str) or not value
+            for value in self.supported_keep_values
+        ):
+            raise LLMConfigurationError(
+                "thinking supported_keep_values must be non-empty strings"
+            )
+        if not self.supported and (
+            self.supports_budget_tokens or self.supported_keep_values
+        ):
+            raise LLMConfigurationError(
+                "unsupported thinking cannot declare optional features"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderCapabilities:
     """Protocol behavior that differs between OpenAI-compatible providers."""
 
@@ -35,6 +65,7 @@ class ProviderCapabilities:
     reasoning_input_field: str | None = None
     reasoning_output_fields: tuple[str, ...] = ("reasoning_content", "thinking")
     requires_assistant_content_for_tool_calls: bool = False
+    thinking: ThinkingCapabilities = field(default_factory=ThinkingCapabilities)
 
     def __post_init__(self) -> None:
         if not isinstance(self.reasoning_retention, ReasoningRetention):
@@ -52,6 +83,8 @@ class ProviderCapabilities:
             raise LLMConfigurationError(
                 "requires_assistant_content_for_tool_calls must be a boolean"
             )
+        if not isinstance(self.thinking, ThinkingCapabilities):
+            raise LLMConfigurationError("thinking must be ThinkingCapabilities")
         if not isinstance(self.reasoning_output_fields, tuple) or any(
             not isinstance(field_name, str) or not field_name
             for field_name in self.reasoning_output_fields
@@ -69,6 +102,7 @@ class ModelProfile:
     reasoning_input_field: str | None | _Unset = _UNSET
     reasoning_output_fields: tuple[str, ...] | _Unset = _UNSET
     requires_assistant_content_for_tool_calls: bool | None = None
+    thinking: ThinkingCapabilities | None = None
 
     def apply(self, defaults: ProviderCapabilities) -> ProviderCapabilities:
         return ProviderCapabilities(
@@ -91,6 +125,9 @@ class ModelProfile:
                 self.requires_assistant_content_for_tool_calls
                 if self.requires_assistant_content_for_tool_calls is not None
                 else defaults.requires_assistant_content_for_tool_calls
+            ),
+            thinking=(
+                self.thinking if self.thinking is not None else defaults.thinking
             ),
         )
 

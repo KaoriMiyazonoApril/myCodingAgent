@@ -31,6 +31,7 @@ from agent.model.types import (
     ProviderConfig,
     ProviderProfile,
     ReasoningRetention,
+    ThinkingCapabilities,
 )
 from agent.tools.types import ToolDefinition, ToolResult
 
@@ -233,6 +234,20 @@ def test_model_profile_can_explicitly_disable_a_provider_default_field() -> None
 
     assert resolved.reasoning_retention is ReasoningRetention.NEVER
     assert resolved.reasoning_input_field is None
+
+
+def test_model_profile_can_override_provider_thinking_capabilities() -> None:
+    profile = ProviderProfile(
+        base_url="https://example.invalid",
+        default_capabilities=ProviderCapabilities(
+            thinking=ThinkingCapabilities(supported=True),
+        ),
+        model_profiles={
+            "plain": ModelProfile(thinking=ThinkingCapabilities()),
+        },
+    )
+
+    assert profile.capabilities_for("plain").thinking.supported is False
 
 
 def test_reasoning_output_fields_are_provider_configurable() -> None:

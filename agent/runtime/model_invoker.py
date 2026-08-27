@@ -16,6 +16,8 @@ class ModelInvoker:
     def __init__(self, provider: LLMProvider, config: TurnConfig) -> None:
         self._provider = provider
         self._config = config
+        if config.thinking is not None:
+            config.thinking.validate_for(provider.capabilities.thinking)
 
     async def chat(
         self,

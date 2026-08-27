@@ -6,11 +6,13 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 
 from .errors import LLMStreamingNotImplementedError
-from .types import LLMEvent, LLMRequest, LLMResponse
+from .types import LLMEvent, LLMRequest, LLMResponse, ProviderCapabilities
 
 
 class LLMProvider(ABC):
     """A provider that accepts and returns only local model-layer types."""
+
+    capabilities = ProviderCapabilities()
 
     @abstractmethod
     async def chat(self, request: LLMRequest) -> LLMResponse:
