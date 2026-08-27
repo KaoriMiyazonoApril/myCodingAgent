@@ -1,6 +1,7 @@
 """Public interface for the in-memory ReAct Agent Runtime."""
 
 from .errors import SettingsConflictError, ThreadBusyError, UnsupportedModelSettingError
+from .events import AgentEvent, EventBatch
 from .prompt import PromptBuilder
 from .settings import (
     ModelSettings,
@@ -11,10 +12,13 @@ from .settings import (
     TurnSettingsOverride,
 )
 from .thread_runtime import ThreadRuntime
-from .types import ThreadSnapshot, ThreadStatus, TurnStatus, TurnSummary
+from .types import SCHEMA_VERSION, ThreadSnapshot, ThreadStatus, TurnStatus, TurnSummary
 
 __all__ = [
     "ThreadRuntime",
+    "AgentEvent",
+    "EventBatch",
+    "SCHEMA_VERSION",
     "ThreadBusyError",
     "PromptBuilder",
     "ModelSettings",

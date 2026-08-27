@@ -57,6 +57,18 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   模型的 `ThinkingCapabilities`，Runtime 在请求前验证 thinking 开关、budget 和 keep，
   不支持的组合以 `UNSUPPORTED_MODEL_SETTING` 失败。API key、base URL 与任意
   `extra_body` 均不属于公开设置。
+- Ticket 04 已实现版本化公开状态与阶段事件：`ThreadSnapshot` 现在包含脱敏后的完整公开
+  对话、时间戳和最近一次 `TurnSummary`，两者均通过 `to_dict()` 产生可直接 JSON 编码的
+  独立数据。公开消息保留用户/助手文本、工具调用与安全工具结果，但排除 system prompt、
+  reasoning、credentials 和内部 traceback。Summary 已提供终止原因、累计 usage、计数与
+  时间戳；修改文件和 diff 字段在 Ticket 08 接入 `ChangeTracker` 前明确报告为空且
+  `diff_complete = false`。
+- 每个 Turn 通过 `TurnEventEmitter` 产生带 schema version、UUID、时间戳和单调 sequence
+  的完整阶段事件，包括 Turn 生命周期、模型完整响应与工具请求/开始/完成。Thread 使用
+  可配置的定长 ring buffer；写入只淘汰最旧事件，不会等待消费者。`get_events()` 通过
+  event ID 游标读取，游标已淘汰时返回 `cursor_expired = true`，调用方据此重新读取
+  Snapshot。reasoning 默认不进入任何公开状态或普通事件；仅当后端显式配置 `debug` 时，
+  才紧随模型响应发出独立的 `model_reasoning` 事件。
 
 ## User Stories
 

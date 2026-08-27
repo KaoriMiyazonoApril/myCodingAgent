@@ -4,11 +4,10 @@
 
 **Blocked by:** 03: 支持多轮 Thread 与版本化模型设置.
 
-**Status:** ready-for-agent
+**Status:** completed
 
-- [ ] `ThreadSnapshot`、`TurnSummary` 和公开消息只包含版本化、安全、JSON-compatible 数据。
-- [ ] 阶段事件包含稳定 envelope 和每 Turn 单调递增 sequence。
-- [ ] 有界 ring buffer 不会因消费者缺席或缓慢而阻塞 Agent。
-- [ ] 事件过期可通过重新读取 Snapshot 恢复当前状态。
-- [ ] reasoning 默认隐藏，debug 模式下只作为独立事件发送。
-
+- [x] `ThreadSnapshot`、`TurnSummary` 和公开消息只包含版本化、安全、JSON-compatible 数据。
+- [x] 阶段事件包含稳定 envelope 和每 Turn 单调递增 sequence。
+- [x] 有界 ring buffer 不会因消费者缺席或缓慢而阻塞 Agent。
+- [x] 事件过期可通过重新读取 Snapshot 恢复当前状态。
+- [x] reasoning 默认隐藏，debug 模式下只作为独立事件发送。

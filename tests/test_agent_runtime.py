@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -155,6 +156,26 @@ def runtime_for_provider(
         tool_registry_factory=tool_registry_factory,
         additional_system_instructions=additional_system_instructions,
     )
+
+
+@pytest.mark.parametrize(
+    "runtime_option",
+    [
+        {"event_buffer_capacity": 0},
+        {"event_buffer_capacity": True},
+        {"reasoning_visibility": "public"},
+    ],
+)
+def test_public_event_configuration_fails_closed(runtime_option) -> None:
+    with pytest.raises(ValueError):
+        ThreadRuntime(
+            provider_resolver=lambda _config_id, _model: ScriptedProvider([]),
+            default_settings=ModelSettings(
+                provider_config_id="test-provider", model="test-model"
+            ),
+            tool_registry_factory=empty_tools,
+            **runtime_option,
+        )
 
 
 @pytest.mark.parametrize(
@@ -617,6 +638,216 @@ def test_user_can_complete_a_turn_without_tool_calls(tmp_path) -> None:
     assert snapshot.status is ThreadStatus.IDLE
     assert snapshot.active_turn_id is None
     assert snapshot.completed_turns == 1
+
+
+def test_snapshot_and_summary_are_versioned_safe_json_with_public_history(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[
+                        ReasoningBlock(text="private reasoning must stay hidden"),
+                        ToolCallBlock(
+                            id="call_missing",
+                            name="missing",
+                            arguments={"value": "public argument"},
+                            raw_arguments='{"value":"public argument"}',
+                        ),
+                    ],
+                ),
+                finish_reason="tool_calls",
+                usage=Usage(input_tokens=4, output_tokens=2, total_tokens=6),
+            ),
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[
+                        ReasoningBlock(text="another private thought"),
+                        TextBlock(text="Finished safely."),
+                    ],
+                ),
+                finish_reason="stop",
+                usage=Usage(input_tokens=8, output_tokens=3, total_tokens=11),
+            ),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        additional_system_instructions="internal system instruction",
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Do the work."))
+    snapshot = runtime.get_snapshot(thread.thread_id)
+    encoded = json.dumps(snapshot.to_dict(), allow_nan=False)
+
+    assert snapshot.schema_version == 1
+    assert summary.schema_version == 1
+    assert summary.stop_reason == "completed"
+    assert summary.usage == {
+        "input_tokens": 12,
+        "output_tokens": 5,
+        "total_tokens": 17,
+    }
+    assert snapshot.latest_turn == summary
+    assert [message["role"] for message in snapshot.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert "private reasoning" not in encoded
+    assert "private thought" not in encoded
+    assert "internal system instruction" not in encoded
+    assert "traceback" not in encoded.casefold()
+    assert snapshot.created_at.endswith("Z")
+    assert snapshot.updated_at.endswith("Z")
+    assert summary.started_at.endswith("Z")
+    assert summary.ended_at.endswith("Z")
+
+
+def test_turn_events_are_ordered_complete_and_json_compatible(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[
+                        ToolCallBlock(
+                            id="call_missing",
+                            name="missing",
+                            arguments={},
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+                usage=Usage(),
+            ),
+            LLMResponse(
+                message=Message(
+                    role="assistant", content=[TextBlock(text="Recovered.")]
+                ),
+                finish_reason="stop",
+                usage=Usage(),
+            ),
+        ]
+    )
+    runtime = runtime_for_provider(provider)
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Use a tool."))
+    batch = runtime.get_events(thread.thread_id)
+    encoded = json.dumps(batch.to_dict(), allow_nan=False)
+
+    assert not batch.cursor_expired
+    assert [event.type for event in batch.events] == [
+        "turn_started",
+        "model_response",
+        "tool_requested",
+        "tool_started",
+        "tool_finished",
+        "model_response",
+        "turn_completed",
+    ]
+    assert [event.sequence for event in batch.events] == list(range(1, 8))
+    assert len({event.event_id for event in batch.events}) == 7
+    assert {event.thread_id for event in batch.events} == {thread.thread_id}
+    assert {event.turn_id for event in batch.events} == {summary.turn_id}
+    assert all(event.schema_version == 1 for event in batch.events)
+    assert batch.latest_event_id == batch.events[-1].event_id
+    assert "UNKNOWN_TOOL" in encoded
+
+    batch.events[0].payload["user_message"] = "consumer mutation"
+    fresh_batch = runtime.get_events(thread.thread_id)
+    assert fresh_batch.events[0].payload["user_message"] == "Use a tool."
+
+
+def test_event_ring_buffer_drops_old_events_and_marks_expired_cursor(
+    tmp_path,
+) -> None:
+    async def scenario():
+        provider = PausingProvider()
+        runtime = ThreadRuntime(
+            provider_resolver=lambda _config_id, _model: provider,
+            default_settings=ModelSettings(
+                provider_config_id="test-provider", model="test-model"
+            ),
+            tool_registry_factory=empty_tools,
+            event_buffer_capacity=2,
+        )
+        thread = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(runtime.run_turn(thread.thread_id, "Wait."))
+        await provider.started.wait()
+        first_event_id = runtime.get_events(thread.thread_id).events[0].event_id
+        provider.release.set()
+        await active
+        return runtime, thread.thread_id, first_event_id
+
+    runtime, thread_id, expired_event_id = asyncio.run(scenario())
+    retained = runtime.get_events(thread_id)
+    expired = runtime.get_events(thread_id, after_event_id=expired_event_id)
+
+    assert len(retained.events) == 2
+    assert [event.type for event in retained.events] == [
+        "model_response",
+        "turn_completed",
+    ]
+    assert expired.cursor_expired
+    assert expired.events == []
+    assert runtime.get_snapshot(thread_id).latest_turn is not None
+
+
+@pytest.mark.parametrize(
+    ("visibility", "reasoning_event_count"),
+    [("hidden", 0), ("debug", 1)],
+)
+def test_reasoning_is_only_emitted_as_a_dedicated_debug_event(
+    tmp_path, visibility, reasoning_event_count
+) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[
+                        ReasoningBlock(text="sensitive chain"),
+                        TextBlock(text="Public answer."),
+                    ],
+                ),
+                finish_reason="stop",
+                usage=Usage(),
+            )
+        ]
+    )
+    runtime = ThreadRuntime(
+        provider_resolver=lambda _config_id, _model: provider,
+        default_settings=ModelSettings(
+            provider_config_id="test-provider", model="test-model"
+        ),
+        tool_registry_factory=empty_tools,
+        reasoning_visibility=visibility,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    asyncio.run(runtime.run_turn(thread.thread_id, "Answer."))
+    events = runtime.get_events(thread.thread_id).events
+    reasoning_events = [event for event in events if event.type == "model_reasoning"]
+    snapshot_json = json.dumps(runtime.get_snapshot(thread.thread_id).to_dict())
+
+    assert len(reasoning_events) == reasoning_event_count
+    assert "sensitive chain" not in snapshot_json
+    model_payload = next(
+        event.payload for event in events if event.type == "model_response"
+    )
+    assert "sensitive chain" not in json.dumps(model_payload)
+    if visibility == "debug":
+        assert reasoning_events[0].payload == {
+            "iteration": 1,
+            "text": "sensitive chain",
+        }
 
 
 def test_model_can_use_a_real_file_tool_and_continue_to_a_final_answer(

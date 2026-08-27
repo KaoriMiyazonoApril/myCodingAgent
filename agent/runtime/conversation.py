@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from agent.core.messages import Message, TextBlock, ToolResultBlock
 
+from .events import public_message
+
 
 class Conversation:
     """Own legal message construction while exposing request snapshots."""
@@ -26,3 +28,12 @@ class Conversation:
 
     def request_messages(self) -> list[Message]:
         return list(self._messages)
+
+    def public_messages(self) -> list[dict[str, object]]:
+        """Return a detached transcript without system prompts or reasoning."""
+
+        return [
+            serialized
+            for message in self._messages
+            if (serialized := public_message(message)) is not None
+        ]
