@@ -13,17 +13,11 @@ from agent.tools.registry import ToolRegistry
 
 from .errors import ThreadBusyError
 from .loop import AgentLoop
+from .prompt import PromptBuilder
 from .types import ThreadSnapshot, ThreadStatus, TurnStatus, TurnSummary
 
 
 ToolRegistryFactory = Callable[[Path], ToolRegistry]
-
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a local coding agent. Inspect relevant files before modifying them, "
-    "use the provided tools, validate completed work, and report only actions that "
-    "actually succeeded."
-)
-
 
 @dataclass(slots=True)
 class _ThreadRecord:
@@ -44,10 +38,13 @@ class ThreadRuntime:
         *,
         provider: LLMProvider,
         tool_registry_factory: ToolRegistryFactory,
-        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        additional_system_instructions: str | None = None,
+        prompt_builder: PromptBuilder | None = None,
     ) -> None:
         self._tool_registry_factory = tool_registry_factory
-        self._system_prompt = system_prompt
+        self._system_prompt = (prompt_builder or PromptBuilder()).build(
+            additional_system_instructions
+        )
         self._loop = AgentLoop(provider)
         self._threads: dict[str, _ThreadRecord] = {}
 

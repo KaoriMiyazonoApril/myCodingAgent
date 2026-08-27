@@ -9,6 +9,7 @@ from agent.core.messages import Message, TextBlock, ToolCallBlock, ToolResultBlo
 from agent.model.provider import LLMProvider
 from agent.model.types import LLMRequest, LLMResponse, Usage
 from agent.runtime import ThreadBusyError, ThreadRuntime, ThreadStatus, TurnStatus
+from agent.tools.local import create_local_tool_registry
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
 
@@ -75,7 +76,10 @@ def test_user_can_complete_a_turn_without_tool_calls(tmp_path) -> None:
     assert snapshot.completed_turns == 1
 
 
-def test_model_can_use_a_tool_and_continue_to_a_final_answer(tmp_path) -> None:
+def test_model_can_use_a_real_file_tool_and_continue_to_a_final_answer(
+    tmp_path,
+) -> None:
+    (tmp_path / "hello.txt").write_text("hello\n", encoding="utf-8")
     provider = ScriptedProvider(
         [
             LLMResponse(
@@ -83,10 +87,10 @@ def test_model_can_use_a_tool_and_continue_to_a_final_answer(tmp_path) -> None:
                     role="assistant",
                     content=[
                         ToolCallBlock(
-                            id="call_echo",
-                            name="echo",
-                            arguments={"text": "hello"},
-                            raw_arguments='{"text":"hello"}',
+                            id="call_read",
+                            name="read_file",
+                            arguments={"path": "hello.txt"},
+                            raw_arguments='{"path":"hello.txt"}',
                         )
                     ],
                 ),
@@ -103,28 +107,12 @@ def test_model_can_use_a_tool_and_continue_to_a_final_answer(tmp_path) -> None:
             ),
         ]
     )
-    registry = ToolRegistry()
-    registry.register(
-        ToolDefinition(
-            name="echo",
-            description="Return the supplied text.",
-            parameters={
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
-                "additionalProperties": False,
-            },
-        ),
-        lambda arguments: ToolResult(
-            content=str(arguments["text"]), metadata={"source": "echo"}
-        ),
-    )
     runtime = ThreadRuntime(
-        provider=provider, tool_registry_factory=lambda _: registry
+        provider=provider, tool_registry_factory=create_local_tool_registry
     )
     thread = runtime.create_thread(tmp_path)
 
-    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Use the echo tool."))
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Read hello.txt."))
 
     assert summary.status is TurnStatus.COMPLETED
     assert summary.final_text == "The tool returned hello."
@@ -139,11 +127,53 @@ def test_model_can_use_a_tool_and_continue_to_a_final_answer(tmp_path) -> None:
     ]
     result_block = second_request.messages[-1].content[0]
     assert result_block == ToolResultBlock(
-        tool_call_id="call_echo",
-        content="hello",
-        metadata={"source": "echo"},
+        tool_call_id="call_read",
+        content="1: hello",
+        metadata={
+            "path": "hello.txt",
+            "requested_offset": 1,
+            "requested_limit": 200,
+            "start_line": 1,
+            "end_line": 1,
+            "returned_lines": 1,
+            "total_lines": 1,
+            "truncated": False,
+        },
         error_code=None,
     )
+
+
+def test_additional_system_instructions_preserve_default_coding_rules(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(
+                    role="assistant", content=[TextBlock(text="Task complete.")]
+                ),
+                finish_reason="stop",
+                usage=Usage(),
+            )
+        ]
+    )
+    runtime = ThreadRuntime(
+        provider=provider,
+        tool_registry_factory=empty_tools,
+        additional_system_instructions="Follow the course rubric.",
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    asyncio.run(runtime.run_turn(thread.thread_id, "Inspect the project."))
+
+    system_text = provider.requests[0].messages[0].content[0]
+    assert isinstance(system_text, TextBlock)
+    normalized_prompt = system_text.text.casefold()
+    assert "workspace-relative" in normalized_prompt
+    assert "prefer file tools" in normalized_prompt
+    assert "handle tool errors honestly" in normalized_prompt
+    assert "summarize the work and validation" in normalized_prompt
+    assert system_text.text.endswith("Follow the course rubric.")
 
 
 def test_thread_rejects_a_second_turn_while_one_is_running(tmp_path) -> None:

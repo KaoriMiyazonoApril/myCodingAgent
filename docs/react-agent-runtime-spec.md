@@ -43,6 +43,10 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   实现。
 - 第一阶段使用单个注入的 `LLMProvider` 和按 workspace 构造的 `ToolRegistry`。模型切换
   与版本化设置将在多轮设置阶段扩展，不属于当前 tracer bullet。
+- `PromptBuilder` 已提供供应商无关的默认 coding-agent 约束，并把 Runtime 附加指令置于
+  默认约束之后，避免调用方定制时覆盖 workspace 路径、文件工具、错误处理和验证要求。
+- Runtime 集成测试通过临时 workspace 中的真实 `read_file` 工具验证闭环；更完整的
+  read/edit/test/diff 场景随 ChangeTracker 和运行控制阶段补充。
 
 ## User Stories
 
