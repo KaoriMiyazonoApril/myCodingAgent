@@ -1,1 +1,5 @@
+.venv
+.serena
+__pycache__/
+*.py[cod]
 .worktrees/
