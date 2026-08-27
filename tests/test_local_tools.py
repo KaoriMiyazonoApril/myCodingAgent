@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 import shutil
 import time
 from types import SimpleNamespace
@@ -11,13 +12,127 @@ import pytest
 
 from agent.core.messages import ToolCallBlock
 from agent.tools.local import create_local_tool_registry
+from agent.tools.process import (
+    BubblewrapSandboxBackend,
+    CommandSandboxBackend,
+    CommandSandboxUnavailableError,
+)
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
+from tests.sandbox_support import (
+    DeterministicSandboxBackend,
+    create_test_tool_registry,
+)
+
+
+def create_bubblewrap_tool_registry_or_skip(tmp_path) -> ToolRegistry:
+    try:
+        return create_local_tool_registry(
+            tmp_path,
+            sandbox_backend=BubblewrapSandboxBackend(),
+        )
+    except CommandSandboxUnavailableError as error:
+        pytest.skip(str(error))
+
+
+def test_local_tools_accept_an_explicit_command_sandbox_backend(tmp_path) -> None:
+    backend = DeterministicSandboxBackend()
+    registry = create_local_tool_registry(tmp_path, sandbox_backend=backend)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="sandbox",
+            name="run_command",
+            arguments={"command": "printf deterministic"},
+        )
+    )
+
+    assert backend.checked_workspaces == [tmp_path.resolve()]
+    assert result.error_code is None
+    assert result.metadata["stdout"] == "deterministic"
+
+
+def test_unavailable_injected_sandbox_fails_without_running_a_host_command(
+    tmp_path,
+) -> None:
+    class UnavailableSandboxBackend(DeterministicSandboxBackend):
+        def check_available(self, workspace_root: Path) -> None:
+            raise CommandSandboxUnavailableError("test sandbox unavailable")
+
+        def _build_command(
+            self,
+            *,
+            workspace_root: Path,
+            command: str,
+            relative_cwd: str,
+        ) -> list[str]:
+            raise AssertionError("an unavailable backend must never execute")
+
+    with pytest.raises(CommandSandboxUnavailableError, match="test sandbox unavailable"):
+        create_local_tool_registry(
+            tmp_path,
+            sandbox_backend=UnavailableSandboxBackend(),
+        )
+
+
+@pytest.fixture(params=("deterministic", "bubblewrap"))
+def command_sandbox_backend(request, tmp_path) -> CommandSandboxBackend:
+    if request.param == "deterministic":
+        return DeterministicSandboxBackend()
+    backend = BubblewrapSandboxBackend()
+    try:
+        backend.check_available(tmp_path)
+    except CommandSandboxUnavailableError as error:
+        pytest.skip(str(error))
+    return backend
+
+
+def test_command_sandbox_backends_share_execution_contract(
+    tmp_path, command_sandbox_backend
+) -> None:
+    registry = create_local_tool_registry(
+        tmp_path,
+        sandbox_backend=command_sandbox_backend,
+    )
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="contract",
+            name="run_command",
+            arguments={"command": "printf out; printf err >&2; exit 9"},
+        )
+    )
+
+    assert result.error_code == "COMMAND_FAILED"
+    assert result.metadata["exit_code"] == 9
+    assert result.metadata["stdout"] == "out"
+    assert result.metadata["stderr"] == "err"
+
+
+def test_command_sandbox_backends_share_timeout_contract(
+    tmp_path, command_sandbox_backend
+) -> None:
+    registry = create_local_tool_registry(
+        tmp_path,
+        sandbox_backend=command_sandbox_backend,
+    )
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="timeout_contract",
+            name="run_command",
+            arguments={"command": "printf begun; sleep 1", "timeout_ms": 30},
+        )
+    )
+
+    assert result.error_code == "TIMEOUT"
+    assert result.metadata["timed_out"] is True
+    assert result.metadata["stdout"] == "begun"
 
 
 def test_read_file_returns_numbered_page_and_metadata(tmp_path) -> None:
     (tmp_path / "notes.txt").write_text("first\nsecond\nthird\n", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(
@@ -42,7 +157,7 @@ def test_read_file_returns_numbered_page_and_metadata(tmp_path) -> None:
 
 
 def test_write_file_creates_parent_directories_and_text_file(tmp_path) -> None:
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(
@@ -60,7 +175,7 @@ def test_write_file_creates_parent_directories_and_text_file(tmp_path) -> None:
 def test_edit_file_replaces_one_exact_match(tmp_path) -> None:
     source = tmp_path / "app.py"
     source.write_text("value = 'old'\n", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(
@@ -84,7 +199,7 @@ def test_glob_returns_sorted_workspace_relative_regular_files(tmp_path) -> None:
     (tmp_path / "src" / "b.py").write_text("", encoding="utf-8")
     (tmp_path / "src" / "a.py").write_text("", encoding="utf-8")
     (tmp_path / "src" / "notes.txt").write_text("", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(
@@ -103,7 +218,7 @@ def test_grep_returns_matching_paths_line_numbers_and_lines(tmp_path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.py").write_text("first\nneedle here\n", encoding="utf-8")
     (tmp_path / "src" / "skip.txt").write_text("needle too\n", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(
@@ -121,7 +236,7 @@ def test_grep_returns_matching_paths_line_numbers_and_lines(tmp_path) -> None:
 def test_grep_returns_lines_in_file_order(tmp_path) -> None:
     source = tmp_path / "main.py"
     source.write_text("\n".join(["needle"] * 10) + "\n", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(id="call_order", name="grep", arguments={"pattern": "needle"})
@@ -134,7 +249,7 @@ def test_grep_returns_lines_in_file_order(tmp_path) -> None:
 def test_grep_skips_non_text_files_and_keeps_searching(tmp_path) -> None:
     (tmp_path / "binary.bin").write_bytes(b"needle\x00")
     (tmp_path / "main.py").write_text("needle\n", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(id="call_binary_search", name="grep", arguments={"pattern": "needle"})
@@ -148,7 +263,7 @@ def test_glob_uses_relative_pathlib_matching_for_recursive_patterns(tmp_path) ->
     (tmp_path / "src" / "nested").mkdir(parents=True)
     (tmp_path / "src" / "root.py").write_text("", encoding="utf-8")
     (tmp_path / "src" / "nested" / "deep.py").write_text("", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     direct = registry.execute(
         ToolCallBlock(
@@ -175,7 +290,7 @@ def test_search_symlinks_must_remain_inside_selected_subtree(tmp_path) -> None:
     (tmp_path / "other.txt").write_text("needle\n", encoding="utf-8")
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "link.txt").symlink_to("../other.txt")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     grep_result = registry.execute(
         ToolCallBlock(
@@ -199,7 +314,7 @@ def test_search_symlinks_must_remain_inside_selected_subtree(tmp_path) -> None:
 
 
 def test_glob_rejects_absolute_or_escaping_patterns(tmp_path) -> None:
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     for pattern in ("/outside/*.py", "../*.py"):
         result = registry.execute(
@@ -214,7 +329,7 @@ def test_glob_rejects_absolute_or_escaping_patterns(tmp_path) -> None:
 
 def test_write_file_reports_a_file_parent_as_an_operational_error(tmp_path) -> None:
     (tmp_path / "parent").write_text("not a directory", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(
@@ -229,7 +344,7 @@ def test_write_file_reports_a_file_parent_as_an_operational_error(tmp_path) -> N
 
 def test_run_command_captures_separate_output_and_nonzero_exit(tmp_path) -> None:
     (tmp_path / "work").mkdir()
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(
@@ -255,7 +370,7 @@ def test_run_command_captures_separate_output_and_nonzero_exit(tmp_path) -> None
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap is unavailable")
 def test_run_command_cannot_read_outside_workspace(tmp_path) -> None:
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_bubblewrap_tool_registry_or_skip(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(
@@ -279,7 +394,7 @@ def test_run_command_cannot_read_outside_workspace(tmp_path) -> None:
 def test_run_command_can_write_inside_without_modifying_host_sibling(tmp_path) -> None:
     outside = tmp_path.parent / "outside-command.txt"
     outside.write_text("unchanged", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_bubblewrap_tool_registry_or_skip(tmp_path)
 
     inside = registry.execute(
         ToolCallBlock(
@@ -329,7 +444,7 @@ def test_local_tool_composition_rejects_installed_but_unusable_bubblewrap(
 
 @pytest.mark.skipif(os.name == "nt", reason="setsid is POSIX-only")
 def test_timeout_returns_even_if_detached_descendant_keeps_pipe_open(tmp_path) -> None:
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_bubblewrap_tool_registry_or_skip(tmp_path)
     start = time.monotonic()
 
     result = registry.execute(
@@ -350,7 +465,7 @@ def test_timeout_returns_even_if_detached_descendant_keeps_pipe_open(tmp_path) -
 
 @pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX-only")
 def test_completed_command_returns_even_if_background_child_keeps_pipe_open(tmp_path) -> None:
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_bubblewrap_tool_registry_or_skip(tmp_path)
     start = time.monotonic()
 
     result = registry.execute(
@@ -369,7 +484,7 @@ def test_completed_command_returns_even_if_background_child_keeps_pipe_open(tmp_
 def test_read_out_of_range_and_non_text_files_return_structured_results(tmp_path) -> None:
     (tmp_path / "short.txt").write_text("only\n", encoding="utf-8")
     (tmp_path / "binary.bin").write_bytes(b"\xff\x00")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     page = registry.execute(
         ToolCallBlock(
@@ -394,7 +509,7 @@ def test_read_file_rejects_files_beyond_its_resource_limit(tmp_path, monkeypatch
         "agent.tools.filesystem.MAX_TEXT_FILE_BYTES", 32, raising=False
     )
     (tmp_path / "large.txt").write_text("x" * 33, encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(
@@ -411,7 +526,7 @@ def test_write_overwrite_preserves_mode_and_edit_failure_is_immutable(tmp_path) 
     script = tmp_path / "script.sh"
     script.write_text("one\none\n", encoding="utf-8")
     script.chmod(0o755)
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     write = registry.execute(
         ToolCallBlock(
@@ -453,7 +568,7 @@ def test_search_skips_default_ignored_directories_but_honors_explicit_path(tmp_p
     ignored.mkdir()
     (ignored / "package.js").write_text("needle\n", encoding="utf-8")
     (tmp_path / "app.js").write_text("needle\n", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     default_search = registry.execute(
         ToolCallBlock(id="call_default", name="grep", arguments={"pattern": "needle"})
@@ -478,7 +593,7 @@ def test_workspace_escapes_unknown_tools_and_duplicate_registration_are_structur
     outside = tmp_path.parent / "outside.txt"
     outside.write_text("secret", encoding="utf-8")
     (tmp_path / "external.txt").symlink_to(outside)
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     escaped = registry.execute(
         ToolCallBlock(id="call_escape", name="read_file", arguments={"path": "../outside.txt"})
@@ -506,7 +621,7 @@ def test_workspace_escapes_unknown_tools_and_duplicate_registration_are_structur
 
 def test_symlink_loops_are_reported_as_workspace_path_errors(tmp_path) -> None:
     (tmp_path / "loop").symlink_to("loop")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(id="call_loop", name="read_file", arguments={"path": "loop"})
@@ -516,7 +631,7 @@ def test_symlink_loops_are_reported_as_workspace_path_errors(tmp_path) -> None:
 
 
 def test_all_six_definitions_are_closed_object_schemas(tmp_path) -> None:
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
     definitions = registry.definitions()
 
     assert {definition.name for definition in definitions} == {
@@ -591,7 +706,7 @@ def test_tool_schema_validation_fails_closed_for_unsupported_types() -> None:
 def test_glob_stops_after_detecting_the_first_truncated_match(
     tmp_path, monkeypatch
 ) -> None:
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     def files(*_args, **_kwargs):
         for index in range(201):
@@ -615,7 +730,7 @@ def test_grep_stops_after_detecting_the_first_truncated_match(
 ) -> None:
     source = tmp_path / "matches.txt"
     source.write_text("needle\n" * 201, encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     def files(*_args, **_kwargs):
         yield source, "matches.txt"
@@ -637,7 +752,7 @@ def test_grep_marks_results_incomplete_at_scanned_file_limit(
     monkeypatch.setattr("agent.tools.local.MAX_SCANNED_FILES", 1, raising=False)
     (tmp_path / "a.txt").write_text("first\n", encoding="utf-8")
     (tmp_path / "b.txt").write_text("needle\n", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(id="file_limit", name="grep", arguments={"pattern": "needle"})
@@ -654,7 +769,7 @@ def test_grep_skips_oversized_files_and_marks_results_incomplete(
     monkeypatch.setattr("agent.tools.local.MAX_SEARCH_FILE_BYTES", 16, raising=False)
     (tmp_path / "large.txt").write_text("needle " * 3, encoding="utf-8")
     (tmp_path / "small.txt").write_text("needle\n", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(id="file_bytes", name="grep", arguments={"pattern": "needle"})
@@ -667,7 +782,7 @@ def test_grep_skips_oversized_files_and_marks_results_incomplete(
 
 def test_grep_bounds_catastrophic_regex_matching_time(tmp_path) -> None:
     (tmp_path / "input.txt").write_text("a" * 1000 + "!\n", encoding="utf-8")
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
     start = time.monotonic()
 
     result = registry.execute(
@@ -679,7 +794,7 @@ def test_grep_bounds_catastrophic_regex_matching_time(tmp_path) -> None:
 
 
 def test_invalid_parsed_arguments_become_recoverable_tool_error(tmp_path) -> None:
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(
@@ -723,8 +838,13 @@ def test_async_registry_execution_does_not_block_event_loop() -> None:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX-only")
-def test_cancelling_async_command_terminates_its_process_group(tmp_path) -> None:
-    registry = create_local_tool_registry(tmp_path)
+def test_cancelling_sandbox_command_terminates_its_process_group(
+    tmp_path, command_sandbox_backend
+) -> None:
+    registry = create_local_tool_registry(
+        tmp_path,
+        sandbox_backend=command_sandbox_backend,
+    )
     marker = tmp_path / "marker.txt"
 
     async def scenario() -> None:
@@ -783,7 +903,7 @@ def test_registry_logs_internal_tool_exceptions(caplog) -> None:
 
 
 def test_path_schemas_reject_empty_paths_like_local_validation(tmp_path) -> None:
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     for name in ("read_file", "write_file", "edit_file"):
         assert registry.lookup(name).parameters["properties"]["path"]["minLength"] == 1
@@ -792,7 +912,7 @@ def test_path_schemas_reject_empty_paths_like_local_validation(tmp_path) -> None
 
 
 def test_run_command_timeout_keeps_available_output_and_marks_tool_failure(tmp_path) -> None:
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(
@@ -808,7 +928,7 @@ def test_run_command_timeout_keeps_available_output_and_marks_tool_failure(tmp_p
 
 
 def test_run_command_marks_bounded_output_as_truncated(tmp_path) -> None:
-    registry = create_local_tool_registry(tmp_path)
+    registry = create_test_tool_registry(tmp_path)
 
     result = registry.execute(
         ToolCallBlock(

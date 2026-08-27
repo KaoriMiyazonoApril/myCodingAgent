@@ -74,7 +74,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 - `glob` and `grep` use a single platform-neutral Python traversal implementation rather than selecting between ripgrep and a fallback. They return only regular files, use stable workspace-relative POSIX ordering, retain at most 200 matches, stop as soon as a 201st match proves truncation, scan at most 10,000 files, and expose truncation.
 - Default traversal excludes `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `build`, and `dist`. The exclusion is overridden only when the caller explicitly chooses such a directory as `path`; a matching-looking pattern does not override it.
 - `glob` treats its pattern as a relative pathlib-style glob below the selected path. `grep` treats `pattern` as a timeout-capable regular expression and optional `include` as a glob against workspace-relative POSIX paths. Invalid regexes produce `INVALID_REGEX`; a match exceeding 50 ms produces `REGEX_TIMEOUT`. `grep` additionally limits each file to 5 MiB, cumulative selected content to 50 MiB, each line to 100,000 characters, and the search to 5 seconds. Reaching a non-fatal scan boundary sets `truncated = true`.
-- The process module resolves `cwd` through the filesystem module. Its internal bubblewrap implementation requires Linux or WSL2 plus `bwrap`, and runs `bash --noprofile --norc -c` in a new namespace with only `/usr`, process/device support, an ephemeral `/tmp`, and the workspace mounted read-write. Host environment variables, host paths, capabilities, and network namespaces are not inherited. Runtime composition executes a minimal command through the real sandbox configuration, not merely `which bwrap`, and raises `CommandSandboxUnavailableError` immediately if installation, user namespaces, mounts, or container policy make the backend unusable; it never silently falls back to a host shell. A public sandbox-backend seam is intentionally deferred until a second real adapter exists.
+- The process module resolves `cwd` through the filesystem module. Its public `CommandSandboxBackend` seam owns capability probing and cancellable command execution. The default `BubblewrapSandboxBackend` requires Linux or WSL2 plus `bwrap`, and runs `bash --noprofile --norc -c` in a new namespace with only `/usr`, process/device support, an ephemeral `/tmp`, and the workspace mounted read-write. Host environment variables, host paths, capabilities, and network namespaces are not inherited. Runtime composition executes a minimal command through the real sandbox configuration, not merely `which bwrap`, and raises `CommandSandboxUnavailableError` immediately if installation, user namespaces, mounts, or container policy make the backend unusable; it never silently falls back to a host shell. Explicit backend injection exists for controlled application composition and deterministic contract tests.
 - Command timeout defaults to 60,000 ms and is constrained to 1 through 300,000 ms. The process module captures stdout and stderr independently, preserving bounded head and tail portions of each 100 KiB stream. It reports duration, exit code, timeout, and truncation. Exit zero is success, non-zero is `COMMAND_FAILED`, and timeout is `TIMEOUT`.
 - `CommandRunner` uses `asyncio.create_subprocess_exec()` and async stream readers. Timeout and coroutine cancellation terminate the owned process group and bound cleanup waits; pending reads are cancelled rather than closing a stream beneath a reader thread. This prevents pipe-lock deadlocks and commands surviving an Agent/UI stop.
 - Error codes include at least invalid arguments, unknown tool, workspace escape, not found, not a file, not text, file too large, invalid regex, regex timeout, missing edit match, ambiguous edit, I/O failure, process start failure, command failure, timeout, and unexpected internal failure. Expected operational failures are converted into execution results at the registry/tool seam; unexpected exceptions are logged with traceback while only a safe message reaches the model.
@@ -116,13 +116,17 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
   为 `None` 表示成功；`ok` 与 `is_error` 均由该字段推导，不存在可独立修改的错误布尔值。
 - `filesystem.py` 的 `WorkspaceFilesystem` 是工作区路径、文本文件和原子写入的唯一
   入口；`ToolOperationError` 将预期的本地操作失败编码为稳定错误码。
-- `process.py` 的 `CommandRunner` 通过受验证的初始目录运行一次 shell 命令，并分别在
+- `process.py` 的 `CommandSandboxBackend` 统一能力探测、异步输出采集、超时与进程组取消
+  生命周期；生产 `BubblewrapSandboxBackend` 负责构造隔离命令，测试 adapter 通过同一
+  contract 提供确定性执行。`CommandRunner` 通过受验证的初始目录运行一次 shell 命令，并分别在
   metadata 中返回 stdout、stderr、持续时间、退出码、`command_succeeded`、sandbox、
   超时和截断状态。非零退出返回 `COMMAND_FAILED`，超时返回 `TIMEOUT`。
 - `registry.py` 的 `ToolRegistry` 提供注册、查找、定义列举及对既有
   `ToolCallBlock` 的统一分派；它不保存任何工作区配置。
 - `local.py` 显式组合共享的文件系统与进程服务，并注册
   `read_file`、`write_file`、`edit_file`、`glob`、`grep`、`run_command` 六个工具。
+  组合函数可显式接收一个 `CommandSandboxBackend`；未提供时只使用生产 Bubblewrap，
+  capability probe 失败即终止组合，不会回退到 host shell。
 
 所有工具定义均使用关闭的对象 schema（`additionalProperties: false`）。文件查询与搜索
 结果均使用工作区相对的 POSIX 路径；搜索中的符号链接目标必须同时位于工作区和调用方

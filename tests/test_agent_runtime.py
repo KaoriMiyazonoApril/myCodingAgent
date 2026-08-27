@@ -9,9 +9,9 @@ from agent.core.messages import Message, TextBlock, ToolCallBlock, ToolResultBlo
 from agent.model.provider import LLMProvider
 from agent.model.types import LLMRequest, LLMResponse, Usage
 from agent.runtime import ThreadBusyError, ThreadRuntime, ThreadStatus, TurnStatus
-from agent.tools.local import create_local_tool_registry
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
+from tests.sandbox_support import create_test_tool_registry
 
 
 class ScriptedProvider(LLMProvider):
@@ -108,7 +108,7 @@ def test_model_can_use_a_real_file_tool_and_continue_to_a_final_answer(
         ]
     )
     runtime = ThreadRuntime(
-        provider=provider, tool_registry_factory=create_local_tool_registry
+        provider=provider, tool_registry_factory=create_test_tool_registry
     )
     thread = runtime.create_thread(tmp_path)
 

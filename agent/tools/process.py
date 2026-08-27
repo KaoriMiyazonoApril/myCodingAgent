@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import shutil
@@ -22,8 +24,168 @@ class CommandSandboxUnavailableError(RuntimeError):
     """The configured command sandbox cannot run on this host."""
 
 
-class _BubblewrapSandbox:
-    """Linux bubblewrap command construction kept inside the process module."""
+@dataclass(frozen=True, slots=True)
+class SandboxExecution:
+    """Raw, bounded outcome returned by a command sandbox backend."""
+
+    duration_ms: int
+    exit_code: int | None
+    timed_out: bool
+    stdout: str
+    stderr: str
+    stdout_truncated: bool
+    stderr_truncated: bool
+
+
+class CommandSandboxBackend(ABC):
+    """Capability-probed, cancellable command execution boundary."""
+
+    @abstractmethod
+    def check_available(self, workspace_root: Path) -> None:
+        """Raise when this backend cannot protect the selected workspace."""
+
+    @abstractmethod
+    def _build_command(
+        self,
+        *,
+        workspace_root: Path,
+        command: str,
+        relative_cwd: str,
+    ) -> list[str]:
+        """Return the isolated process invocation for one command."""
+
+    async def execute(
+        self,
+        *,
+        workspace_root: Path,
+        working_directory: Path,
+        relative_cwd: str,
+        command: str,
+        timeout_ms: int,
+    ) -> SandboxExecution:
+        """Execute one command; cancellation terminates its process group."""
+
+        invocation = self._build_command(
+            workspace_root=workspace_root,
+            command=command,
+            relative_cwd=relative_cwd,
+        )
+        start = time.monotonic()
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *invocation,
+                cwd=working_directory,
+                stdin=subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise ToolOperationError(
+                "PROCESS_START_FAILED", f"could not start command: {error}"
+            ) from error
+
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stdout_capture = _BoundedOutput()
+        stderr_capture = _BoundedOutput()
+        capture_tasks = [
+            asyncio.create_task(self._capture(process.stdout, stdout_capture)),
+            asyncio.create_task(self._capture(process.stderr, stderr_capture)),
+        ]
+        wait_task = asyncio.create_task(process.wait())
+        timed_out = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(wait_task), timeout=timeout_ms / 1000
+                )
+            except TimeoutError:
+                timed_out = True
+                await self._terminate_process_group(process, wait_task)
+            await self._finish_capture(process, capture_tasks)
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(
+                self._cleanup_cancelled(process, wait_task, capture_tasks)
+            )
+            await asyncio.shield(cleanup)
+            raise
+
+        stdout_text, stdout_truncated = stdout_capture.result()
+        stderr_text, stderr_truncated = stderr_capture.result()
+        return SandboxExecution(
+            duration_ms=round((time.monotonic() - start) * 1000),
+            exit_code=process.returncode,
+            timed_out=timed_out,
+            stdout=stdout_text,
+            stderr=stderr_text,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
+        )
+
+    @staticmethod
+    async def _capture(
+        stream: asyncio.StreamReader, capture: _BoundedOutput
+    ) -> None:
+        while chunk := await stream.read(8192):
+            capture.append(chunk)
+
+    async def _finish_capture(
+        self,
+        process: asyncio.subprocess.Process,
+        tasks: list[asyncio.Task[None]],
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(asyncio.shield(task) for task in tasks)),
+                timeout=0.1,
+            )
+        except TimeoutError:
+            self._signal_process_group(process.pid, signal.SIGTERM)
+            await self._cancel_tasks(tasks)
+
+    async def _cleanup_cancelled(
+        self,
+        process: asyncio.subprocess.Process,
+        wait_task: asyncio.Task[int],
+        capture_tasks: list[asyncio.Task[None]],
+    ) -> None:
+        await self._terminate_process_group(process, wait_task)
+        await self._cancel_tasks(capture_tasks)
+
+    async def _terminate_process_group(
+        self,
+        process: asyncio.subprocess.Process,
+        wait_task: asyncio.Task[int],
+    ) -> None:
+        self._signal_process_group(process.pid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(asyncio.shield(wait_task), timeout=0.1)
+        except TimeoutError:
+            self._signal_process_group(process.pid, signal.SIGKILL)
+            try:
+                await asyncio.wait_for(asyncio.shield(wait_task), timeout=0.1)
+            except TimeoutError:
+                process.kill()
+                await asyncio.gather(wait_task, return_exceptions=True)
+
+    @staticmethod
+    def _signal_process_group(process_id: int, signal_number: signal.Signals) -> None:
+        try:
+            os.killpg(process_id, signal_number)
+        except OSError:
+            pass
+
+    @staticmethod
+    async def _cancel_tasks(tasks: list[asyncio.Task[None]]) -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class BubblewrapSandboxBackend(CommandSandboxBackend):
+    """Production Linux bubblewrap command sandbox."""
 
     def __init__(self) -> None:
         self._executable: str | None = None
@@ -40,7 +202,7 @@ class _BubblewrapSandbox:
                 "bubblewrap is required for workspace command isolation"
             )
         self._executable = executable
-        probe_command = self.build_command(
+        probe_command = self._build_command(
             workspace_root=workspace_root,
             command="true",
             relative_cwd=".",
@@ -66,7 +228,7 @@ class _BubblewrapSandbox:
                 f"bubblewrap capability probe failed with status {probe.returncode}{suffix}"
             )
 
-    def build_command(
+    def _build_command(
         self,
         *,
         workspace_root: Path,
@@ -169,9 +331,10 @@ class CommandRunner:
     def __init__(
         self,
         filesystem: WorkspaceFilesystem,
+        sandbox_backend: CommandSandboxBackend | None = None,
     ) -> None:
         self._filesystem = filesystem
-        self._sandbox = _BubblewrapSandbox()
+        self._sandbox = sandbox_backend or BubblewrapSandboxBackend()
         self._sandbox.check_available(self._filesystem.root)
 
     def run(self, command: str, cwd: str, timeout_ms: int) -> ToolResult:
@@ -188,135 +351,37 @@ class CommandRunner:
         if not working_directory.is_dir():
             raise ToolOperationError("NOT_A_FILE", f"not a directory: {relative_cwd}")
 
-        shell = self._sandbox.build_command(
+        execution = await self._sandbox.execute(
             workspace_root=self._filesystem.root,
+            working_directory=working_directory,
             command=command,
             relative_cwd=relative_cwd,
+            timeout_ms=timeout_ms,
         )
-        start = time.monotonic()
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *shell,
-                cwd=working_directory,
-                stdin=subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-        except OSError as error:
-            raise ToolOperationError(
-                "PROCESS_START_FAILED", f"could not start command: {error}"
-            ) from error
-
-        assert process.stdout is not None
-        assert process.stderr is not None
-        stdout_capture = _BoundedOutput()
-        stderr_capture = _BoundedOutput()
-        capture_tasks = [
-            asyncio.create_task(self._capture(process.stdout, stdout_capture)),
-            asyncio.create_task(self._capture(process.stderr, stderr_capture)),
-        ]
-        wait_task = asyncio.create_task(process.wait())
-        timed_out = False
-        try:
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(wait_task), timeout=timeout_ms / 1000
-                )
-            except TimeoutError:
-                timed_out = True
-                await self._terminate_process_group(process, wait_task)
-            await self._finish_capture(process, capture_tasks)
-        except asyncio.CancelledError:
-            cleanup = asyncio.create_task(
-                self._cleanup_cancelled(process, wait_task, capture_tasks)
-            )
-            await asyncio.shield(cleanup)
-            raise
-
-        duration_ms = round((time.monotonic() - start) * 1000)
-        stdout_text, stdout_truncated = stdout_capture.result()
-        stderr_text, stderr_truncated = stderr_capture.result()
         metadata = {
             "cwd": relative_cwd,
-            "duration_ms": duration_ms,
-            "exit_code": process.returncode,
-            "timed_out": timed_out,
-            "stdout": stdout_text,
-            "stderr": stderr_text,
-            "stdout_truncated": stdout_truncated,
-            "stderr_truncated": stderr_truncated,
-            "command_succeeded": not timed_out and process.returncode == 0,
+            "duration_ms": execution.duration_ms,
+            "exit_code": execution.exit_code,
+            "timed_out": execution.timed_out,
+            "stdout": execution.stdout,
+            "stderr": execution.stderr,
+            "stdout_truncated": execution.stdout_truncated,
+            "stderr_truncated": execution.stderr_truncated,
+            "command_succeeded": (
+                not execution.timed_out and execution.exit_code == 0
+            ),
             "sandboxed": True,
         }
-        if timed_out:
+        if execution.timed_out:
             status = f"command timed out after {timeout_ms} ms"
             error_code = "TIMEOUT"
-        elif process.returncode == 0:
+        elif execution.exit_code == 0:
             status = "command completed successfully"
             error_code = None
         else:
-            status = f"command exited with status {process.returncode}"
+            status = f"command exited with status {execution.exit_code}"
             error_code = "COMMAND_FAILED"
-        content = f"{status}\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}"
+        content = (
+            f"{status}\nstdout:\n{execution.stdout}\nstderr:\n{execution.stderr}"
+        )
         return ToolResult(content=content, metadata=metadata, error_code=error_code)
-
-    @staticmethod
-    async def _capture(
-        stream: asyncio.StreamReader, capture: _BoundedOutput
-    ) -> None:
-        while chunk := await stream.read(8192):
-            capture.append(chunk)
-
-    async def _finish_capture(
-        self,
-        process: asyncio.subprocess.Process,
-        tasks: list[asyncio.Task[None]],
-    ) -> None:
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*(asyncio.shield(task) for task in tasks)),
-                timeout=0.1,
-            )
-        except TimeoutError:
-            self._signal_process_group(process.pid, signal.SIGTERM)
-            await self._cancel_tasks(tasks)
-
-    async def _cleanup_cancelled(
-        self,
-        process: asyncio.subprocess.Process,
-        wait_task: asyncio.Task[int],
-        capture_tasks: list[asyncio.Task[None]],
-    ) -> None:
-        await self._terminate_process_group(process, wait_task)
-        await self._cancel_tasks(capture_tasks)
-
-    async def _terminate_process_group(
-        self,
-        process: asyncio.subprocess.Process,
-        wait_task: asyncio.Task[int],
-    ) -> None:
-        self._signal_process_group(process.pid, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(asyncio.shield(wait_task), timeout=0.1)
-        except TimeoutError:
-            self._signal_process_group(process.pid, signal.SIGKILL)
-            try:
-                await asyncio.wait_for(asyncio.shield(wait_task), timeout=0.1)
-            except TimeoutError:
-                process.kill()
-                await asyncio.gather(wait_task, return_exceptions=True)
-
-    @staticmethod
-    def _signal_process_group(process_id: int, signal_number: signal.Signals) -> None:
-        try:
-            os.killpg(process_id, signal_number)
-        except OSError:
-            pass
-
-    @staticmethod
-    async def _cancel_tasks(tasks: list[asyncio.Task[None]]) -> None:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)

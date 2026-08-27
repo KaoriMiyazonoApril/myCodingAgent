@@ -11,7 +11,7 @@ from typing import cast
 import regex
 
 from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem
-from agent.tools.process import CommandRunner
+from agent.tools.process import CommandRunner, CommandSandboxBackend
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
 
@@ -242,11 +242,15 @@ async def _run_command_async(
     )
 
 
-def create_local_tool_registry(workspace_root: Path) -> ToolRegistry:
+def create_local_tool_registry(
+    workspace_root: Path,
+    *,
+    sandbox_backend: CommandSandboxBackend | None = None,
+) -> ToolRegistry:
     """Compose shared workspace services and register the available local tools."""
 
     filesystem = WorkspaceFilesystem(workspace_root)
-    runner = CommandRunner(filesystem)
+    runner = CommandRunner(filesystem, sandbox_backend=sandbox_backend)
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(

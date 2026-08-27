@@ -4,10 +4,9 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] bubblewrap adapter 保持现有 workspace 隔离、输出、非零退出、超时和取消行为。
-- [ ] 确定性的测试 adapter 与生产 adapter 满足同一 interface。
-- [ ] sandbox 不可用时仍在首次命令前明确失败，且不存在 host-shell fallback。
-- [ ] 现有本地工具测试继续通过。
-
+- [x] bubblewrap adapter 保持现有 workspace 隔离、输出、非零退出、超时和取消行为。
+- [x] 确定性的测试 adapter 与生产 adapter 满足同一 interface。
+- [x] sandbox 不可用时仍在首次命令前明确失败，且不存在 host-shell fallback。
+- [x] 现有本地工具测试继续通过。

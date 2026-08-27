@@ -47,6 +47,10 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   默认约束之后，避免调用方定制时覆盖 workspace 路径、文件工具、错误处理和验证要求。
 - Runtime 集成测试通过临时 workspace 中的真实 `read_file` 工具验证闭环；更完整的
   read/edit/test/diff 场景随 ChangeTracker 和运行控制阶段补充。
+- Ticket 02 已提取公共 `CommandSandboxBackend`：生产 Bubblewrap 与确定性测试 adapter
+  共享 capability probe、输出、超时和取消 contract。普通 Runtime 测试不再要求开发主机
+  可运行 Bubblewrap，生产组合仍 fail-fast 且绝不回退到 host shell。严格 workspace 链接
+  禁令仍属于后续安全 ticket。
 
 ## User Stories
 
