@@ -97,3 +97,22 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 - Model-facing paths should remain workspace-relative POSIX paths even when the runtime executes on Windows. The runtime does not translate arbitrary command syntax between shells.
 - The result limit for glob and grep is 200; each stdout and stderr capture budget is 100 KiB. These are resource limits, not approval or permission decisions, and all truncation is exposed to the model.
 - This specification is local by explicit request and has not been published as a GitHub Issue.
+
+## 当前实现
+
+当前 MVP 位于 `agent/tools/`，并保持模型连接层与执行能力层解耦：
+
+- `types.py` 定义既有的模型可见 `ToolDefinition`，以及执行域的 `ToolResult`。`error_code`
+  为 `None` 表示成功；`is_error` 由该字段推导，不存在可独立修改的错误布尔值。
+- `filesystem.py` 的 `WorkspaceFilesystem` 是工作区路径、文本文件和原子写入的唯一
+  入口；`ToolOperationError` 将预期的本地操作失败编码为稳定错误码。
+- `process.py` 的 `CommandRunner` 通过受验证的初始目录运行一次 shell 命令，并分别在
+  metadata 中返回 stdout、stderr、持续时间、退出码、超时和截断状态。
+- `registry.py` 的 `ToolRegistry` 提供注册、查找、定义列举及对既有
+  `ToolCallBlock` 的统一分派；它不保存任何工作区配置。
+- `local.py` 显式组合共享的文件系统与进程服务，并注册
+  `read_file`、`write_file`、`edit_file`、`glob`、`grep`、`run_command` 六个工具。
+
+所有工具定义均使用关闭的对象 schema（`additionalProperties: false`）。文件查询与搜索
+结果均使用工作区相对的 POSIX 路径；`glob` 和 `grep` 最多返回 200 个结果，命令的每个
+输出流最多保留 100 KiB 的头尾内容。

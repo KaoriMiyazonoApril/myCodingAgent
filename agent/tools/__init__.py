@@ -1,1 +1,7 @@
-"""Types for local tools that may be offered to an LLM."""
+"""Local tool definitions, execution types, and workspace composition."""
+
+from agent.tools.local import create_local_tool_registry
+from agent.tools.registry import ToolRegistry
+from agent.tools.types import ToolDefinition, ToolResult
+
+__all__ = ["ToolDefinition", "ToolRegistry", "ToolResult", "create_local_tool_registry"]

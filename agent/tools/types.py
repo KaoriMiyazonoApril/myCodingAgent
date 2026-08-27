@@ -13,3 +13,18 @@ class ToolDefinition:
     name: str
     description: str
     parameters: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ToolResult:
+    """The provider-independent result of executing one local tool call."""
+
+    content: str
+    metadata: dict[str, Any]
+    error_code: str | None = None
+
+    @property
+    def is_error(self) -> bool:
+        """Whether execution failed according to the stable error-code contract."""
+
+        return self.error_code is not None
