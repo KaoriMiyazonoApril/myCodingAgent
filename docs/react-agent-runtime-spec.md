@@ -61,8 +61,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   对话、时间戳和最近一次 `TurnSummary`，两者均通过 `to_dict()` 产生可直接 JSON 编码的
   独立数据。公开消息保留用户/助手文本、工具调用与安全工具结果，但排除 system prompt、
   reasoning、credentials 和内部 traceback。Summary 已提供终止原因、累计 usage、计数与
-  时间戳；修改文件和 diff 字段在 Ticket 08 接入 `ChangeTracker` 前明确报告为空且
-  `diff_complete = false`。
+  时间戳；修改文件和 diff 字段现由 Ticket 08 的 `ChangeTracker` 填充。
 - 每个 Turn 通过 `TurnEventEmitter` 产生带 schema version、UUID、时间戳和单调 sequence
   的完整阶段事件，包括 Turn 生命周期、模型完整响应与工具请求/开始/完成。Thread 使用
   可配置的定长 ring buffer；写入只淘汰最旧事件，不会等待消费者。`get_events()` 通过
@@ -91,6 +90,12 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   的 `approval_requested`。调用方通过 `resolve_approval()` 批准或拒绝；取消与独立审批超时
   均安全终止，审批等待通过 `RunController` 暂停执行 deadline 且始终继续持有 workspace
   lease。
+- Ticket 08 已实现每 Turn 文件变更跟踪：`ChangeTracker` 在文件工具首次写入前保存 original，
+  成功写入后更新 final，因此重复修改只在 Summary 产生一份 original-to-final unified diff；
+  新文件以 `/dev/null` 表达，`file_changed` 事件在每次实际文件工具变化后发出。成功
+  `read_file` 与文件写入会刷新已知内容指纹，外部变化在覆盖前返回 `FILE_CHANGED`，模型
+  重新读取后可安全重试。只由文件工具修改的 Turn 报告 `diff_complete = true`；实际执行过
+  `run_command` 的 Turn 保守报告 `false`，且不会猜测无法恢复 original 的命令改动文件。
 
 ## User Stories
 

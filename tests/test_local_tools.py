@@ -12,6 +12,7 @@ import pytest
 
 from agent.core.messages import ToolCallBlock
 from agent.tools.local import create_local_tool_registry
+from agent.tools.filesystem import content_fingerprint
 from agent.tools.process import (
     BubblewrapSandboxBackend,
     CommandSandboxBackend,
@@ -212,6 +213,7 @@ def test_read_file_returns_numbered_page_and_metadata(tmp_path) -> None:
         "start_line": 2,
         "end_line": 2,
         "truncated": True,
+        "content_fingerprint": content_fingerprint(b"first\nsecond\nthird\n"),
     }
 
 

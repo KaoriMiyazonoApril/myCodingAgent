@@ -45,6 +45,7 @@ from agent.runtime import (
 )
 from agent.runtime.run_controller import RunController
 from agent.tools.registry import ToolRegistry
+from agent.tools.filesystem import content_fingerprint
 from agent.tools.types import ToolDefinition, ToolResult
 from tests.sandbox_support import create_test_tool_registry
 
@@ -939,9 +940,10 @@ def test_model_can_use_a_real_file_tool_and_continue_to_a_final_answer(
             "start_line": 1,
             "end_line": 1,
             "returned_lines": 1,
-            "total_lines": 1,
-            "truncated": False,
-        },
+                "total_lines": 1,
+                "truncated": False,
+                "content_fingerprint": content_fingerprint(b"hello\n"),
+            },
         error_code=None,
     )
 
@@ -1868,3 +1870,397 @@ def test_approval_timeout_configuration_fails_closed(
             tool_registry_factory=empty_tools,
             approval_timeout_seconds=approval_timeout_seconds,
         )
+
+
+def test_repeated_file_tool_edits_produce_one_original_to_final_diff(
+    tmp_path,
+) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("value = 'old'\n", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="write-middle",
+                    name="write_file",
+                    arguments={"path": "app.py", "content": "value = 'middle'\n"},
+                )
+            ),
+            tool_response(
+                ToolCallBlock(
+                    id="edit-final",
+                    name="edit_file",
+                    arguments={
+                        "path": "app.py",
+                        "old_string": "'middle'",
+                        "new_string": "'final'",
+                    },
+                )
+            ),
+            final_response("File updated."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Update app.py."))
+
+    assert source.read_text(encoding="utf-8") == "value = 'final'\n"
+    assert summary.modified_files == ["app.py"]
+    assert summary.diff_complete is True
+    assert summary.file_diffs == [
+        {
+            "path": "app.py",
+            "change_type": "modified",
+            "diff": (
+                "--- a/app.py\n"
+                "+++ b/app.py\n"
+                    "@@ -1 +1 @@\n"
+                    "-value = 'old'\n"
+                    "+value = 'final'\n"
+                ),
+        }
+    ]
+    changed_events = [
+        event
+        for event in runtime.get_events(thread.thread_id).events
+        if event.type == "file_changed"
+    ]
+    assert len(changed_events) == 2
+    assert changed_events[-1].payload == summary.file_diffs[0]
+
+
+def test_new_file_is_reported_against_dev_null(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="new-file",
+                    name="write_file",
+                    arguments={"path": "notes.txt", "content": "hello\n"},
+                )
+            ),
+            final_response("Created."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Create notes."))
+
+    assert summary.modified_files == ["notes.txt"]
+    assert summary.file_diffs[0]["change_type"] == "added"
+    assert summary.file_diffs[0]["diff"].startswith("--- /dev/null\n+++ b/notes.txt\n")
+    assert "+hello" in summary.file_diffs[0]["diff"]
+
+
+def test_external_change_returns_file_changed_until_model_rereads(tmp_path) -> None:
+    source = tmp_path / "shared.txt"
+    source.write_text("original\n", encoding="utf-8")
+
+    class ConflictRecoveryProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.requests: list[LLMRequest] = []
+
+        async def chat(self, request: LLMRequest) -> LLMResponse:
+            self.requests.append(request)
+            call_number = len(self.requests)
+            if call_number == 1:
+                return tool_response(
+                    ToolCallBlock(
+                        id="initial-read",
+                        name="read_file",
+                        arguments={"path": "shared.txt"},
+                    )
+                )
+            if call_number == 2:
+                source.write_text("external\n", encoding="utf-8")
+                return tool_response(
+                    ToolCallBlock(
+                        id="stale-write",
+                        name="write_file",
+                        arguments={"path": "shared.txt", "content": "stale\n"},
+                    )
+                )
+            if call_number == 3:
+                stale_result = request.messages[-1].content[0]
+                assert isinstance(stale_result, ToolResultBlock)
+                assert stale_result.error_code == "FILE_CHANGED"
+                assert source.read_text(encoding="utf-8") == "external\n"
+                return tool_response(
+                    ToolCallBlock(
+                        id="fresh-read",
+                        name="read_file",
+                        arguments={"path": "shared.txt"},
+                    )
+                )
+            if call_number == 4:
+                fresh_result = request.messages[-1].content[0]
+                assert isinstance(fresh_result, ToolResultBlock)
+                assert "external" in fresh_result.content
+                return tool_response(
+                    ToolCallBlock(
+                        id="fresh-write",
+                        name="write_file",
+                        arguments={"path": "shared.txt", "content": "resolved\n"},
+                    )
+                )
+            return final_response("Conflict resolved.")
+
+    provider = ConflictRecoveryProvider()
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Update shared.txt."))
+
+    assert summary.status is TurnStatus.COMPLETED
+    assert source.read_text(encoding="utf-8") == "resolved\n"
+    assert summary.modified_files == ["shared.txt"]
+    assert "-external" in summary.file_diffs[0]["diff"]
+    assert "+resolved" in summary.file_diffs[0]["diff"]
+
+
+def test_run_command_marks_diff_incomplete_without_guessing_changed_files(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="command-change",
+                    name="run_command",
+                    arguments={"command": "printf command > generated.txt"},
+                )
+            ),
+            final_response("Command complete."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Use a command."))
+
+    assert (tmp_path / "generated.txt").read_text(encoding="utf-8") == "command"
+    assert summary.modified_files == []
+    assert summary.file_diffs == []
+    assert summary.diff_complete is False
+
+
+def test_policy_denied_command_does_not_make_diff_incomplete(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="denied-command",
+                    name="run_command",
+                    arguments={"command": "printf denied > denied.txt"},
+                )
+            ),
+            final_response("Denied safely."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+        tool_policy=FixedPolicy(PolicyDecision.DENY),
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Do not execute."))
+
+    assert not (tmp_path / "denied.txt").exists()
+    assert summary.diff_complete is True
+
+
+def test_unified_diff_preserves_a_removed_final_newline(tmp_path) -> None:
+    source = tmp_path / "newline.txt"
+    source.write_text("value\n", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="remove-newline",
+                    name="write_file",
+                    arguments={"path": "newline.txt", "content": "value"},
+                )
+            ),
+            final_response("Newline removed."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Remove newline."))
+
+    assert summary.file_diffs[0]["diff"]
+    assert "-value\n+value" in summary.file_diffs[0]["diff"]
+
+
+def test_reverting_to_original_emits_a_final_reverted_event(tmp_path) -> None:
+    source = tmp_path / "revert.txt"
+    source.write_text("original\n", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="change",
+                    name="write_file",
+                    arguments={"path": "revert.txt", "content": "changed\n"},
+                )
+            ),
+            tool_response(
+                ToolCallBlock(
+                    id="revert",
+                    name="write_file",
+                    arguments={"path": "revert.txt", "content": "original\n"},
+                )
+            ),
+            final_response("Reverted."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Change then revert."))
+
+    assert summary.modified_files == []
+    changed_events = [
+        event.payload
+        for event in runtime.get_events(thread.thread_id).events
+        if event.type == "file_changed"
+    ]
+    assert changed_events[-1] == {
+        "path": "revert.txt",
+        "change_type": "reverted",
+        "diff": "",
+    }
+
+
+def test_invalid_command_does_not_make_diff_incomplete(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="invalid-command",
+                    name="run_command",
+                    arguments={"command": ""},
+                )
+            ),
+            final_response("Invalid command handled."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Invalid command."))
+
+    assert provider.requests[1].messages[-1].content[0].error_code == "INVALID_ARGUMENTS"
+    assert summary.diff_complete is True
+
+
+def test_read_fingerprint_matches_the_exact_content_returned_to_model(
+    tmp_path,
+) -> None:
+    source = tmp_path / "raced.txt"
+    source.write_text("model-saw-this\n", encoding="utf-8")
+
+    def raced_read(arguments: dict[str, object]) -> ToolResult:
+        source.write_text("external-version\n", encoding="utf-8")
+        return ToolResult(
+            content="1: model-saw-this",
+            metadata={
+                "path": "raced.txt",
+                "content_fingerprint": content_fingerprint(b"model-saw-this\n"),
+            },
+        )
+
+    def raced_write(arguments: dict[str, object]) -> ToolResult:
+        source.write_text(str(arguments["content"]), encoding="utf-8")
+        return ToolResult(
+            content="wrote raced.txt",
+            metadata={"path": "raced.txt"},
+        )
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="read_file",
+            description="Race-aware read fake.",
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        ),
+        raced_read,
+    )
+    registry.register(
+        ToolDefinition(
+            name="write_file",
+            description="Write fake.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        ),
+        raced_write,
+    )
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="raced-read",
+                    name="read_file",
+                    arguments={"path": "raced.txt"},
+                )
+            ),
+            tool_response(
+                ToolCallBlock(
+                    id="raced-write",
+                    name="write_file",
+                    arguments={"path": "raced.txt", "content": "overwrite\n"},
+                )
+            ),
+            final_response("Conflict observed."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=lambda _: registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Avoid overwrite."))
+
+    assert summary.status is TurnStatus.COMPLETED
+    assert source.read_text(encoding="utf-8") == "external-version\n"
+    conflict = provider.requests[2].messages[-1].content[0]
+    assert isinstance(conflict, ToolResultBlock)
+    assert conflict.error_code == "FILE_CHANGED"

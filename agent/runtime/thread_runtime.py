@@ -14,6 +14,7 @@ from agent.model.provider import LLMProvider
 from agent.tools.registry import ToolRegistry
 
 from .conversation import Conversation
+from .change_tracker import ChangeTracker
 from .errors import (
     ApprovalTimeoutError,
     SettingsConflictError,
@@ -46,6 +47,7 @@ class _ActiveTurn:
     turn_id: str
     controller: RunController
     tools: ToolCoordinator
+    changes: ChangeTracker
     events: TurnEventEmitter
     started_at: str
 
@@ -196,6 +198,7 @@ class ThreadRuntime:
             current_task = asyncio.current_task()
             assert current_task is not None
             controller.bind(current_task)
+            changes = ChangeTracker(record.workspace, events)
             tools = ToolCoordinator(
                 registry=record.tools,
                 conversation=record.conversation,
@@ -204,11 +207,13 @@ class ThreadRuntime:
                 policy=self._tool_policy,
                 approval_timeout_seconds=self._approval_timeout_seconds,
                 set_waiting=lambda waiting: self._set_waiting(record, waiting),
+                change_tracker=changes,
             )
             active_turn = _ActiveTurn(
                 turn_id=turn_id,
                 controller=controller,
                 tools=tools,
+                changes=changes,
                 events=events,
                 started_at=utc_now(),
             )
@@ -409,6 +414,7 @@ class ThreadRuntime:
         event_type: str,
         error: dict[str, object] | None = None,
     ) -> TurnSummary:
+        file_diffs = active_turn.changes.changes()
         summary = TurnSummary(
             schema_version=SCHEMA_VERSION,
             turn_id=active_turn.turn_id,
@@ -419,6 +425,9 @@ class ThreadRuntime:
             iterations=active_turn.controller.iterations,
             tool_calls=active_turn.controller.tool_calls,
             usage=deepcopy(active_turn.controller.usage),
+            modified_files=[change["path"] for change in file_diffs],
+            file_diffs=file_diffs,
+            diff_complete=active_turn.changes.diff_complete,
             started_at=active_turn.started_at,
             ended_at=utc_now(),
             error=error,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 import stat
 import tempfile
@@ -13,6 +14,12 @@ DEFAULT_IGNORED_DIRECTORIES = frozenset(
     {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", "build", "dist"}
 )
 MAX_TEXT_FILE_BYTES = 10 * 1024 * 1024
+
+
+def content_fingerprint(content: bytes) -> str:
+    """Return the stable version identifier used for optimistic file writes."""
+
+    return hashlib.sha256(content).hexdigest()
 
 
 class ToolOperationError(Exception):
@@ -87,28 +94,29 @@ class WorkspaceFilesystem:
 
     def read_text_page(
         self, raw_path: object, *, offset: int, limit: int
-    ) -> tuple[list[str], int, str]:
-        """Stream one page while counting lines within the file resource limit."""
+    ) -> tuple[list[str], int, str, str]:
+        """Read one bounded text version and return its exact content fingerprint."""
 
         target, relative = self._resolve_text_file(raw_path)
-        page: list[str] = []
-        total_lines = 0
         try:
-            with target.open(mode="r", encoding="utf-8", newline=None) as source:
-                for total_lines, raw_line in enumerate(source, 1):
-                    if "\0" in raw_line:
-                        raise ToolOperationError(
-                            "NOT_TEXT", f"file contains NUL bytes: {relative}"
-                        )
-                    if offset <= total_lines < offset + limit:
-                        page.append(raw_line.rstrip("\r\n"))
+            content_bytes = target.read_bytes()
+            content = content_bytes.decode("utf-8")
         except UnicodeDecodeError as error:
             raise ToolOperationError(
                 "NOT_TEXT", f"file is not valid UTF-8: {relative}"
             ) from error
         except OSError as error:
             raise ToolOperationError("IO_ERROR", f"could not read file: {relative}") from error
-        return page, total_lines, relative
+        if "\0" in content:
+            raise ToolOperationError("NOT_TEXT", f"file contains NUL bytes: {relative}")
+        lines = content.splitlines()
+        page = lines[offset - 1 : offset - 1 + limit]
+        return (
+            page,
+            len(lines),
+            relative,
+            content_fingerprint(content_bytes),
+        )
 
     def write_text_file(self, raw_path: object, content: object) -> tuple[str, int]:
         if not isinstance(content, str):

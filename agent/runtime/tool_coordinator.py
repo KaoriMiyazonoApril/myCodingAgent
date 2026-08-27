@@ -12,6 +12,7 @@ from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
 
 from .conversation import Conversation
+from .change_tracker import ChangeTracker
 from .errors import ApprovalTimeoutError, TurnLimitReached
 from .events import TurnEventEmitter, public_tool_call
 from .policy import PolicyDecision, ToolPolicy
@@ -37,6 +38,7 @@ class ToolCoordinator:
         policy: ToolPolicy,
         approval_timeout_seconds: float,
         set_waiting: Callable[[bool], None],
+        change_tracker: ChangeTracker,
     ) -> None:
         self._registry = registry
         self._conversation = conversation
@@ -45,6 +47,7 @@ class ToolCoordinator:
         self._policy = policy
         self._approval_timeout_seconds = approval_timeout_seconds
         self._set_waiting = set_waiting
+        self._change_tracker = change_tracker
         self._pending_approval: _PendingApproval | None = None
 
     def definitions(self) -> list[ToolDefinition]:
@@ -151,7 +154,16 @@ class ToolCoordinator:
             if not await self._request_approval(call):
                 return self._denied_result()
         self._events.tool_started(call)
-        return await self._controller.wait(self._registry.execute_async(call))
+        conflict = self._change_tracker.before_execution(call)
+        if conflict is not None:
+            return conflict
+        try:
+            result = await self._controller.wait(self._registry.execute_async(call))
+        except (TurnLimitReached, asyncio.CancelledError):
+            self._change_tracker.execution_interrupted(call)
+            raise
+        self._change_tracker.after_execution(call, result)
+        return result
 
     async def _request_approval(self, call: ToolCallBlock) -> bool:
         loop = asyncio.get_running_loop()

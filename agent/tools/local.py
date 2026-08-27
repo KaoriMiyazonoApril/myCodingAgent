@@ -63,7 +63,7 @@ def _read_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) ->
     offset = cast(int, arguments["offset"])
     limit = cast(int, arguments["limit"])
 
-    page, total_lines, relative = filesystem.read_text_page(
+    page, total_lines, relative, fingerprint = filesystem.read_text_page(
         arguments.get("path"), offset=offset, limit=limit
     )
     start_line = offset if page else None
@@ -79,6 +79,7 @@ def _read_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) ->
             "start_line": start_line,
             "end_line": end_line,
             "truncated": bool(page) and end_line < total_lines,
+            "content_fingerprint": fingerprint,
         },
     )
 
