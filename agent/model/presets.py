@@ -6,7 +6,6 @@ from types import MappingProxyType
 
 from .errors import LLMConfigurationError
 from .types import (
-    ModelProfile,
     ProviderCapabilities,
     ProviderConfig,
     ProviderProfile,
@@ -16,6 +15,11 @@ from .types import (
 
 REASONING_TOOL_CALLS = ProviderCapabilities(
     reasoning_retention=ReasoningRetention.TOOL_CHAIN_ONLY,
+    reasoning_input_field="reasoning_content",
+)
+
+PRESERVED_REASONING = ProviderCapabilities(
+    reasoning_retention=ReasoningRetention.ALWAYS,
     reasoning_input_field="reasoning_content",
 )
 
@@ -30,21 +34,14 @@ PROVIDER_PRESETS = MappingProxyType(
         "deepseek": ProviderProfile(
             base_url="https://api.deepseek.com",
             default_capabilities=DEEPSEEK_CAPABILITIES,
-            model_profiles=MappingProxyType(
-                {
-                    "deepseek-chat": ModelProfile(
-                        reasoning_retention=ReasoningRetention.NEVER
-                    ),
-                }
-            ),
         ),
         "kimi": ProviderProfile(
             base_url="https://api.moonshot.cn/v1",
-            default_capabilities=REASONING_TOOL_CALLS,
+            default_capabilities=PRESERVED_REASONING,
         ),
         "moonshot": ProviderProfile(
             base_url="https://api.moonshot.cn/v1",
-            default_capabilities=REASONING_TOOL_CALLS,
+            default_capabilities=PRESERVED_REASONING,
         ),
         "glm": ProviderProfile(
             base_url="https://open.bigmodel.cn/api/paas/v4",

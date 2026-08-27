@@ -20,12 +20,20 @@ class ReasoningRetention(str, Enum):
     ALWAYS = "always"
 
 
+class _Unset:
+    """Sentinel separating inheritance from an explicit ``None`` override."""
+
+
+_UNSET = _Unset()
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderCapabilities:
     """Protocol behavior that differs between OpenAI-compatible providers."""
 
     reasoning_retention: ReasoningRetention = ReasoningRetention.NEVER
     reasoning_input_field: str | None = None
+    reasoning_output_fields: tuple[str, ...] = ("reasoning_content", "thinking")
     requires_assistant_content_for_tool_calls: bool = False
 
     def __post_init__(self) -> None:
@@ -44,6 +52,13 @@ class ProviderCapabilities:
             raise LLMConfigurationError(
                 "requires_assistant_content_for_tool_calls must be a boolean"
             )
+        if not isinstance(self.reasoning_output_fields, tuple) or any(
+            not isinstance(field_name, str) or not field_name
+            for field_name in self.reasoning_output_fields
+        ):
+            raise LLMConfigurationError(
+                "reasoning_output_fields must be a tuple of non-empty strings"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +66,8 @@ class ModelProfile:
     """Partial capability overrides for one exact model."""
 
     reasoning_retention: ReasoningRetention | None = None
-    reasoning_input_field: str | None = None
+    reasoning_input_field: str | None | _Unset = _UNSET
+    reasoning_output_fields: tuple[str, ...] | _Unset = _UNSET
     requires_assistant_content_for_tool_calls: bool | None = None
 
     def apply(self, defaults: ProviderCapabilities) -> ProviderCapabilities:
@@ -61,9 +77,16 @@ class ModelProfile:
                 if self.reasoning_retention is not None
                 else defaults.reasoning_retention
             ),
-            reasoning_input_field=self.reasoning_input_field
-            if self.reasoning_input_field is not None
-            else defaults.reasoning_input_field,
+            reasoning_input_field=(
+                defaults.reasoning_input_field
+                if self.reasoning_input_field is _UNSET
+                else self.reasoning_input_field
+            ),
+            reasoning_output_fields=(
+                defaults.reasoning_output_fields
+                if self.reasoning_output_fields is _UNSET
+                else self.reasoning_output_fields
+            ),
             requires_assistant_content_for_tool_calls=(
                 self.requires_assistant_content_for_tool_calls
                 if self.requires_assistant_content_for_tool_calls is not None

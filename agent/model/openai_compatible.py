@@ -337,10 +337,9 @@ class OpenAICompatibleProvider(LLMProvider):
             total_tokens=OpenAICompatibleProvider._get_field(raw_usage, "total_tokens"),
         )
 
-    @staticmethod
-    def _get_reasoning(raw_message: Any) -> str | None:
-        for field_name in ("reasoning_content", "thinking"):
-            value = OpenAICompatibleProvider._get_field(raw_message, field_name)
+    def _get_reasoning(self, raw_message: Any) -> str | None:
+        for field_name in self.config.capabilities.reasoning_output_fields:
+            value = self._get_field(raw_message, field_name)
             if isinstance(value, str) and value:
                 return value
         return None

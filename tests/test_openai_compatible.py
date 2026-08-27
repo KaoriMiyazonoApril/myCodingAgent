@@ -26,8 +26,10 @@ from agent.model.openai_compatible import OpenAICompatibleProvider
 from agent.model.presets import create_provider_config
 from agent.model.types import (
     LLMRequest,
+    ModelProfile,
     ProviderCapabilities,
     ProviderConfig,
+    ProviderProfile,
     ReasoningRetention,
 )
 from agent.tools.types import ToolDefinition, ToolResult
@@ -174,7 +176,7 @@ def test_request_encoding_keeps_sdk_shapes_at_provider_boundary() -> None:
 def test_reasoning_is_preserved_for_thinking_tool_call_turns() -> None:
     deepseek = OpenAICompatibleProvider(
         create_provider_config(
-            "deepseek", api_key="test-key", model="deepseek-reasoner"
+            "deepseek", api_key="test-key", model="deepseek-v4-pro"
         ),
         client=object(),
     )
@@ -199,20 +201,74 @@ def test_reasoning_is_preserved_for_thinking_tool_call_turns() -> None:
 
 
 def test_provider_defaults_and_model_overrides_resolve_capabilities() -> None:
-    deepseek = create_provider_config("deepseek", api_key="key", model="deepseek-chat")
-    reasoner = create_provider_config(
-        "deepseek", api_key="key", model="deepseek-reasoner"
+    deepseek = create_provider_config(
+        "deepseek", api_key="key", model="deepseek-v4-pro"
     )
     kimi = create_provider_config("kimi", api_key="key", model="model")
     glm = create_provider_config("glm", api_key="key", model="model")
 
-    assert deepseek.capabilities.reasoning_retention is ReasoningRetention.NEVER
+    assert deepseek.capabilities.reasoning_retention is ReasoningRetention.TOOL_CHAIN_ONLY
     assert deepseek.capabilities.requires_assistant_content_for_tool_calls is True
-    assert reasoner.capabilities.reasoning_retention is ReasoningRetention.TOOL_CHAIN_ONLY
-    assert kimi.capabilities.reasoning_retention is ReasoningRetention.TOOL_CHAIN_ONLY
+    assert kimi.capabilities.reasoning_retention is ReasoningRetention.ALWAYS
     assert glm.capabilities.reasoning_retention is ReasoningRetention.TOOL_CHAIN_ONLY
-    assert reasoner.capabilities.requires_assistant_content_for_tool_calls is True
     assert kimi.capabilities.requires_assistant_content_for_tool_calls is False
+
+
+def test_model_profile_can_explicitly_disable_a_provider_default_field() -> None:
+    profile = ProviderProfile(
+        base_url="https://example.invalid",
+        default_capabilities=ProviderCapabilities(
+            reasoning_retention=ReasoningRetention.TOOL_CHAIN_ONLY,
+            reasoning_input_field="reasoning_content",
+        ),
+        model_profiles={
+            "plain": ModelProfile(
+                reasoning_retention=ReasoningRetention.NEVER,
+                reasoning_input_field=None,
+            )
+        },
+    )
+
+    resolved = profile.capabilities_for("plain")
+
+    assert resolved.reasoning_retention is ReasoningRetention.NEVER
+    assert resolved.reasoning_input_field is None
+
+
+def test_reasoning_output_fields_are_provider_configurable() -> None:
+    configured = OpenAICompatibleProvider(
+        ProviderConfig(
+            provider="gateway",
+            base_url="https://example.invalid/v1",
+            api_key="key",
+            model="model",
+            capabilities=ProviderCapabilities(
+                reasoning_output_fields=("reasoning_details",),
+            ),
+        ),
+        client=object(),
+    )
+    raw_message = SimpleNamespace(
+        role="assistant",
+        content="answer",
+        tool_calls=None,
+        reasoning_details="private reasoning",
+    )
+    raw_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=raw_message, finish_reason="stop")],
+        usage=None,
+    )
+
+    parsed = configured._parse_response(raw_response)
+
+    assert parsed.message.content[0] == ReasoningBlock(text="private reasoning")
+
+
+def test_deepseek_profiles_do_not_reference_retired_model_aliases() -> None:
+    from agent.model.presets import PROVIDER_PRESETS
+
+    assert "deepseek-chat" not in PROVIDER_PRESETS["deepseek"].model_profiles
+    assert "deepseek-reasoner" not in PROVIDER_PRESETS["deepseek"].model_profiles
 
 
 def test_reasoning_retention_supports_never_tool_chain_and_always() -> None:

@@ -28,7 +28,7 @@ class _BubblewrapSandbox:
     def __init__(self) -> None:
         self._executable: str | None = None
 
-    def check_available(self) -> None:
+    def check_available(self, workspace_root: Path) -> None:
         """Fail during runtime composition when bubblewrap cannot execute."""
         if not sys.platform.startswith("linux"):
             raise CommandSandboxUnavailableError(
@@ -40,6 +40,31 @@ class _BubblewrapSandbox:
                 "bubblewrap is required for workspace command isolation"
             )
         self._executable = executable
+        probe_command = self.build_command(
+            workspace_root=workspace_root,
+            command="true",
+            relative_cwd=".",
+        )
+        try:
+            probe = subprocess.run(
+                probe_command,
+                cwd=workspace_root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise CommandSandboxUnavailableError(
+                f"bubblewrap capability probe failed: {error}"
+            ) from error
+        if probe.returncode != 0:
+            details = probe.stderr.decode("utf-8", errors="replace").strip()
+            suffix = f": {details}" if details else ""
+            raise CommandSandboxUnavailableError(
+                f"bubblewrap capability probe failed with status {probe.returncode}{suffix}"
+            )
 
     def build_command(
         self,
@@ -147,7 +172,7 @@ class CommandRunner:
     ) -> None:
         self._filesystem = filesystem
         self._sandbox = _BubblewrapSandbox()
-        self._sandbox.check_available()
+        self._sandbox.check_available(self._filesystem.root)
 
     def run(self, command: str, cwd: str, timeout_ms: int) -> ToolResult:
         """Synchronous entry point for CLI code and synchronous tests."""

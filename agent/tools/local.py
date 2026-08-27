@@ -5,13 +5,24 @@ from __future__ import annotations
 from fnmatch import fnmatchcase
 from pathlib import Path
 from pathlib import PurePosixPath
-import re
+import time
 from typing import cast
+
+import regex
 
 from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem
 from agent.tools.process import CommandRunner
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
+
+
+MAX_RETURNED_MATCHES = 200
+MAX_SCANNED_FILES = 10_000
+MAX_SEARCH_FILE_BYTES = 5 * 1024 * 1024
+MAX_SEARCH_TOTAL_BYTES = 50 * 1024 * 1024
+MAX_SEARCH_LINE_CHARS = 100_000
+MAX_SEARCH_DURATION_SECONDS = 5.0
+REGEX_TIMEOUT_SECONDS = 0.05
 
 
 def _object_schema(
@@ -52,9 +63,9 @@ def _read_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) ->
     offset = cast(int, arguments["offset"])
     limit = cast(int, arguments["limit"])
 
-    content, relative = filesystem.read_text_file(arguments.get("path"))
-    lines = content.splitlines()
-    page = lines[offset - 1 : offset - 1 + limit]
+    page, total_lines, relative = filesystem.read_text_page(
+        arguments.get("path"), offset=offset, limit=limit
+    )
     start_line = offset if page else None
     end_line = offset + len(page) - 1 if page else None
     return ToolResult(
@@ -64,10 +75,10 @@ def _read_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) ->
             "requested_offset": offset,
             "requested_limit": limit,
             "returned_lines": len(page),
-            "total_lines": len(lines),
+            "total_lines": total_lines,
             "start_line": start_line,
             "end_line": end_line,
-            "truncated": bool(page) and end_line < len(lines),
+            "truncated": bool(page) and end_line < total_lines,
         },
     )
 
@@ -109,24 +120,28 @@ def _glob(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> Tool
         raise ToolOperationError("INVALID_ARGUMENTS", "pattern must be a relative glob")
     selected_path = arguments["path"]
     selected, selected_relative = filesystem.resolve(selected_path)
-    matches = [
-        relative
-        for _, relative in filesystem.regular_files(selected_path)
-        if _matches_relative_glob(
-            PurePosixPath(relative)
-            .relative_to(PurePosixPath(selected.relative_to(filesystem.root).as_posix()))
-            .as_posix(),
-            pattern,
-        )
-    ]
-    matches.sort()
-    returned = matches[:200]
+    selected_prefix = PurePosixPath(selected.relative_to(filesystem.root).as_posix())
+    matches: list[str] = []
+    truncated = False
+    for scanned_index, (_, relative) in enumerate(
+        filesystem.regular_files(selected_path)
+    ):
+        if scanned_index >= MAX_SCANNED_FILES:
+            truncated = True
+            break
+        relative_to_selected = PurePosixPath(relative).relative_to(selected_prefix)
+        if not _matches_relative_glob(relative_to_selected.as_posix(), pattern):
+            continue
+        if len(matches) >= MAX_RETURNED_MATCHES:
+            truncated = True
+            break
+        matches.append(relative)
     return ToolResult(
-        content="\n".join(returned),
+        content="\n".join(matches),
         metadata={
             "path": selected_relative,
-            "matches": len(returned),
-            "truncated": len(matches) > len(returned),
+            "matches": len(matches),
+            "truncated": truncated,
         },
     )
 
@@ -135,33 +150,76 @@ def _grep(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> Tool
     pattern = cast(str, arguments["pattern"])
     include = arguments.get("include")
     try:
-        expression = re.compile(pattern)
-    except re.error as error:
+        expression = regex.compile(pattern)
+    except regex.error as error:
         raise ToolOperationError("INVALID_REGEX", f"invalid regular expression: {error}") from error
 
     selected_path = arguments["path"]
     _, selected_relative = filesystem.resolve(selected_path)
     matches: list[tuple[str, int, str]] = []
-    for _, relative in filesystem.regular_files(selected_path):
+    truncated = False
+    scanned_bytes = 0
+    deadline = time.monotonic() + MAX_SEARCH_DURATION_SECONDS
+    limit_reached = False
+    for scanned_index, (path, relative) in enumerate(
+        filesystem.regular_files(selected_path)
+    ):
+        if scanned_index >= MAX_SCANNED_FILES or time.monotonic() >= deadline:
+            truncated = True
+            break
         if include is not None and not PurePosixPath(relative).match(include):
             continue
         try:
-            content, relative = filesystem.read_text_file(relative)
+            file_bytes = path.stat().st_size
+        except OSError:
+            truncated = True
+            continue
+        if scanned_bytes + file_bytes > MAX_SEARCH_TOTAL_BYTES:
+            truncated = True
+            break
+        scanned_bytes += file_bytes
+        try:
+            content, _ = filesystem.read_text_file(
+                relative, max_bytes=MAX_SEARCH_FILE_BYTES
+            )
         except ToolOperationError as error:
             if error.code == "NOT_TEXT":
                 continue
+            if error.code == "FILE_TOO_LARGE":
+                truncated = True
+                continue
             raise
         for line_number, line in enumerate(content.splitlines(), 1):
-            if expression.search(line):
+            if time.monotonic() >= deadline:
+                truncated = True
+                limit_reached = True
+                break
+            if len(line) > MAX_SEARCH_LINE_CHARS:
+                truncated = True
+                continue
+            try:
+                matched = expression.search(line, timeout=REGEX_TIMEOUT_SECONDS)
+            except TimeoutError as error:
+                raise ToolOperationError(
+                    "REGEX_TIMEOUT", "regular expression exceeded its match time limit"
+                ) from error
+            if matched:
+                if len(matches) >= MAX_RETURNED_MATCHES:
+                    truncated = True
+                    limit_reached = True
+                    break
                 matches.append((relative, line_number, line))
-    matches.sort(key=lambda match: (match[0], match[1]))
-    returned = matches[:200]
+        if limit_reached:
+            break
     return ToolResult(
-        content="\n".join(f"{relative}:{line_number}: {line}" for relative, line_number, line in returned),
+        content="\n".join(
+            f"{relative}:{line_number}: {line}"
+            for relative, line_number, line in matches
+        ),
         metadata={
             "path": selected_relative,
-            "matches": len(returned),
-            "truncated": len(matches) > len(returned),
+            "matches": len(matches),
+            "truncated": truncated,
         },
     )
 

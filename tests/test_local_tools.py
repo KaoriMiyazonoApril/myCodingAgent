@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -170,6 +171,33 @@ def test_glob_uses_relative_pathlib_matching_for_recursive_patterns(tmp_path) ->
     assert recursive.content == "src/nested/deep.py\nsrc/root.py"
 
 
+def test_search_symlinks_must_remain_inside_selected_subtree(tmp_path) -> None:
+    (tmp_path / "other.txt").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "link.txt").symlink_to("../other.txt")
+    registry = create_local_tool_registry(tmp_path)
+
+    grep_result = registry.execute(
+        ToolCallBlock(
+            id="call_subtree_grep",
+            name="grep",
+            arguments={"path": "sub", "pattern": "needle"},
+        )
+    )
+    glob_result = registry.execute(
+        ToolCallBlock(
+            id="call_subtree_glob",
+            name="glob",
+            arguments={"path": "sub", "pattern": "*.txt"},
+        )
+    )
+
+    assert grep_result.error_code is None
+    assert grep_result.content == ""
+    assert glob_result.error_code is None
+    assert glob_result.content == ""
+
+
 def test_glob_rejects_absolute_or_escaping_patterns(tmp_path) -> None:
     registry = create_local_tool_registry(tmp_path)
 
@@ -284,6 +312,21 @@ def test_local_tool_composition_checks_command_isolation_capability_early(
     assert not (tmp_path / "must-not-run").exists()
 
 
+def test_local_tool_composition_rejects_installed_but_unusable_bubblewrap(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("agent.tools.process.shutil.which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(
+        "agent.tools.process.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stderr=b"user namespaces disabled"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="user namespaces disabled"):
+        create_local_tool_registry(tmp_path)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="setsid is POSIX-only")
 def test_timeout_returns_even_if_detached_descendant_keeps_pipe_open(tmp_path) -> None:
     registry = create_local_tool_registry(tmp_path)
@@ -344,6 +387,24 @@ def test_read_out_of_range_and_non_text_files_return_structured_results(tmp_path
     assert page.metadata["end_line"] is None
     assert page.metadata["truncated"] is False
     assert non_text.error_code == "NOT_TEXT"
+
+
+def test_read_file_rejects_files_beyond_its_resource_limit(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "agent.tools.filesystem.MAX_TEXT_FILE_BYTES", 32, raising=False
+    )
+    (tmp_path / "large.txt").write_text("x" * 33, encoding="utf-8")
+    registry = create_local_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="call_large_read",
+            name="read_file",
+            arguments={"path": "large.txt", "limit": 1},
+        )
+    )
+
+    assert result.error_code == "FILE_TOO_LARGE"
 
 
 def test_write_overwrite_preserves_mode_and_edit_failure_is_immutable(tmp_path) -> None:
@@ -525,6 +586,96 @@ def test_tool_schema_validation_fails_closed_for_unsupported_types() -> None:
 
     assert result.error_code == "INVALID_ARGUMENTS"
     assert "unsupported schema type" in result.content
+
+
+def test_glob_stops_after_detecting_the_first_truncated_match(
+    tmp_path, monkeypatch
+) -> None:
+    registry = create_local_tool_registry(tmp_path)
+
+    def files(*_args, **_kwargs):
+        for index in range(201):
+            yield tmp_path / f"{index:03}.py", f"{index:03}.py"
+        raise AssertionError("glob scanned beyond the truncation sentinel")
+
+    monkeypatch.setattr("agent.tools.filesystem.WorkspaceFilesystem.regular_files", files)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="bounded_glob", name="glob", arguments={"pattern": "*.py"}
+        )
+    )
+
+    assert result.error_code is None
+    assert result.metadata == {"path": ".", "matches": 200, "truncated": True}
+
+
+def test_grep_stops_after_detecting_the_first_truncated_match(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "matches.txt"
+    source.write_text("needle\n" * 201, encoding="utf-8")
+    registry = create_local_tool_registry(tmp_path)
+
+    def files(*_args, **_kwargs):
+        yield source, "matches.txt"
+        raise AssertionError("grep scanned beyond the truncation sentinel")
+
+    monkeypatch.setattr("agent.tools.filesystem.WorkspaceFilesystem.regular_files", files)
+
+    result = registry.execute(
+        ToolCallBlock(id="bounded_grep", name="grep", arguments={"pattern": "needle"})
+    )
+
+    assert result.error_code is None
+    assert result.metadata == {"path": ".", "matches": 200, "truncated": True}
+
+
+def test_grep_marks_results_incomplete_at_scanned_file_limit(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("agent.tools.local.MAX_SCANNED_FILES", 1, raising=False)
+    (tmp_path / "a.txt").write_text("first\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("needle\n", encoding="utf-8")
+    registry = create_local_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(id="file_limit", name="grep", arguments={"pattern": "needle"})
+    )
+
+    assert result.error_code is None
+    assert result.content == ""
+    assert result.metadata["truncated"] is True
+
+
+def test_grep_skips_oversized_files_and_marks_results_incomplete(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("agent.tools.local.MAX_SEARCH_FILE_BYTES", 16, raising=False)
+    (tmp_path / "large.txt").write_text("needle " * 3, encoding="utf-8")
+    (tmp_path / "small.txt").write_text("needle\n", encoding="utf-8")
+    registry = create_local_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(id="file_bytes", name="grep", arguments={"pattern": "needle"})
+    )
+
+    assert result.error_code is None
+    assert result.content == "small.txt:1: needle"
+    assert result.metadata["truncated"] is True
+
+
+def test_grep_bounds_catastrophic_regex_matching_time(tmp_path) -> None:
+    (tmp_path / "input.txt").write_text("a" * 1000 + "!\n", encoding="utf-8")
+    registry = create_local_tool_registry(tmp_path)
+    start = time.monotonic()
+
+    result = registry.execute(
+        ToolCallBlock(id="redos", name="grep", arguments={"pattern": "(a+)+$"})
+    )
+
+    assert result.error_code == "REGEX_TIMEOUT"
+    assert time.monotonic() - start < 0.5
 
 
 def test_invalid_parsed_arguments_become_recoverable_tool_error(tmp_path) -> None:

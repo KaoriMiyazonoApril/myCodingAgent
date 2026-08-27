@@ -61,12 +61,13 @@ OpenAI Python SDK 只在 `OpenAICompatibleProvider` 内用作 HTTP 客户端。S
 
 reasoning 历史由 `ProviderCapabilities.reasoning_retention` 的三态策略控制：`NEVER`
 从不回放，`TOOL_CHAIN_ONLY` 只回放含 tool call 的 assistant turn，`ALWAYS` 回放所有
-含 reasoning 的 assistant turn。适配器使用能力声明中的字段（当前预设均为
-`reasoning_content`）发送保留内容。供应商私有的 thinking 启用参数仍由调用方通过
-`extra_body` 指定。
+含 reasoning 的 assistant turn。适配器使用 `reasoning_input_field` 指定的字段发送保留
+内容，并依次从 `reasoning_output_fields` 声明的响应字段中解析 reasoning；因此网关若使用
+`reasoning_details` 等非默认字段，只需配置 capability，无需修改适配器。供应商私有的
+thinking 启用参数仍由调用方通过 `extra_body` 指定。
 
-解析响应时，文本变成 `TextBlock`，`reasoning_content` 或字符串形式的
-`thinking` 变成 `ReasoningBlock`。工具调用参数用 `json.loads` 解析为 `dict`。空参数
+解析响应时，文本变成 `TextBlock`，能力声明匹配到的字符串 reasoning 字段变成
+`ReasoningBlock`。工具调用参数用 `json.loads` 解析为 `dict`。空参数
 变成 `{}`；无效 JSON、非对象 JSON 或非字符串参数不会废弃整条模型响应，而是产生
 `arguments=None`、带 `arguments_error` 的 `ToolCallBlock`。无论解析成功与否，原始
 `function.arguments` 都保存在 `raw_arguments`，下一轮历史回放不会把非法参数改写成
@@ -85,15 +86,22 @@ envelope：`ok`、`content`、`metadata`、`error_code` 会一起进入 tool mes
 提供当前官方默认端点：DeepSeek `https://api.deepseek.com`、Kimi/Moonshot
 `https://api.moonshot.cn/v1`、GLM `https://open.bigmodel.cn/api/paas/v4`；调用者
 仍可用 `base_url` 覆盖。每个 `ProviderProfile` 提供默认 capabilities，并可通过精确模型
-名映射到 `ModelProfile` 的逐字段覆盖；未覆盖字段继承 provider 默认值。调用方也可在
-创建配置时显式传入完整 capabilities。当前三家
-provider 默认使用 `TOOL_CHAIN_ONLY`；`deepseek-chat` 的非思考模型 profile 覆盖为
-`NEVER`。DeepSeek 还要求 tool-call assistant message 提供非 null content。API key 不会
-出现在 `ProviderConfig` 的默认 repr 中，示例也只从环境变量读取 key。
+名映射到 `ModelProfile` 的逐字段覆盖；未覆盖字段继承 provider 默认值。对于可空字段，
+内部 `UNSET` 表示继承，而显式 `None` 表示禁用，因此 model profile 可以清除 provider
+默认的 reasoning 输入字段。调用方也可在创建配置时显式传入完整 capabilities。
+
+当前 DeepSeek 预设面向 `deepseek-v4-flash` 与 `deepseek-v4-pro` 等当前模型，不再保留已
+退役的 `deepseek-chat` / `deepseek-reasoner` 特例；其 reasoning 使用
+`TOOL_CHAIN_ONLY`，且 tool-call assistant message 需要非 null content。Kimi/Moonshot
+预设使用 `ALWAYS`，与 preserved thinking 默认保留完整历史的行为对齐；只有调用方实际
+开启 thinking 时，才应通过 `extra_body` 传入相应的 `thinking.keep` 等私有参数。GLM
+预设继续使用 `TOOL_CHAIN_ONLY`。API key 不会出现在 `ProviderConfig` 的默认 repr 中，
+示例也只从环境变量读取 key。
 
 能力声明依据供应商的 thinking + tool-call 协议文档：
 [DeepSeek Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/)、
-[Kimi K2.6 Tool Use Compatibility](https://platform.kimi.com/docs/guide/kimi-k2-6-quickstart)、
+[DeepSeek V4 Release Notes](https://api-docs.deepseek.com/news/news260424/)、
+[Kimi Code Configuration](https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/config-files)、
 [GLM 思考模式](https://docs.bigmodel.cn/cn/guide/capabilities/thinking-mode)。
 
 `ProviderConfig` 和预设选择的所有配置错误都统一抛出
