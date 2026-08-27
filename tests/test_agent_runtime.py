@@ -40,6 +40,7 @@ from agent.runtime import (
     TurnSettingsOverride,
     TurnStatus,
     UnsupportedModelSettingError,
+    WorkspaceBusyError,
 )
 from agent.runtime.run_controller import RunController
 from agent.tools.registry import ToolRegistry
@@ -111,6 +112,26 @@ class PausingToolProvider(LLMProvider):
             finish_reason="stop",
             usage=Usage(),
         )
+
+
+class ConcurrentProvider(LLMProvider):
+    """Hold any number of model calls while exposing how many started."""
+
+    def __init__(self) -> None:
+        self.started_count = 0
+        self.changed = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def chat(self, request: LLMRequest) -> LLMResponse:
+        self.started_count += 1
+        self.changed.set()
+        await self.release.wait()
+        return final_response("Concurrent turn complete.")
+
+    async def wait_for_started(self, count: int) -> None:
+        while self.started_count < count:
+            self.changed.clear()
+            await self.changed.wait()
 
 
 class RecordingCompletions:
@@ -1342,3 +1363,183 @@ def test_cancelling_run_command_terminates_its_process_group(tmp_path) -> None:
     assert summary.status is TurnStatus.CANCELLED
     with pytest.raises(ProcessLookupError):
         os.kill(process_id, 0)
+
+
+def test_turns_in_unrelated_workspaces_run_concurrently(tmp_path) -> None:
+    async def scenario():
+        provider = ConcurrentProvider()
+        runtime = runtime_for_provider(provider)
+        first_workspace = tmp_path / "first"
+        second_workspace = tmp_path / "second"
+        first_workspace.mkdir()
+        second_workspace.mkdir()
+        first = runtime.create_thread(first_workspace)
+        second = runtime.create_thread(second_workspace)
+
+        first_turn = asyncio.create_task(runtime.run_turn(first.thread_id, "First."))
+        second_turn = asyncio.create_task(runtime.run_turn(second.thread_id, "Second."))
+        await asyncio.wait_for(provider.wait_for_started(2), timeout=0.5)
+        provider.release.set()
+        return await asyncio.gather(first_turn, second_turn)
+
+    summaries = asyncio.run(scenario())
+
+    assert [summary.status for summary in summaries] == [
+        TurnStatus.COMPLETED,
+        TurnStatus.COMPLETED,
+    ]
+
+
+@pytest.mark.parametrize("relationship", ["same", "parent", "child"])
+def test_overlapping_workspace_turns_fail_immediately_with_workspace_busy(
+    tmp_path,
+    relationship,
+) -> None:
+    async def scenario():
+        provider = PausingProvider()
+        runtime = runtime_for_provider(provider)
+        parent = tmp_path / "workspace"
+        child = parent / "nested"
+        child.mkdir(parents=True)
+        if relationship == "same":
+            first_path, second_path = parent, parent
+        elif relationship == "parent":
+            first_path, second_path = child, parent
+        else:
+            first_path, second_path = parent, child
+        first = runtime.create_thread(first_path)
+        second = runtime.create_thread(second_path)
+        active = asyncio.create_task(runtime.run_turn(first.thread_id, "Hold lease."))
+        await provider.started.wait()
+        try:
+            with pytest.raises(WorkspaceBusyError) as captured:
+                await runtime.run_turn(second.thread_id, "Must fail immediately.")
+            assert captured.value.code == "WORKSPACE_BUSY"
+        finally:
+            provider.release.set()
+            await active
+
+    asyncio.run(scenario())
+
+
+def test_global_active_turn_limit_is_configurable_and_fails_immediately(
+    tmp_path,
+) -> None:
+    async def scenario():
+        provider = ConcurrentProvider()
+        runtime = runtime_for_provider(provider, max_active_turns=2)
+        threads = []
+        for name in ("one", "two", "three"):
+            workspace = tmp_path / name
+            workspace.mkdir()
+            threads.append(runtime.create_thread(workspace))
+
+        active = [
+            asyncio.create_task(runtime.run_turn(thread.thread_id, "Hold capacity."))
+            for thread in threads[:2]
+        ]
+        await asyncio.wait_for(provider.wait_for_started(2), timeout=0.5)
+        try:
+            with pytest.raises(WorkspaceBusyError, match="capacity") as captured:
+                await runtime.run_turn(threads[2].thread_id, "No capacity.")
+            assert captured.value.code == "WORKSPACE_BUSY"
+        finally:
+            provider.release.set()
+            await asyncio.gather(*active)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("first_responses", "limits", "expected_status"),
+    [
+        ([final_response("Completed.")], AgentLimits(), TurnStatus.COMPLETED),
+        (
+            [
+                tool_response(
+                    ToolCallBlock(id="limited", name="missing", arguments={})
+                )
+            ],
+            AgentLimits(max_iterations=1),
+            TurnStatus.LIMIT_REACHED,
+        ),
+    ],
+)
+def test_terminal_turn_releases_workspace_lease(
+    tmp_path,
+    first_responses,
+    limits,
+    expected_status,
+) -> None:
+    provider = ScriptedProvider(first_responses + [final_response("Next thread.")])
+    runtime = runtime_for_provider(
+        provider,
+        default_settings=ModelSettings(
+            provider_config_id="test-provider",
+            model="test-model",
+            limits=limits,
+        ),
+    )
+    first = runtime.create_thread(tmp_path)
+    second = runtime.create_thread(tmp_path)
+
+    first_summary = asyncio.run(runtime.run_turn(first.thread_id, "First turn."))
+    second_summary = asyncio.run(runtime.run_turn(second.thread_id, "Reuse workspace."))
+
+    assert first_summary.status is expected_status
+    assert second_summary.status is TurnStatus.COMPLETED
+
+
+def test_cancelled_turn_releases_workspace_lease(tmp_path) -> None:
+    async def scenario():
+        provider = PausingProvider()
+        runtime = runtime_for_provider(provider)
+        first = runtime.create_thread(tmp_path)
+        second = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(runtime.run_turn(first.thread_id, "Cancel."))
+        await provider.started.wait()
+        runtime.cancel_turn(first.thread_id)
+        cancelled = await active
+        provider.release.set()
+        after_cancel = await runtime.run_turn(second.thread_id, "After cancellation.")
+        return cancelled, after_cancel
+
+    cancelled, after_cancel = asyncio.run(scenario())
+
+    assert cancelled.status is TurnStatus.CANCELLED
+    assert after_cancel.status is TurnStatus.COMPLETED
+
+
+def test_failed_turn_releases_workspace_lease(tmp_path) -> None:
+    class FailOnceProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, request: LLMRequest) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                raise LLMAuthenticationError("invalid credential")
+            return final_response("Recovered on another Thread.")
+
+    runtime = runtime_for_provider(FailOnceProvider())
+    first = runtime.create_thread(tmp_path)
+    second = runtime.create_thread(tmp_path)
+
+    failed = asyncio.run(runtime.run_turn(first.thread_id, "Fail."))
+    after_failure = asyncio.run(runtime.run_turn(second.thread_id, "Try again."))
+
+    assert failed.status is TurnStatus.FAILED
+    assert after_failure.status is TurnStatus.COMPLETED
+
+
+@pytest.mark.parametrize("max_active_turns", [0, True, 33])
+def test_global_active_turn_limit_fails_closed(max_active_turns) -> None:
+    with pytest.raises(ValueError, match="max_active_turns"):
+        ThreadRuntime(
+            provider_resolver=lambda _config_id, _model: ScriptedProvider([]),
+            default_settings=ModelSettings(
+                provider_config_id="test-provider", model="test-model"
+            ),
+            tool_registry_factory=empty_tools,
+            max_active_turns=max_active_turns,
+        )

@@ -4,6 +4,14 @@
 class ThreadBusyError(RuntimeError):
     """A Thread already has an active Turn."""
 
+    code = "THREAD_BUSY"
+
+
+class WorkspaceBusyError(RuntimeError):
+    """A workspace overlaps an active Turn or global capacity is full."""
+
+    code = "WORKSPACE_BUSY"
+
 
 class SettingsConflictError(RuntimeError):
     """A settings update used an obsolete Thread version."""

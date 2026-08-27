@@ -27,6 +27,7 @@ from .settings import (
     TurnSettingsOverride,
 )
 from .types import SCHEMA_VERSION, ThreadSnapshot, ThreadStatus, TurnStatus, TurnSummary
+from .workspace_lease import WorkspaceLeaseManager
 
 
 ToolRegistryFactory = Callable[[Path], ToolRegistry]
@@ -71,6 +72,7 @@ class ThreadRuntime:
         event_buffer_capacity: int = 512,
         reasoning_visibility: str = "hidden",
         model_retry_delays: tuple[float, ...] = (0.1, 0.2),
+        max_active_turns: int = 4,
     ) -> None:
         if reasoning_visibility not in {"hidden", "debug"}:
             raise ValueError("reasoning_visibility must be 'hidden' or 'debug'")
@@ -98,6 +100,7 @@ class ThreadRuntime:
         self._event_buffer_capacity = event_buffer_capacity
         self._reasoning_visibility = reasoning_visibility
         self._model_retry_delays = model_retry_delays
+        self._workspace_leases = WorkspaceLeaseManager(max_active_turns)
 
     def create_thread(self, workspace: Path) -> ThreadSnapshot:
         normalized_workspace = workspace.resolve()
@@ -153,48 +156,65 @@ class ThreadRuntime:
             turn_config,
             retry_delays=self._model_retry_delays,
         )
+        workspace_lease = self._workspace_leases.acquire(record.workspace)
         record.status = ThreadStatus.RUNNING
-        record.conversation.append_user(user_text)
-        record.updated_at = utc_now()
-        assert record.events is not None
-        events = TurnEventEmitter(
-            thread_id=thread_id,
-            turn_id=turn_id,
-            buffer=record.events,
-            reasoning_visibility=self._reasoning_visibility,
-        )
-        controller = RunController(turn_config.limits)
-        current_task = asyncio.current_task()
-        assert current_task is not None
-        controller.bind(current_task)
-        started_at = utc_now()
-        active_turn = _ActiveTurn(
-            turn_id=turn_id,
-            controller=controller,
-            events=events,
-            started_at=started_at,
-        )
-        record.active_turn = active_turn
-        events.emit(
-            "turn_started",
-            {
-                "user_message": user_text,
-                "settings_version": turn_config.settings_version,
-                "provider_config_id": turn_config.provider_config_id,
-                "model": turn_config.model,
-                "limits": {
-                    "max_iterations": turn_config.limits.max_iterations,
-                    "max_tool_calls": turn_config.limits.max_tool_calls,
-                    "max_execution_seconds": turn_config.limits.max_execution_seconds,
+        try:
+            record.conversation.append_user(user_text)
+            record.updated_at = utc_now()
+            assert record.events is not None
+            events = TurnEventEmitter(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                buffer=record.events,
+                reasoning_visibility=self._reasoning_visibility,
+            )
+            controller = RunController(turn_config.limits)
+            current_task = asyncio.current_task()
+            assert current_task is not None
+            controller.bind(current_task)
+            active_turn = _ActiveTurn(
+                turn_id=turn_id,
+                controller=controller,
+                events=events,
+                started_at=utc_now(),
+            )
+            record.active_turn = active_turn
+            events.emit(
+                "turn_started",
+                {
+                    "user_message": user_text,
+                    "settings_version": turn_config.settings_version,
+                    "provider_config_id": turn_config.provider_config_id,
+                    "model": turn_config.model,
+                    "limits": {
+                        "max_iterations": turn_config.limits.max_iterations,
+                        "max_tool_calls": turn_config.limits.max_tool_calls,
+                        "max_execution_seconds": (
+                            turn_config.limits.max_execution_seconds
+                        ),
+                    },
                 },
-            },
-        )
+            )
+            return await self._execute_active_turn(record, active_turn, model)
+        finally:
+            record.status = ThreadStatus.IDLE
+            record.active_turn = None
+            record.updated_at = utc_now()
+            self._workspace_leases.release(workspace_lease)
+
+    async def _execute_active_turn(
+        self,
+        record: _ThreadRecord,
+        active_turn: _ActiveTurn,
+        model: ModelInvoker,
+    ) -> TurnSummary:
+        controller = active_turn.controller
         try:
             outcome = await self._loop.run(
                 record.conversation,
                 record.tools,
                 model,
-                events,
+                active_turn.events,
                 controller,
             )
             return self._finish_turn(
@@ -240,10 +260,6 @@ class ThreadRuntime:
                 event_type="turn_failed",
                 error=public_error,
             )
-        finally:
-            record.status = ThreadStatus.IDLE
-            record.active_turn = None
-            record.updated_at = utc_now()
 
     def get_snapshot(self, thread_id: str) -> ThreadSnapshot:
         return self._snapshot(self._threads[thread_id])
