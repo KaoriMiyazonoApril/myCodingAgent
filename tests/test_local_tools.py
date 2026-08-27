@@ -100,11 +100,15 @@ def test_failed_bubblewrap_probe_does_not_leave_backend_executable(
 ) -> None:
     backend = BubblewrapSandboxBackend()
     monkeypatch.setattr("agent.tools.process.shutil.which", lambda _: "/usr/bin/bwrap")
+    probe_results = iter(
+        (
+            SimpleNamespace(returncode=0, stderr=b""),
+            SimpleNamespace(returncode=1, stderr=b"user namespaces disabled"),
+        )
+    )
     monkeypatch.setattr(
         "agent.tools.process.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=1, stderr=b"user namespaces disabled"
-        ),
+        lambda *args, **kwargs: next(probe_results),
     )
 
     async def unexpected_process_start(*args, **kwargs):
@@ -115,6 +119,7 @@ def test_failed_bubblewrap_probe_does_not_leave_backend_executable(
         unexpected_process_start,
     )
 
+    backend.check_available(tmp_path)
     with pytest.raises(CommandSandboxUnavailableError, match="user namespaces disabled"):
         backend.check_available(tmp_path)
     with pytest.raises(CommandSandboxUnavailableError, match="capability check"):

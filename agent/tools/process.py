@@ -202,8 +202,8 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
             raise CommandSandboxUnavailableError(
                 "bubblewrap is required for workspace command isolation"
             )
-        self._executable = executable
-        probe_command = self._build_command(
+        probe_command = self._command(
+            executable=executable,
             workspace_root=workspace_root,
             command="true",
             relative_cwd=".",
@@ -219,17 +219,16 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
-            self._executable = None
             raise CommandSandboxUnavailableError(
                 f"bubblewrap capability probe failed: {error}"
             ) from error
         if probe.returncode != 0:
-            self._executable = None
             details = probe.stderr.decode("utf-8", errors="replace").strip()
             suffix = f": {details}" if details else ""
             raise CommandSandboxUnavailableError(
                 f"bubblewrap capability probe failed with status {probe.returncode}{suffix}"
             )
+        self._executable = executable
 
     def _build_command(
         self,
@@ -242,11 +241,26 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
             raise CommandSandboxUnavailableError(
                 "bubblewrap backend must pass its capability check before use"
             )
+        return self._command(
+            executable=self._executable,
+            workspace_root=workspace_root,
+            command=command,
+            relative_cwd=relative_cwd,
+        )
+
+    @staticmethod
+    def _command(
+        *,
+        executable: str,
+        workspace_root: Path,
+        command: str,
+        relative_cwd: str,
+    ) -> list[str]:
         sandbox_cwd = "/workspace"
         if relative_cwd != ".":
             sandbox_cwd = f"/workspace/{relative_cwd}"
         return [
-            self._executable,
+            executable,
             "--unshare-all",
             "--die-with-parent",
             "--new-session",
