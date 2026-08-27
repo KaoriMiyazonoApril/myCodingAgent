@@ -5,18 +5,21 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.model.errors import LLMConfigurationError, LLMRequestError, LLMToolArgumentsParseError
+from agent.core.messages import (
+    Message,
+    MessageValidationError,
+    TextBlock,
+    ToolCallBlock,
+    ToolResultBlock,
+)
+from agent.model.errors import LLMConfigurationError, LLMToolArgumentsParseError
 from agent.model.openai_compatible import OpenAICompatibleProvider
 from agent.model.presets import create_provider_config
 from agent.model.types import (
     LLMRequest,
-    Message,
     ProviderConfig,
-    TextBlock,
-    ToolCallBlock,
-    ToolDefinition,
-    ToolResultBlock,
 )
+from agent.tools.types import ToolDefinition
 
 
 def provider() -> OpenAICompatibleProvider:
@@ -125,14 +128,19 @@ def test_chat_or_stream_method_not_request_field_selects_transport_mode() -> Non
     assert "stream" not in {field.name for field in fields(LLMRequest)}
 
 
+def test_domain_types_are_imported_from_core_and_tools_modules() -> None:
+    assert Message.__module__ == "agent.core.messages"
+    assert ToolDefinition.__module__ == "agent.tools.types"
+
+
 def test_message_rejects_invalid_role_and_content_block_combinations() -> None:
-    with pytest.raises(LLMRequestError, match="user.*TextBlock"):
+    with pytest.raises(MessageValidationError, match="user.*TextBlock"):
         Message(
             role="user",
             content=[ToolCallBlock(id="call_1", name="read_file", arguments={})],
         )
 
-    with pytest.raises(LLMRequestError, match="tool.*ToolResultBlock"):
+    with pytest.raises(MessageValidationError, match="tool.*ToolResultBlock"):
         Message(role="tool", content=[TextBlock(text="not a tool result")])
 
     Message(

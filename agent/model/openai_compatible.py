@@ -6,6 +6,16 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
+from agent.core.messages import (
+    ContentBlock,
+    Message,
+    ReasoningBlock,
+    TextBlock,
+    ToolCallBlock,
+    ToolResultBlock,
+)
+from agent.tools.types import ToolDefinition
+
 from .errors import (
     LLMAuthenticationError,
     LLMConfigurationError,
@@ -19,17 +29,10 @@ from .errors import (
 )
 from .provider import LLMProvider
 from .types import (
-    ContentBlock,
     LLMEvent,
     LLMRequest,
     LLMResponse,
-    Message,
     ProviderConfig,
-    ReasoningBlock,
-    TextBlock,
-    ToolCallBlock,
-    ToolDefinition,
-    ToolResultBlock,
     Usage,
 )
 

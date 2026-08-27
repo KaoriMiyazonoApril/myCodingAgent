@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
-from .errors import LLMConfigurationError, LLMRequestError
+from agent.core.messages import Message
+from agent.tools.types import ToolDefinition
 
-
-Role: TypeAlias = Literal["system", "user", "assistant", "tool"]
+from .errors import LLMConfigurationError
 
 
 @dataclass(slots=True)
@@ -47,69 +47,6 @@ class ProviderConfig:
             or self.timeout <= 0
         ):
             raise LLMConfigurationError("timeout must be a positive number")
-
-
-@dataclass(slots=True)
-class TextBlock:
-    type: Literal["text"] = field(default="text", init=False)
-    text: str = ""
-
-
-@dataclass(slots=True)
-class ReasoningBlock:
-    type: Literal["reasoning"] = field(default="reasoning", init=False)
-    text: str = ""
-
-
-@dataclass(slots=True)
-class ToolCallBlock:
-    id: str
-    name: str
-    arguments: dict[str, Any]
-    type: Literal["tool_call"] = field(default="tool_call", init=False)
-
-
-@dataclass(slots=True)
-class ToolResultBlock:
-    tool_call_id: str
-    content: str
-    is_error: bool = False
-    type: Literal["tool_result"] = field(default="tool_result", init=False)
-
-
-ContentBlock: TypeAlias = TextBlock | ReasoningBlock | ToolCallBlock | ToolResultBlock
-
-
-@dataclass(slots=True)
-class Message:
-    role: Role
-    content: list[ContentBlock]
-
-    def __post_init__(self) -> None:
-        allowed_blocks: dict[str, tuple[type[ContentBlock], ...]] = {
-            "system": (TextBlock,),
-            "user": (TextBlock,),
-            "assistant": (TextBlock, ReasoningBlock, ToolCallBlock),
-            "tool": (ToolResultBlock,),
-        }
-        allowed = allowed_blocks.get(self.role)
-        if allowed is None:
-            raise LLMRequestError(f"Unsupported message role: {self.role!r}")
-        invalid = next((block for block in self.content if not isinstance(block, allowed)), None)
-        if invalid is not None:
-            allowed_names = ", ".join(block_type.__name__ for block_type in allowed)
-            raise LLMRequestError(
-                f"{self.role!r} messages may contain only {allowed_names}; "
-                f"got {type(invalid).__name__}"
-            )
-
-
-@dataclass(slots=True)
-class ToolDefinition:
-    name: str
-    description: str
-    parameters: dict[str, Any]
-
 
 @dataclass(slots=True)
 class LLMRequest:

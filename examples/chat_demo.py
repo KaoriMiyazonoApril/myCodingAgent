@@ -6,13 +6,10 @@ import argparse
 import asyncio
 import os
 
-from agent.model import (
-    LLMRequest,
-    Message,
-    OpenAICompatibleProvider,
-    TextBlock,
-    create_provider_config,
-)
+from agent.core.messages import Message, TextBlock
+from agent.model.openai_compatible import OpenAICompatibleProvider
+from agent.model.presets import create_provider_config
+from agent.model.types import LLMRequest
 
 
 ENVIRONMENT_KEY_NAMES = {

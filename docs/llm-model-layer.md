@@ -5,18 +5,20 @@
 本模块只负责本地 coding agent 与模型 API 的连接和协议转换。它不包含
 Agent Loop、文件或 Shell 工具、权限控制、UI、上下文压缩或自动重试。
 
-目录为 `agent/model/`：
+当前实现涉及以下边界明确的目录：
 
-- `types.py`：agent 使用的统一数据结构；
-- `provider.py`：SDK 无关的 `LLMProvider` 抽象接口；
-- `openai_compatible.py`：唯一的 Chat Completions 适配器；
-- `presets.py`：DeepSeek、Kimi/Moonshot、GLM 的便捷端点预设；
-- `errors.py`：项目自己的稳定异常类型。
+- `agent/core/messages.py`：Agent 内部统一消息和 content block 表示；
+- `agent/tools/types.py`：模型可见的工具定义 `ToolDefinition`；
+- `agent/model/types.py`：LLM 调用请求、响应、usage、配置和流事件；
+- `agent/model/provider.py`：SDK 无关的 `LLMProvider` 抽象接口；
+- `agent/model/openai_compatible.py`：唯一的 Chat Completions 适配器；
+- `agent/model/presets.py`：DeepSeek、Kimi/Moonshot、GLM 的便捷端点预设；
+- `agent/model/errors.py`：LLM 调用层的稳定异常类型。
 
 调用方向如下：
 
 ```text
-Agent / UI -> LLMRequest、Message、ContentBlock
+Agent / UI -> core.Message / ContentBlock + model.LLMRequest
            -> OpenAICompatibleProvider
            -> OpenAI AsyncOpenAI Chat Completions API
            -> DeepSeek / Kimi(Moonshot) / GLM
@@ -27,13 +29,18 @@ OpenAI Python SDK 只在 `OpenAICompatibleProvider` 内用作 HTTP 客户端。S
 
 ## 统一类型
 
-对话历史始终为 `list[Message]`。每个 `Message` 有 `system`、`user`、
+对话历史始终为 `list[agent.core.messages.Message]`。每个 `Message` 有 `system`、`user`、
 `assistant` 或 `tool` role，且 `content` 是 block 列表：
 
 - `TextBlock`：普通文本；
 - `ReasoningBlock`：兼容供应商可能返回的 reasoning/thinking 文本；
 - `ToolCallBlock`：工具调用 ID、名称和已解析的 `dict` 参数；
 - `ToolResultBlock`：未来本地工具执行的结果。
+
+`Message`、`Role` 和各 content block 是 Agent 领域类型，而非 Model-specific
+类型；它们可被未来 Conversation、Runtime、Tool Dispatcher 或 UI/API adapter 使用。
+`agent.core` 不依赖 Model Layer 或 OpenAI SDK。`ToolDefinition` 同样属于工具领域，
+由 `agent.tools.types` 定义，当前只描述工具的元数据与 JSON Schema，不包含工具执行。
 
 `LLMRequest` 目前只抽象共同子集：messages、tools、temperature、max_tokens 与
 `extra_body`。调用 `chat()` 或 `stream()` 决定传输模式，避免请求数据同时包含两种
@@ -69,7 +76,7 @@ OpenAI Python SDK 只在 `OpenAICompatibleProvider` 内用作 HTTP 客户端。S
 `ProviderConfig` 和预设选择的所有配置错误都统一抛出
 `LLMConfigurationError`。`Message` 在创建时校验 role 与 block 的组合：system/user
 只能包含文本，assistant 可包含文本、reasoning 和 tool call，tool 只能包含 tool
-result；非法组合抛出 `LLMRequestError`，不会在编码时被静默忽略。
+result；非法组合抛出 core 层的 `MessageValidationError`，不会在编码时被静默忽略。
 
 ## Streaming 状态
 
