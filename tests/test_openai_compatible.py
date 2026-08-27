@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import fields
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -14,12 +15,20 @@ from agent.core.messages import (
     ToolCallBlock,
     ToolResultBlock,
 )
-from agent.model.errors import LLMConfigurationError
+from agent.model.errors import (
+    LLMAuthenticationError,
+    LLMConfigurationError,
+    LLMConnectionError,
+    LLMRateLimitError,
+    LLMRequestError,
+)
 from agent.model.openai_compatible import OpenAICompatibleProvider
 from agent.model.presets import create_provider_config
 from agent.model.types import (
     LLMRequest,
+    ProviderCapabilities,
     ProviderConfig,
+    ReasoningRetention,
 )
 from agent.tools.types import ToolDefinition, ToolResult
 
@@ -65,14 +74,19 @@ def test_tool_call_arguments_decode_to_dict() -> None:
     parsed = provider()._parse_response(response(content=None, tool_calls=[tool_call]))
 
     assert parsed.message.content == [
-        ToolCallBlock(id="call_123", name="read_file", arguments={"path": "main.py"})
+        ToolCallBlock(
+            id="call_123",
+            name="read_file",
+            raw_arguments='{"path":"main.py"}',
+            arguments={"path": "main.py"},
+        )
     ]
 
 
 def test_invalid_tool_arguments_raise_clear_project_error() -> None:
     tool_call = SimpleNamespace(
         id="call_123",
-        function=SimpleNamespace(name="read_file", arguments='{"path":'),
+        function=SimpleNamespace(name="read_file", arguments="{bad"),
     )
 
     parsed = provider()._parse_response(response(content=None, tool_calls=[tool_call]))
@@ -81,10 +95,14 @@ def test_invalid_tool_arguments_raise_clear_project_error() -> None:
         ToolCallBlock(
             id="call_123",
             name="read_file",
-            arguments={},
+            raw_arguments="{bad",
+            arguments=None,
             arguments_error="invalid JSON arguments",
         )
     ]
+
+    encoded = provider()._encode_messages([parsed.message])
+    assert encoded[0]["tool_calls"][0]["function"]["arguments"] == "{bad"
 
 
 def test_one_invalid_tool_call_does_not_discard_other_calls() -> None:
@@ -180,16 +198,55 @@ def test_reasoning_is_preserved_for_thinking_tool_call_turns() -> None:
     assert encoded["content"] == ""
 
 
-def test_provider_presets_declare_protocol_capabilities() -> None:
-    deepseek = create_provider_config("deepseek", api_key="key", model="model")
+def test_provider_defaults_and_model_overrides_resolve_capabilities() -> None:
+    deepseek = create_provider_config("deepseek", api_key="key", model="deepseek-chat")
+    reasoner = create_provider_config(
+        "deepseek", api_key="key", model="deepseek-reasoner"
+    )
     kimi = create_provider_config("kimi", api_key="key", model="model")
     glm = create_provider_config("glm", api_key="key", model="model")
 
-    assert deepseek.capabilities.preserve_reasoning_for_tool_calls is True
-    assert kimi.capabilities.preserve_reasoning_for_tool_calls is True
-    assert glm.capabilities.preserve_reasoning_for_tool_calls is True
+    assert deepseek.capabilities.reasoning_retention is ReasoningRetention.NEVER
     assert deepseek.capabilities.requires_assistant_content_for_tool_calls is True
+    assert reasoner.capabilities.reasoning_retention is ReasoningRetention.TOOL_CHAIN_ONLY
+    assert kimi.capabilities.reasoning_retention is ReasoningRetention.TOOL_CHAIN_ONLY
+    assert glm.capabilities.reasoning_retention is ReasoningRetention.TOOL_CHAIN_ONLY
+    assert reasoner.capabilities.requires_assistant_content_for_tool_calls is True
     assert kimi.capabilities.requires_assistant_content_for_tool_calls is False
+
+
+def test_reasoning_retention_supports_never_tool_chain_and_always() -> None:
+    def encode(policy: ReasoningRetention, *, with_tool: bool) -> dict:
+        configured = OpenAICompatibleProvider(
+            ProviderConfig(
+                provider="test",
+                base_url="https://example.invalid/v1",
+                api_key="key",
+                model="model",
+                capabilities=ProviderCapabilities(
+                    reasoning_retention=policy,
+                    reasoning_input_field="reasoning_content",
+                ),
+            ),
+            client=object(),
+        )
+        content = [ReasoningBlock(text="reasoning")]
+        if with_tool:
+            content.append(ToolCallBlock(id="call", name="read_file", arguments={}))
+        return configured._encode_messages([Message(role="assistant", content=content)])[0]
+
+    assert "reasoning_content" not in encode(ReasoningRetention.NEVER, with_tool=True)
+    assert (
+        encode(ReasoningRetention.TOOL_CHAIN_ONLY, with_tool=True)["reasoning_content"]
+        == "reasoning"
+    )
+    assert "reasoning_content" not in encode(
+        ReasoningRetention.TOOL_CHAIN_ONLY, with_tool=False
+    )
+    assert (
+        encode(ReasoningRetention.ALWAYS, with_tool=False)["reasoning_content"]
+        == "reasoning"
+    )
 
 
 def test_tool_result_protocol_preserves_metadata_and_error_code_for_model() -> None:
@@ -205,11 +262,80 @@ def test_tool_result_protocol_preserves_metadata_and_error_code_for_model() -> N
     envelope = json.loads(encoded[0]["content"])
 
     assert envelope == {
+        "ok": False,
         "content": "command failed",
         "metadata": {"exit_code": 2, "stderr_truncated": True},
         "error_code": "COMMAND_FAILED",
     }
     assert block.is_error is True
+    assert block.ok is False
+    assert result.ok is False
+
+
+def test_llm_errors_expose_retry_metadata() -> None:
+    cases = [
+        (LLMRequestError("bad request", status_code=400), 400, False),
+        (LLMAuthenticationError("unauthorized", status_code=401), 401, False),
+        (LLMRateLimitError("limited", status_code=429), 429, True),
+        (LLMRequestError("server error", status_code=503), 503, True),
+        (LLMConnectionError("timeout"), None, True),
+    ]
+
+    for error, status_code, retryable in cases:
+        assert error.status_code == status_code
+        assert error.retryable is retryable
+
+
+def test_sdk_http_errors_translate_to_stable_retry_taxonomy(monkeypatch) -> None:
+    class APIStatusError(Exception):
+        def __init__(self, status_code: int) -> None:
+            super().__init__(f"HTTP {status_code}")
+            self.status_code = status_code
+
+    class BadRequestError(APIStatusError):
+        pass
+
+    class AuthenticationError(APIStatusError):
+        pass
+
+    class RateLimitError(APIStatusError):
+        pass
+
+    class APIConnectionError(Exception):
+        pass
+
+    class APITimeoutError(APIConnectionError):
+        pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        SimpleNamespace(
+            APIConnectionError=APIConnectionError,
+            APIStatusError=APIStatusError,
+            APITimeoutError=APITimeoutError,
+            AuthenticationError=AuthenticationError,
+            BadRequestError=BadRequestError,
+            RateLimitError=RateLimitError,
+        ),
+    )
+
+    translated = [
+        provider()._translate_sdk_error(BadRequestError(400)),
+        provider()._translate_sdk_error(AuthenticationError(401)),
+        provider()._translate_sdk_error(RateLimitError(429)),
+        provider()._translate_sdk_error(APIStatusError(503)),
+        provider()._translate_sdk_error(APITimeoutError("timeout")),
+    ]
+
+    assert [(error.status_code, error.retryable) for error in translated] == [
+        (400, False),
+        (401, False),
+        (429, True),
+        (503, True),
+        (None, True),
+    ]
+    assert all(error.provider == "deepseek" for error in translated)
 
 
 def test_chat_or_stream_method_not_request_field_selects_transport_mode() -> None:
@@ -249,3 +375,8 @@ def test_message_rejects_invalid_role_and_content_block_combinations() -> None:
 def test_configuration_errors_use_project_exception(factory) -> None:
     with pytest.raises(LLMConfigurationError):
         factory()
+
+
+def test_invalid_reasoning_capabilities_are_configuration_errors() -> None:
+    with pytest.raises(LLMConfigurationError, match="reasoning_retention"):
+        ProviderCapabilities(reasoning_retention=True)  # type: ignore[arg-type]

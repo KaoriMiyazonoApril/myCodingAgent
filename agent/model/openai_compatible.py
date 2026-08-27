@@ -33,6 +33,7 @@ from .types import (
     LLMRequest,
     LLMResponse,
     ProviderConfig,
+    ReasoningRetention,
     Usage,
 )
 
@@ -117,19 +118,23 @@ class OpenAICompatibleProvider(LLMProvider):
         ]
         tool_calls = [block for block in message.content if isinstance(block, ToolCallBlock)]
         encoded: dict[str, Any] = {"role": message.role, "content": "".join(text_parts)}
+        capabilities = self.config.capabilities
         if tool_calls:
-            capabilities = self.config.capabilities
             if text_parts or capabilities.requires_assistant_content_for_tool_calls:
                 encoded["content"] = "".join(text_parts)
             else:
                 encoded["content"] = None
-            if (
-                reasoning_parts
-                and capabilities.preserve_reasoning_for_tool_calls
-                and capabilities.reasoning_input_field is not None
-            ):
-                encoded[capabilities.reasoning_input_field] = "".join(reasoning_parts)
             encoded["tool_calls"] = [self._encode_tool_call(call) for call in tool_calls]
+        preserve_reasoning = capabilities.reasoning_retention is ReasoningRetention.ALWAYS or (
+            capabilities.reasoning_retention is ReasoningRetention.TOOL_CHAIN_ONLY
+            and bool(tool_calls)
+        )
+        if (
+            reasoning_parts
+            and preserve_reasoning
+            and capabilities.reasoning_input_field is not None
+        ):
+            encoded[capabilities.reasoning_input_field] = "".join(reasoning_parts)
         return [encoded]
 
     @staticmethod
@@ -138,12 +143,15 @@ class OpenAICompatibleProvider(LLMProvider):
             raise LLMRequestError("ToolCallBlock.id must not be empty")
         if not call.name:
             raise LLMRequestError("ToolCallBlock.name must not be empty")
-        try:
-            arguments = json.dumps(call.arguments, ensure_ascii=False)
-        except (TypeError, ValueError) as error:
-            raise LLMRequestError(
-                f"Arguments for tool call {call.name!r} are not JSON serializable"
-            ) from error
+        if call.raw_arguments is not None:
+            arguments = call.raw_arguments
+        else:
+            try:
+                arguments = json.dumps(call.arguments, ensure_ascii=False)
+            except (TypeError, ValueError) as error:
+                raise LLMRequestError(
+                    f"Arguments for tool call {call.name!r} are not JSON serializable"
+                ) from error
         return {
             "id": call.id,
             "type": "function",
@@ -164,6 +172,7 @@ class OpenAICompatibleProvider(LLMProvider):
             try:
                 content = json.dumps(
                     {
+                        "ok": result.ok,
                         "content": result.content,
                         "metadata": result.metadata,
                         "error_code": result.error_code,
@@ -259,23 +268,35 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise LLMResponseParseError(f"Tool call at index {index} has no valid id")
             if not isinstance(name, str) or not name:
                 raise LLMResponseParseError(f"Tool call {call_id!r} has no valid function name")
+            raw_arguments_value = self._get_field(function, "arguments", "")
+            raw_arguments = self._stringify_raw_arguments(raw_arguments_value)
             arguments_error: str | None = None
             try:
                 arguments = self._parse_tool_arguments(
-                    self._get_field(function, "arguments", ""), call_id, name
+                    raw_arguments_value, call_id, name
                 )
             except LLMToolArgumentsParseError as error:
-                arguments = {}
+                arguments = None
                 arguments_error = self._tool_arguments_error_reason(error)
             parsed.append(
                 ToolCallBlock(
                     id=call_id,
                     name=name,
+                    raw_arguments=raw_arguments,
                     arguments=arguments,
                     arguments_error=arguments_error,
                 )
             )
         return parsed
+
+    @staticmethod
+    def _stringify_raw_arguments(raw_arguments: Any) -> str:
+        if isinstance(raw_arguments, str):
+            return raw_arguments
+        try:
+            return json.dumps(raw_arguments, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return repr(raw_arguments)
 
     @staticmethod
     def _tool_arguments_error_reason(error: LLMToolArgumentsParseError) -> str:
@@ -332,8 +353,7 @@ class OpenAICompatibleProvider(LLMProvider):
             return value.get(name, default)
         return getattr(value, name, default)
 
-    @staticmethod
-    def _translate_sdk_error(error: Exception) -> LLMError:
+    def _translate_sdk_error(self, error: Exception) -> LLMError:
         """Map optional SDK exceptions to stable project exceptions."""
         try:
             from openai import (
@@ -345,14 +365,42 @@ class OpenAICompatibleProvider(LLMProvider):
                 RateLimitError,
             )
         except ImportError:
-            return LLMConnectionError(f"Model request failed: {error}")
+            return LLMConnectionError(
+                f"Model request failed: {error}", provider=self.config.provider
+            )
+
+        status_code = getattr(error, "status_code", None)
+        provider = self.config.provider
 
         if isinstance(error, AuthenticationError):
-            return LLMAuthenticationError("Model provider rejected the API key")
+            return LLMAuthenticationError(
+                "Model provider rejected the API key",
+                status_code=status_code or 401,
+                provider=provider,
+            )
         if isinstance(error, RateLimitError):
-            return LLMRateLimitError("Model provider rate limit exceeded")
+            return LLMRateLimitError(
+                "Model provider rate limit exceeded",
+                status_code=status_code or 429,
+                provider=provider,
+            )
         if isinstance(error, (APITimeoutError, APIConnectionError)):
-            return LLMConnectionError(f"Could not reach model provider: {error}")
-        if isinstance(error, (BadRequestError, APIStatusError)):
-            return LLMRequestError(f"Model provider rejected the request: {error}")
-        return LLMConnectionError(f"Model request failed: {error}")
+            return LLMConnectionError(
+                f"Could not reach model provider: {error}", provider=provider
+            )
+        if isinstance(error, BadRequestError):
+            return LLMRequestError(
+                f"Model provider rejected the request: {error}",
+                status_code=status_code or 400,
+                retryable=False,
+                provider=provider,
+            )
+        if isinstance(error, APIStatusError):
+            return LLMRequestError(
+                f"Model provider rejected the request: {error}",
+                status_code=status_code,
+                provider=provider,
+            )
+        return LLMConnectionError(
+            f"Model request failed: {error}", provider=provider
+        )

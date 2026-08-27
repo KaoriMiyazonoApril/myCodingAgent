@@ -34,7 +34,8 @@ OpenAI Python SDK 只在 `OpenAICompatibleProvider` 内用作 HTTP 客户端。S
 
 - `TextBlock`：普通文本；
 - `ReasoningBlock`：兼容供应商可能返回的 reasoning/thinking 文本；
-- `ToolCallBlock`：工具调用 ID、名称、已解析的 `dict` 参数，以及可恢复的参数解析错误；
+- `ToolCallBlock`：工具调用 ID、名称、原始参数字符串、可选的已解析 `dict` 参数，以及
+  可恢复的参数解析错误；
 - `ToolResultBlock`：绑定调用 ID 的本地工具结果，保留 content、metadata 与 error code。
 
 `Message`、`Role` 和各 content block 是 Agent 领域类型，而非 Model-specific
@@ -52,35 +53,43 @@ OpenAI Python SDK 只在 `OpenAICompatibleProvider` 内用作 HTTP 客户端。S
 `OpenAICompatibleProvider` 在请求前把本地消息编码为 Chat Completions JSON：
 
 - `TextBlock` 合并成 `content` 字符串；
-- assistant 的 `ToolCallBlock` 编码为 `tool_calls[].function.arguments` JSON 字符串；
+- assistant 的 `ToolCallBlock` 优先把 `raw_arguments` 原样编码为
+  `tool_calls[].function.arguments`；仅程序内部构造且没有原始值的调用才序列化
+  `arguments`；
 - 一个 `ToolResultBlock` 编码成一个 role 为 `tool`、带 `tool_call_id` 的消息；
 - `ToolDefinition` 编码为 OpenAI 的 `{type: "function", function: {...}}` 格式。
 
-普通对话中的 `ReasoningBlock` 只保留在本地历史中。对于带工具调用的 thinking turn，
-适配器依据 `ProviderCapabilities` 将 reasoning 以供应商声明的字段（当前三家均为
-`reasoning_content`）发回请求，避免交错思考在工具结果轮次中断。供应商私有的 thinking
-启用参数仍由调用方通过 `extra_body` 指定。
+reasoning 历史由 `ProviderCapabilities.reasoning_retention` 的三态策略控制：`NEVER`
+从不回放，`TOOL_CHAIN_ONLY` 只回放含 tool call 的 assistant turn，`ALWAYS` 回放所有
+含 reasoning 的 assistant turn。适配器使用能力声明中的字段（当前预设均为
+`reasoning_content`）发送保留内容。供应商私有的 thinking 启用参数仍由调用方通过
+`extra_body` 指定。
 
 解析响应时，文本变成 `TextBlock`，`reasoning_content` 或字符串形式的
 `thinking` 变成 `ReasoningBlock`。工具调用参数用 `json.loads` 解析为 `dict`。空参数
-变成 `{}`；无效 JSON、非对象 JSON 或非字符串参数不会废弃整条模型响应，而是产生带
-`arguments_error` 的 `ToolCallBlock`。Registry 随后将其转成 `INVALID_ARGUMENTS`
+变成 `{}`；无效 JSON、非对象 JSON 或非字符串参数不会废弃整条模型响应，而是产生
+`arguments=None`、带 `arguments_error` 的 `ToolCallBlock`。无论解析成功与否，原始
+`function.arguments` 都保存在 `raw_arguments`，下一轮历史回放不会把非法参数改写成
+`{}`。Registry 只执行已解析的 `arguments`，解析失败会变成 `INVALID_ARGUMENTS`
 工具结果，让模型可在下一轮自行修复。缺失调用 ID 或函数名因无法绑定工具结果，仍抛出
 `LLMResponseParseError`。`content=None` 加 `tool_calls` 是有效响应。
 
 执行域 `ToolResult.to_message_block()` 明确完成结果绑定。适配器把 block 编码成 JSON
-envelope：`content`、`metadata`、`error_code` 会一起进入 tool message；`is_error` 只由
-`error_code` 推导。因此分页、截断、exit code 等控制信息不会只停留在本地对象中。
+envelope：`ok`、`content`、`metadata`、`error_code` 会一起进入 tool message；`ok` 与
+`is_error` 都只由 `error_code` 推导，避免并列状态互相矛盾。因此分页、截断、exit code
+等控制信息不会只停留在本地对象中。
 
 ## 供应商切换
 
 所有供应商均实例化同一个 `OpenAICompatibleProvider`。`create_provider_config`
 提供当前官方默认端点：DeepSeek `https://api.deepseek.com`、Kimi/Moonshot
 `https://api.moonshot.cn/v1`、GLM `https://open.bigmodel.cn/api/paas/v4`；调用者
-仍可用 `base_url` 覆盖。Preset 同时携带显式 `ProviderCapabilities`：DeepSeek、Kimi 和
-GLM 的 thinking tool-call turn 都需保留 `reasoning_content`；DeepSeek 还要求 tool-call
-assistant message 提供非 null content。API key 不会出现在 `ProviderConfig` 的默认 repr
-中，示例也只从环境变量读取 key。
+仍可用 `base_url` 覆盖。每个 `ProviderProfile` 提供默认 capabilities，并可通过精确模型
+名映射到 `ModelProfile` 的逐字段覆盖；未覆盖字段继承 provider 默认值。调用方也可在
+创建配置时显式传入完整 capabilities。当前三家
+provider 默认使用 `TOOL_CHAIN_ONLY`；`deepseek-chat` 的非思考模型 profile 覆盖为
+`NEVER`。DeepSeek 还要求 tool-call assistant message 提供非 null content。API key 不会
+出现在 `ProviderConfig` 的默认 repr 中，示例也只从环境变量读取 key。
 
 能力声明依据供应商的 thinking + tool-call 协议文档：
 [DeepSeek Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/)、
@@ -91,6 +100,10 @@ assistant message 提供非 null content。API key 不会出现在 `ProviderConf
 `LLMConfigurationError`。`Message` 在创建时校验 role 与 block 的组合：system/user
 只能包含文本，assistant 可包含文本、reasoning 和 tool call，tool 只能包含 tool
 result；非法组合抛出 core 层的 `MessageValidationError`，不会在编码时被静默忽略。
+
+所有 `LLMError` 都公开 `status_code`、`retryable` 与 `provider`。HTTP 400/401 默认不可
+重试，429、5xx、timeout 和 connection error 可重试；适配器仍保留 authentication、
+rate-limit、connection 与 request 的稳定异常子类，使未来 Agent Loop 无需解析错误文本。
 
 ## Streaming 状态
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import time
@@ -29,6 +30,7 @@ def test_read_file_returns_numbered_page_and_metadata(tmp_path) -> None:
     assert result.content == "2: second"
     assert result.metadata == {
         "path": "notes.txt",
+        "requested_offset": 2,
         "requested_limit": 1,
         "returned_lines": 1,
         "total_lines": 3,
@@ -212,7 +214,8 @@ def test_run_command_captures_separate_output_and_nonzero_exit(tmp_path) -> None
         )
     )
 
-    assert result.error_code is None
+    assert result.error_code == "COMMAND_FAILED"
+    assert result.is_error is True
     assert result.metadata["cwd"] == "work"
     assert result.metadata["exit_code"] == 7
     assert result.metadata["timed_out"] is False
@@ -271,21 +274,13 @@ def test_run_command_can_write_inside_without_modifying_host_sibling(tmp_path) -
     assert outside.read_text(encoding="utf-8") == "unchanged"
 
 
-def test_run_command_fails_closed_when_isolation_is_unavailable(
+def test_local_tool_composition_checks_command_isolation_capability_early(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setattr("agent.tools.process.shutil.which", lambda _: None)
-    registry = create_local_tool_registry(tmp_path)
 
-    result = registry.execute(
-        ToolCallBlock(
-            id="call_no_sandbox",
-            name="run_command",
-            arguments={"command": "printf must-not-run > must-not-run"},
-        )
-    )
-
-    assert result.error_code == "PROCESS_START_FAILED"
+    with pytest.raises(RuntimeError, match="bubblewrap"):
+        create_local_tool_registry(tmp_path)
     assert not (tmp_path / "must-not-run").exists()
 
 
@@ -310,6 +305,24 @@ def test_timeout_returns_even_if_detached_descendant_keeps_pipe_open(tmp_path) -
     assert result.metadata["stdout"] == "begun"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX-only")
+def test_completed_command_returns_even_if_background_child_keeps_pipe_open(tmp_path) -> None:
+    registry = create_local_tool_registry(tmp_path)
+    start = time.monotonic()
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="call_background_pipe",
+            name="run_command",
+            arguments={"command": "sleep 1 & printf done"},
+        )
+    )
+
+    assert result.error_code is None
+    assert time.monotonic() - start < 0.5
+    assert result.metadata["stdout"] == "done"
+
+
 def test_read_out_of_range_and_non_text_files_return_structured_results(tmp_path) -> None:
     (tmp_path / "short.txt").write_text("only\n", encoding="utf-8")
     (tmp_path / "binary.bin").write_bytes(b"\xff\x00")
@@ -326,8 +339,9 @@ def test_read_out_of_range_and_non_text_files_return_structured_results(tmp_path
 
     assert page.error_code is None
     assert page.content == ""
-    assert page.metadata["start_line"] == 4
-    assert page.metadata["end_line"] == 3
+    assert page.metadata["requested_offset"] == 4
+    assert page.metadata["start_line"] is None
+    assert page.metadata["end_line"] is None
     assert page.metadata["truncated"] is False
     assert non_text.error_code == "NOT_TEXT"
 
@@ -489,6 +503,30 @@ def test_registry_uses_tool_schema_for_validation_and_defaults() -> None:
     assert invalid.error_code == "INVALID_ARGUMENTS"
 
 
+def test_tool_schema_validation_fails_closed_for_unsupported_types() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="unsupported",
+            description="unsupported schema",
+            parameters={
+                "type": "object",
+                "properties": {"items": {"type": "array"}},
+                "required": [],
+                "additionalProperties": False,
+            },
+        ),
+        lambda _: ToolResult("must not execute", {}),
+    )
+
+    result = registry.execute(
+        ToolCallBlock(id="unsupported", name="unsupported", arguments={})
+    )
+
+    assert result.error_code == "INVALID_ARGUMENTS"
+    assert "unsupported schema type" in result.content
+
+
 def test_invalid_parsed_arguments_become_recoverable_tool_error(tmp_path) -> None:
     registry = create_local_tool_registry(tmp_path)
 
@@ -531,6 +569,66 @@ def test_async_registry_execution_does_not_block_event_loop() -> None:
         return responsive
 
     assert asyncio.run(scenario()) is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX-only")
+def test_cancelling_async_command_terminates_its_process_group(tmp_path) -> None:
+    registry = create_local_tool_registry(tmp_path)
+    marker = tmp_path / "marker.txt"
+
+    async def scenario() -> None:
+        execution = asyncio.create_task(
+            registry.execute_async(
+                ToolCallBlock(
+                    id="cancel",
+                    name="run_command",
+                    arguments={
+                        "command": (
+                            "printf started > marker.txt; "
+                            "(sleep 0.2; printf leaked > marker.txt) & sleep 1"
+                        )
+                    },
+                )
+            )
+        )
+        for _ in range(50):
+            if marker.exists():
+                break
+            await asyncio.sleep(0.01)
+        execution.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+        await asyncio.sleep(0.4)
+
+    asyncio.run(scenario())
+
+    assert marker.read_text(encoding="utf-8") == "started"
+
+
+def test_registry_logs_internal_tool_exceptions(caplog) -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="broken",
+            description="broken",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        ),
+        lambda _: (_ for _ in ()).throw(RuntimeError("developer details")),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="agent.tools.registry"):
+        result = registry.execute(
+            ToolCallBlock(id="broken", name="broken", arguments={})
+        )
+
+    assert result.error_code == "INTERNAL_ERROR"
+    assert result.content == "unexpected internal tool error"
+    assert "developer details" in caplog.text
 
 
 def test_path_schemas_reject_empty_paths_like_local_validation(tmp_path) -> None:

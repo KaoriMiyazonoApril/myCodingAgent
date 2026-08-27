@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeAlias
+from enum import Enum
+from typing import Any, Literal, Mapping, TypeAlias
 
 from agent.core.messages import Message
 from agent.tools.types import ToolDefinition
@@ -11,13 +12,81 @@ from agent.tools.types import ToolDefinition
 from .errors import LLMConfigurationError
 
 
+class ReasoningRetention(str, Enum):
+    """How assistant reasoning is replayed into provider history."""
+
+    NEVER = "never"
+    TOOL_CHAIN_ONLY = "tool_chain_only"
+    ALWAYS = "always"
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderCapabilities:
     """Protocol behavior that differs between OpenAI-compatible providers."""
 
-    preserve_reasoning_for_tool_calls: bool = False
+    reasoning_retention: ReasoningRetention = ReasoningRetention.NEVER
     reasoning_input_field: str | None = None
     requires_assistant_content_for_tool_calls: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reasoning_retention, ReasoningRetention):
+            raise LLMConfigurationError(
+                "reasoning_retention must be a ReasoningRetention value"
+            )
+        if self.reasoning_input_field is not None and (
+            not isinstance(self.reasoning_input_field, str)
+            or not self.reasoning_input_field
+        ):
+            raise LLMConfigurationError(
+                "reasoning_input_field must be a non-empty string or None"
+            )
+        if not isinstance(self.requires_assistant_content_for_tool_calls, bool):
+            raise LLMConfigurationError(
+                "requires_assistant_content_for_tool_calls must be a boolean"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProfile:
+    """Partial capability overrides for one exact model."""
+
+    reasoning_retention: ReasoningRetention | None = None
+    reasoning_input_field: str | None = None
+    requires_assistant_content_for_tool_calls: bool | None = None
+
+    def apply(self, defaults: ProviderCapabilities) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            reasoning_retention=(
+                self.reasoning_retention
+                if self.reasoning_retention is not None
+                else defaults.reasoning_retention
+            ),
+            reasoning_input_field=self.reasoning_input_field
+            if self.reasoning_input_field is not None
+            else defaults.reasoning_input_field,
+            requires_assistant_content_for_tool_calls=(
+                self.requires_assistant_content_for_tool_calls
+                if self.requires_assistant_content_for_tool_calls is not None
+                else defaults.requires_assistant_content_for_tool_calls
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderProfile:
+    """Provider defaults plus optional exact-model capability overrides."""
+
+    base_url: str
+    default_capabilities: ProviderCapabilities = field(
+        default_factory=ProviderCapabilities
+    )
+    model_profiles: Mapping[str, ModelProfile] = field(default_factory=dict)
+
+    def capabilities_for(self, model: str) -> ProviderCapabilities:
+        profile = self.model_profiles.get(model)
+        if profile is None:
+            return self.default_capabilities
+        return profile.apply(self.default_capabilities)
 
 
 @dataclass(slots=True)

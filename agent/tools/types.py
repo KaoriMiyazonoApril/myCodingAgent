@@ -24,6 +24,10 @@ class ToolDefinition:
     def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Validate and default arguments from this definition's object schema."""
 
+        if not isinstance(arguments, dict):
+            raise ToolArgumentsValidationError("tool arguments must be an object")
+        if self.parameters.get("type") != "object":
+            raise ToolArgumentsValidationError("tool schema must have type object")
         properties = self.parameters.get("properties", {})
         required = self.parameters.get("required", [])
         if not isinstance(properties, dict) or not isinstance(required, list):
@@ -39,6 +43,12 @@ class ToolDefinition:
             if not isinstance(property_schema, dict):
                 raise ToolArgumentsValidationError(
                     f"tool schema for {name!r} must be an object"
+                )
+            expected_type = property_schema.get("type")
+            if expected_type not in {"string", "integer", "boolean", "object"}:
+                raise ToolArgumentsValidationError(
+                    f"tool schema for {name!r} has unsupported schema type "
+                    f"{expected_type!r}"
                 )
             if name not in normalized and "default" in property_schema:
                 normalized[name] = property_schema["default"]
@@ -97,6 +107,12 @@ class ToolResult:
         """Whether execution failed according to the stable error-code contract."""
 
         return self.error_code is not None
+
+    @property
+    def ok(self) -> bool:
+        """Whether execution completed successfully."""
+
+        return not self.is_error
 
     def to_message_block(self, tool_call_id: str) -> ToolResultBlock:
         """Bind this execution result to a conversation tool-call result block."""

@@ -55,18 +55,19 @@ def _read_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) ->
     content, relative = filesystem.read_text_file(arguments.get("path"))
     lines = content.splitlines()
     page = lines[offset - 1 : offset - 1 + limit]
-    start_line = offset
-    end_line = offset + len(page) - 1
+    start_line = offset if page else None
+    end_line = offset + len(page) - 1 if page else None
     return ToolResult(
         content="\n".join(f"{number}: {line}" for number, line in enumerate(page, offset)),
         metadata={
             "path": relative,
+            "requested_offset": offset,
             "requested_limit": limit,
             "returned_lines": len(page),
             "total_lines": len(lines),
             "start_line": start_line,
             "end_line": end_line,
-            "truncated": end_line < len(lines),
+            "truncated": bool(page) and end_line < len(lines),
         },
     )
 
@@ -167,6 +168,16 @@ def _grep(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> Tool
 
 def _run_command(runner: CommandRunner, arguments: dict[str, object]) -> ToolResult:
     return runner.run(
+        cast(str, arguments["command"]),
+        cast(str, arguments["cwd"]),
+        cast(int, arguments["timeout_ms"]),
+    )
+
+
+async def _run_command_async(
+    runner: CommandRunner, arguments: dict[str, object]
+) -> ToolResult:
+    return await runner.run_async(
         cast(str, arguments["command"]),
         cast(str, arguments["cwd"]),
         cast(int, arguments["timeout_ms"]),
@@ -277,5 +288,6 @@ def create_local_tool_registry(workspace_root: Path) -> ToolRegistry:
             ),
         ),
         lambda arguments: _run_command(runner, arguments),
+        async_executor=lambda arguments: _run_command_async(runner, arguments),
     )
     return registry

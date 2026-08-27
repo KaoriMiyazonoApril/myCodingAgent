@@ -29,8 +29,9 @@ class ReasoningBlock:
 class ToolCallBlock:
     id: str
     name: str
-    arguments: dict[str, Any]
+    arguments: dict[str, Any] | None
     arguments_error: str | None = None
+    raw_arguments: str | None = None
     type: Literal["tool_call"] = field(default="tool_call", init=False)
 
 
@@ -45,6 +46,10 @@ class ToolResultBlock:
     @property
     def is_error(self) -> bool:
         return self.error_code is not None
+
+    @property
+    def ok(self) -> bool:
+        return not self.is_error
 
 
 ContentBlock: TypeAlias = TextBlock | ReasoningBlock | ToolCallBlock | ToolResultBlock

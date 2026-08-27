@@ -44,38 +44,40 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 19. As a model, I want an explicitly selected ignored directory to be searchable, so that default noise reduction does not block an intentional investigation.
 20. As a model, I want to run one non-interactive shell command from a workspace-relative initial directory, so that I can validate or inspect local work.
 21. As a model, I want command stdout and stderr captured separately with duration, exit code, timeout, and truncation metadata, so that I can distinguish command behavior from tool behavior.
-22. As a model, I want a non-zero command exit code not to be treated as a tool execution error, so that failing tests and diagnostics remain inspectable.
+22. As a model, I want a non-zero command exit code reported as `COMMAND_FAILED` while retaining stdout, stderr, and exit metadata, so that failing tests cannot be mistaken for success and remain inspectable.
 23. As a model, I want timed-out command output retained where possible, so that I can diagnose the partial execution.
 24. As an agent-loop author, I want stable error codes for invalid arguments, path violations, text-file failures, edits, regexes, and process failures, so that recovery logic can act without parsing prose.
 25. As a maintainer, I want tools to return results rather than append messages or request approvals, so that capability execution remains separate from policy, UI, and conversation orchestration.
 26. As a maintainer, I want temporary-directory tests at the tool registry and tool execution seams, so that results do not depend on a developer machine's paths or files.
 27. As an async runtime author, I want a non-blocking dispatch entry point, so that local execution does not freeze the Agent Loop or UI event loop.
 28. As a model, I want commands to access persistent files only in the configured workspace, so that a generated command cannot inspect or alter unrelated host files.
+29. As an async runtime author, I want cancellation to terminate the command process group, so that stopping the Agent cannot leave commands running in the background.
+30. As an application author, I want command-sandbox capability checked during local-tool composition, so that an unsupported host fails before the first model command.
 
 ## Implementation Decisions
 
 - The tool subsystem extends the existing tool-domain definition model rather than creating another model-facing schema type. Existing parsed tool-call and conversation result blocks retain their current responsibilities.
-- A new execution-domain result carries model-readable content, JSON-compatible metadata, and an optional stable error code. Error state is derived exclusively from the presence of that code; no independently mutable error boolean exists.
-- `ToolResult.to_message_block` binds an execution result to a tool call. The model adapter serializes content, metadata, and error code together as a JSON tool-message envelope.
+- A new execution-domain result carries model-readable content, JSON-compatible metadata, and an optional stable error code. `ok` and `is_error` are derived exclusively from the presence of that code; no independently mutable error boolean exists.
+- `ToolResult.to_message_block` binds an execution result to a tool call. The model adapter serializes `ok`, content, metadata, and error code together as a JSON tool-message envelope.
 - The common executable-tool interface accepts an existing, already accepted tool call and returns an execution result. Individual tools contain capability behavior only: they do not perform approval, permission-policy, UI, agent-loop, or conversation-history work.
 - The registry is a deep module with a small interface: registration, lookup, definition enumeration, and consistent execution dispatch. It owns no workspace configuration, file system, process service, policy, or runtime state.
-- The registry offers synchronous `execute` for CLI/tests and worker-thread-backed `execute_async` for async Agent Loop/UI callers.
+- The registry offers synchronous `execute` for CLI/tests and `execute_async` for Agent Loop/UI callers. Ordinary synchronous tools use a worker thread; tools with an async executor, notably `run_command`, remain natively async and cancellable.
 - Runtime composition is explicit: it constructs shared filesystem and process modules from the configured workspace, injects those modules into tools, then registers tools. No global workspace configuration is introduced.
 - A filesystem module centralizes relative-path normalization, absolute-path rejection, workspace containment, final symlink containment, UTF-8 validation, regular-file validation, atomic text replacement, and controlled traversal. It accepts `/` path separators at the tool interface and returns workspace-relative POSIX paths.
 - Absolute paths and any lexical or resolved path escaping the workspace are rejected. An internal symlink is usable only when its resolved target remains inside the configured workspace.
 - Text files are strict UTF-8 regular files without NUL bytes. Direct reads of directories, missing files, binary or non-UTF-8 files, and unsafe paths become structured operational errors. Search traversal skips non-text files and continues with remaining files. New write content containing NUL is rejected as non-text.
 - Existing-file writes use a same-directory temporary file plus atomic replacement. Existing mode and executable permission are preserved where practical; ACLs, extended attributes, fsync durability protocols, and broader metadata preservation are not implemented.
-- `read` uses one-based offsets and a default limit of 200. The limit must be an integer from 1 through 2,000, expressed in both the model schema and local validation. Out-of-range offsets return an empty success page. Read metadata contains `requested_limit`, `returned_lines`, `total_lines`, `start_line`, `end_line`, and `truncated`; an empty page uses `start_line = offset` and `end_line = offset - 1`.
+- `read` uses one-based offsets and a default limit of 200. The limit must be an integer from 1 through 2,000, expressed in both the model schema and local validation. Out-of-range offsets return an empty success page. Read metadata contains `requested_offset`, `requested_limit`, `returned_lines`, `total_lines`, `start_line`, `end_line`, and `truncated`; an empty page uses `start_line = null` and `end_line = null`.
 - `edit` performs exact, case-sensitive string replacement. `old_string` must be nonempty without trimming; whitespace-only strings are valid. `new_string` may be empty. A non-global edit requires exactly one match, while global edit replaces all matches. Failed matching never writes the file.
 - `glob` and `grep` use a single platform-neutral Python traversal implementation rather than selecting between ripgrep and a fallback. They return only regular files, use stable workspace-relative POSIX ordering, limit results to 200, and expose truncation.
 - Default traversal excludes `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `build`, and `dist`. The exclusion is overridden only when the caller explicitly chooses such a directory as `path`; a matching-looking pattern does not override it.
 - `glob` treats its pattern as a relative pathlib-style glob below the selected path. `grep` treats `pattern` as a Python regular expression and optional `include` as a glob against workspace-relative POSIX paths. Invalid regexes produce `INVALID_REGEX`.
-- The process module resolves `cwd` through the filesystem module. Production composition requires Linux bubblewrap and runs `bash --noprofile --norc -c` in a new namespace with only `/usr`, process/device support, an ephemeral `/tmp`, and the workspace mounted read-write. Host environment variables, host paths, capabilities, and network namespaces are not inherited. If isolation is unavailable, execution fails closed with `PROCESS_START_FAILED`; it never silently falls back to a host shell.
-- Command timeout defaults to 60,000 ms and is constrained to 1 through 300,000 ms. The process module captures stdout and stderr independently, preserving bounded head and tail portions of each 100 KiB stream. It reports duration, exit code, timeout, and truncation. A non-zero exit code is a completed execution, not a tool error.
-- On timeout the process module terminates the sandbox process group, bounds all subsequent waits, and retains already captured output. Reader threads are daemonized and bounded so a detached descendant retaining a pipe cannot indefinitely block the Agent.
-- Error codes include at least invalid arguments, unknown tool, workspace escape, not found, not a file, not text, invalid regex, missing edit match, ambiguous edit, I/O failure, process start failure, timeout, and unexpected internal failure. Expected operational failures are converted into execution results at the registry/tool seam.
+- The process module resolves `cwd` through the filesystem module. Its internal bubblewrap implementation requires Linux or WSL2 plus `bwrap`, and runs `bash --noprofile --norc -c` in a new namespace with only `/usr`, process/device support, an ephemeral `/tmp`, and the workspace mounted read-write. Host environment variables, host paths, capabilities, and network namespaces are not inherited. Runtime composition performs an eager capability check and raises `CommandSandboxUnavailableError` immediately if the host is unsupported; it never silently falls back to a host shell. A public sandbox-backend seam is intentionally deferred until a second real adapter exists.
+- Command timeout defaults to 60,000 ms and is constrained to 1 through 300,000 ms. The process module captures stdout and stderr independently, preserving bounded head and tail portions of each 100 KiB stream. It reports duration, exit code, timeout, and truncation. Exit zero is success, non-zero is `COMMAND_FAILED`, and timeout is `TIMEOUT`.
+- `CommandRunner` uses `asyncio.create_subprocess_exec()` and async stream readers. Timeout and coroutine cancellation terminate the owned process group and bound cleanup waits; pending reads are cancelled rather than closing a stream beneath a reader thread. This prevents pipe-lock deadlocks and commands surviving an Agent/UI stop.
+- Error codes include at least invalid arguments, unknown tool, workspace escape, not found, not a file, not text, invalid regex, missing edit match, ambiguous edit, I/O failure, process start failure, command failure, timeout, and unexpected internal failure. Expected operational failures are converted into execution results at the registry/tool seam; unexpected exceptions are logged with traceback while only a safe message reaches the model.
 - Every model-visible tool schema is an object with `additionalProperties: false`. Required fields, defaults, numeric ranges, and `edit.old_string` minimum length agree with local validation.
-- `ToolDefinition.validate_arguments` is the runtime source of truth for the supported JSON Schema subset. It validates types, required/unknown fields, string lengths and numeric ranges, and applies defaults before dispatch; capability functions retain only semantic checks such as regex compilation and workspace containment.
+- `ToolDefinition.validate_arguments` is the runtime source of truth for the supported JSON Schema subset. It validates types, required/unknown fields, string lengths and numeric ranges, and applies defaults before dispatch; unsupported or missing property schema types fail closed instead of skipping validation. Capability functions retain only semantic checks such as regex compilation and workspace containment.
 
 ## Testing Decisions
 
@@ -91,7 +93,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 
 - Approval workflows, user interaction, general permission policy, and command authorization beyond the mandatory workspace sandbox.
 - Agent-loop control, conversation-history mutation, UI communication, and conversion of execution results into conversation result blocks.
-- Persistent command sessions, stdin streaming, job management, process reattachment, and non-Linux command sandbox backends.
+- Persistent command sessions, stdin streaming, job management, process reattachment, cancellation tokens beyond coroutine cancellation, and production command sandbox backends other than bubblewrap.
 - `apply_patch`, git-specific, browser, web, MCP, or subagent tools.
 - Arbitrary shell-command translation between operating systems.
 - Ripgrep integration, pluggable search backends, parallel tool execution, deferred-tool exposure, tool search, and registry production features beyond the MVP.
@@ -99,7 +101,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 
 ## Further Notes
 
-- `run_command` uses a Linux bubblewrap namespace. `/workspace` is the sole persistent writable mount; `/tmp` is ephemeral, other host paths are absent, and the network is unshared. This is capability isolation, not an approval or intent policy.
+- Project command execution requires Linux or WSL2 with bubblewrap installed and usable. `run_command` uses its namespace with `/workspace` as the sole persistent writable mount; `/tmp` is ephemeral, other host paths are absent, and the network is unshared. This is capability isolation, not an approval or intent policy.
 - Model-facing paths should remain workspace-relative POSIX paths even when the runtime executes on Windows. The runtime does not translate arbitrary command syntax between shells.
 - The result limit for glob and grep is 200; each stdout and stderr capture budget is 100 KiB. These are resource limits, not approval or permission decisions, and all truncation is exposed to the model.
 - This specification is local by explicit request and has not been published as a GitHub Issue.
@@ -109,12 +111,12 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 当前 MVP 位于 `agent/tools/`，并保持模型连接层与执行能力层解耦：
 
 - `types.py` 定义既有的模型可见 `ToolDefinition`，以及执行域的 `ToolResult`。`error_code`
-  为 `None` 表示成功；`is_error` 由该字段推导，不存在可独立修改的错误布尔值。
+  为 `None` 表示成功；`ok` 与 `is_error` 均由该字段推导，不存在可独立修改的错误布尔值。
 - `filesystem.py` 的 `WorkspaceFilesystem` 是工作区路径、文本文件和原子写入的唯一
   入口；`ToolOperationError` 将预期的本地操作失败编码为稳定错误码。
 - `process.py` 的 `CommandRunner` 通过受验证的初始目录运行一次 shell 命令，并分别在
   metadata 中返回 stdout、stderr、持续时间、退出码、`command_succeeded`、sandbox、
-  超时和截断状态。非零退出是已完成但失败的命令，不是工具基础设施错误。
+  超时和截断状态。非零退出返回 `COMMAND_FAILED`，超时返回 `TIMEOUT`。
 - `registry.py` 的 `ToolRegistry` 提供注册、查找、定义列举及对既有
   `ToolCallBlock` 的统一分派；它不保存任何工作区配置。
 - `local.py` 显式组合共享的文件系统与进程服务，并注册
