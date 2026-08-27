@@ -34,6 +34,16 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 第一版状态全部保存在内存中。核心对象设计为 JSON 可序列化数据，未来可由 REST 接收命令、
 由 SSE 发送事件。HTTP adapter、React 前端、数据库和上下文压缩均留待后续实现。
 
+## Implementation Status
+
+- Ticket 01 的最小 tracer bullet 已完成：调用方可通过 `ThreadRuntime` 创建内存 Thread、
+  提交一个 Turn，并让完整模型响应与现有工具注册表顺序循环，直至模型返回最终文本。
+- 当前公开结果只包含基础 Thread 生命周期与 Turn 的最终文本、迭代数和工具调用数；完整
+  settings、事件、预算、跨 workspace 并发、Policy、diff 与严格链接安全仍由后续 ticket
+  实现。
+- 第一阶段使用单个注入的 `LLMProvider` 和按 workspace 构造的 `ToolRegistry`。模型切换
+  与版本化设置将在多轮设置阶段扩展，不属于当前 tracer bullet。
+
 ## User Stories
 
 1. As a coding-agent user, I want to submit a programming request, so that the model can autonomously inspect, modify, and validate my project.
