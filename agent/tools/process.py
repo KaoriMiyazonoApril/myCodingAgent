@@ -192,6 +192,7 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
 
     def check_available(self, workspace_root: Path) -> None:
         """Fail during runtime composition when bubblewrap cannot execute."""
+        self._executable = None
         if not sys.platform.startswith("linux"):
             raise CommandSandboxUnavailableError(
                 "bubblewrap command isolation requires Linux or WSL2"
@@ -218,10 +219,12 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
+            self._executable = None
             raise CommandSandboxUnavailableError(
                 f"bubblewrap capability probe failed: {error}"
             ) from error
         if probe.returncode != 0:
+            self._executable = None
             details = probe.stderr.decode("utf-8", errors="replace").strip()
             suffix = f": {details}" if details else ""
             raise CommandSandboxUnavailableError(
@@ -334,7 +337,11 @@ class CommandRunner:
         sandbox_backend: CommandSandboxBackend | None = None,
     ) -> None:
         self._filesystem = filesystem
-        self._sandbox = sandbox_backend or BubblewrapSandboxBackend()
+        self._sandbox = (
+            sandbox_backend
+            if sandbox_backend is not None
+            else BubblewrapSandboxBackend()
+        )
         self._sandbox.check_available(self._filesystem.root)
 
     def run(self, command: str, cwd: str, timeout_ms: int) -> ToolResult:

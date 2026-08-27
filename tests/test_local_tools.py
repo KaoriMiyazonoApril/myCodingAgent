@@ -52,6 +52,26 @@ def test_local_tools_accept_an_explicit_command_sandbox_backend(tmp_path) -> Non
     assert result.metadata["stdout"] == "deterministic"
 
 
+def test_falsey_explicit_sandbox_backend_is_not_replaced(tmp_path) -> None:
+    class FalseySandboxBackend(DeterministicSandboxBackend):
+        def __bool__(self) -> bool:
+            return False
+
+    backend = FalseySandboxBackend()
+    registry = create_local_tool_registry(tmp_path, sandbox_backend=backend)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="falsey_sandbox",
+            name="run_command",
+            arguments={"command": "printf explicit"},
+        )
+    )
+
+    assert backend.checked_workspaces == [tmp_path.resolve()]
+    assert result.metadata["stdout"] == "explicit"
+
+
 def test_unavailable_injected_sandbox_fails_without_running_a_host_command(
     tmp_path,
 ) -> None:
@@ -72,6 +92,40 @@ def test_unavailable_injected_sandbox_fails_without_running_a_host_command(
         create_local_tool_registry(
             tmp_path,
             sandbox_backend=UnavailableSandboxBackend(),
+        )
+
+
+def test_failed_bubblewrap_probe_does_not_leave_backend_executable(
+    tmp_path, monkeypatch
+) -> None:
+    backend = BubblewrapSandboxBackend()
+    monkeypatch.setattr("agent.tools.process.shutil.which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(
+        "agent.tools.process.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stderr=b"user namespaces disabled"
+        ),
+    )
+
+    async def unexpected_process_start(*args, **kwargs):
+        raise AssertionError("a backend with a failed probe must not execute")
+
+    monkeypatch.setattr(
+        "agent.tools.process.asyncio.create_subprocess_exec",
+        unexpected_process_start,
+    )
+
+    with pytest.raises(CommandSandboxUnavailableError, match="user namespaces disabled"):
+        backend.check_available(tmp_path)
+    with pytest.raises(CommandSandboxUnavailableError, match="capability check"):
+        asyncio.run(
+            backend.execute(
+                workspace_root=tmp_path,
+                working_directory=tmp_path,
+                relative_cwd=".",
+                command="true",
+                timeout_ms=100,
+            )
         )
 
 
