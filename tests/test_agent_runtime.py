@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ from agent.core.messages import (
     ToolResultBlock,
 )
 from agent.model.openai_compatible import OpenAICompatibleProvider
+from agent.model.errors import LLMAuthenticationError, LLMConnectionError
 from agent.model.provider import LLMProvider
 from agent.model.types import (
     LLMRequest,
@@ -27,6 +29,7 @@ from agent.model.types import (
     Usage,
 )
 from agent.runtime import (
+    AgentLimits,
     ModelSettings,
     SettingsConflictError,
     ThinkingKeep,
@@ -38,6 +41,7 @@ from agent.runtime import (
     TurnStatus,
     UnsupportedModelSettingError,
 )
+from agent.runtime.run_controller import RunController
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
 from tests.sandbox_support import create_test_tool_registry
@@ -148,6 +152,7 @@ def runtime_for_provider(
     tool_registry_factory=empty_tools,
     default_settings: ModelSettings | None = None,
     additional_system_instructions: str | None = None,
+    **runtime_options,
 ) -> ThreadRuntime:
     return ThreadRuntime(
         provider_resolver=lambda _config_id, _model: provider,
@@ -155,6 +160,7 @@ def runtime_for_provider(
         or ModelSettings(provider_config_id="test-provider", model="test-model"),
         tool_registry_factory=tool_registry_factory,
         additional_system_instructions=additional_system_instructions,
+        **runtime_options,
     )
 
 
@@ -1064,3 +1070,275 @@ def test_multiple_tools_and_a_recoverable_error_preserve_result_order(
             ],
         ),
     ]
+
+
+def tool_response(*calls: ToolCallBlock) -> LLMResponse:
+    return LLMResponse(
+        message=Message(role="assistant", content=list(calls)),
+        finish_reason="tool_calls",
+        usage=Usage(input_tokens=2, output_tokens=1, total_tokens=3),
+    )
+
+
+def final_response(text: str = "Done.") -> LLMResponse:
+    return LLMResponse(
+        message=Message(role="assistant", content=[TextBlock(text=text)]),
+        finish_reason="stop",
+        usage=Usage(input_tokens=3, output_tokens=2, total_tokens=5),
+    )
+
+
+def test_retryable_model_errors_recover_within_three_attempts(tmp_path) -> None:
+    class RecoveringProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, request: LLMRequest) -> LLMResponse:
+            self.calls += 1
+            if self.calls < 3:
+                raise LLMConnectionError("temporary provider outage")
+            return final_response("Recovered.")
+
+    provider = RecoveringProvider()
+    runtime = runtime_for_provider(provider, model_retry_delays=())
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Retry safely."))
+
+    assert provider.calls == 3
+    assert summary.status is TurnStatus.COMPLETED
+    assert summary.final_text == "Recovered."
+    assert summary.iterations == 1
+
+
+def test_non_retryable_model_error_fails_immediately_without_leaking_details(
+    tmp_path,
+) -> None:
+    class AuthenticationFailureProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, request: LLMRequest) -> LLMResponse:
+            self.calls += 1
+            raise LLMAuthenticationError("secret-key was rejected")
+
+    provider = AuthenticationFailureProvider()
+    runtime = runtime_for_provider(provider, model_retry_delays=())
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Do not retry auth."))
+
+    assert provider.calls == 1
+    assert summary.status is TurnStatus.FAILED
+    assert summary.stop_reason == "model_error"
+    assert summary.error == {"code": "LLM_ERROR", "message": "model request failed"}
+    assert "secret-key" not in json.dumps(runtime.get_snapshot(thread.thread_id).to_dict())
+
+
+def test_iteration_budget_stops_before_an_extra_model_request(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(id="missing-1", name="missing", arguments={})
+            ),
+            final_response("must not be requested"),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        default_settings=ModelSettings(
+            provider_config_id="test-provider",
+            model="test-model",
+            limits=AgentLimits(max_iterations=1),
+        ),
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Stop after one model call."))
+
+    assert len(provider.requests) == 1
+    assert summary.status is TurnStatus.LIMIT_REACHED
+    assert summary.stop_reason == "max_iterations"
+    assert summary.iterations == 1
+    assert summary.tool_calls == 1
+
+
+def test_tool_budget_preserves_a_result_for_every_unexecuted_call(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(id="first", name="missing", arguments={}),
+                ToolCallBlock(id="second", name="missing", arguments={}),
+            )
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        default_settings=ModelSettings(
+            provider_config_id="test-provider",
+            model="test-model",
+            limits=AgentLimits(max_tool_calls=1),
+        ),
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Bound the tool batch."))
+
+    assert summary.status is TurnStatus.LIMIT_REACHED
+    assert summary.stop_reason == "max_tool_calls"
+    assert summary.tool_calls == 1
+    public_results = [
+        block
+        for message in runtime.get_snapshot(thread.thread_id).messages
+        for block in message["content"]
+        if block["type"] == "tool_result"
+    ]
+    assert [result["tool_call_id"] for result in public_results] == ["first", "second"]
+    assert public_results[1]["error_code"] == "LIMIT_REACHED"
+    assert public_results[1]["metadata"] == {"executed": False}
+
+
+def test_three_identical_consecutive_tool_failures_stop_the_turn(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(id=f"missing-{index}", name="missing", arguments={"b": 2, "a": 1})
+            )
+            for index in range(3)
+        ]
+    )
+    runtime = runtime_for_provider(provider)
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Avoid a failure loop."))
+
+    assert summary.status is TurnStatus.LIMIT_REACHED
+    assert summary.stop_reason == "repeated_tool_failure"
+    assert summary.iterations == 3
+    assert summary.tool_calls == 3
+
+
+def test_different_failed_arguments_do_not_trigger_repeated_failure_limit(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id=f"missing-{index}",
+                    name="missing",
+                    arguments={"attempt": index},
+                )
+            )
+            for index in range(3)
+        ]
+        + [final_response("Changed approach.")]
+    )
+    runtime = runtime_for_provider(provider)
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Try distinct arguments."))
+
+    assert summary.status is TurnStatus.COMPLETED
+    assert summary.final_text == "Changed approach."
+    assert summary.iterations == 4
+    assert summary.tool_calls == 3
+
+
+def test_execution_deadline_cancels_a_slow_model_call(tmp_path) -> None:
+    runtime = runtime_for_provider(
+        PausingProvider(),
+        default_settings=ModelSettings(
+            provider_config_id="test-provider",
+            model="test-model",
+            limits=AgentLimits(max_execution_seconds=0.02),
+        ),
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Time-box this."))
+
+    assert summary.status is TurnStatus.LIMIT_REACHED
+    assert summary.stop_reason == "execution_timeout"
+    assert runtime.get_snapshot(thread.thread_id).status is ThreadStatus.IDLE
+
+
+def test_approval_pause_rearms_an_already_active_execution_deadline() -> None:
+    async def scenario() -> str:
+        controller = RunController(AgentLimits(max_execution_seconds=0.03))
+
+        async def operation() -> str:
+            await asyncio.sleep(0.01)
+            controller.pause_deadline()
+            await asyncio.sleep(0.05)
+            controller.resume_deadline()
+            await asyncio.sleep(0.005)
+            return "approved"
+
+        return await controller.wait(operation())
+
+    assert asyncio.run(scenario()) == "approved"
+
+
+def test_cancelling_an_active_model_call_returns_a_cancelled_summary(tmp_path) -> None:
+    async def scenario():
+        provider = PausingProvider()
+        runtime = runtime_for_provider(provider)
+        thread = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(runtime.run_turn(thread.thread_id, "Cancel me."))
+        await provider.started.wait()
+
+        assert runtime.cancel_turn(thread.thread_id) is True
+        assert runtime.cancel_turn(thread.thread_id) is False
+        summary = await active
+        return runtime, thread.thread_id, summary
+
+    runtime, thread_id, summary = asyncio.run(scenario())
+
+    assert summary.status is TurnStatus.CANCELLED
+    assert summary.stop_reason == "cancelled"
+    assert runtime.get_snapshot(thread_id).status is ThreadStatus.IDLE
+    assert [event.type for event in runtime.get_events(thread_id).events][-2:] == [
+        "turn_cancel_requested",
+        "turn_cancelled",
+    ]
+
+
+def test_cancelling_run_command_terminates_its_process_group(tmp_path) -> None:
+    async def scenario():
+        provider = ScriptedProvider(
+            [
+                tool_response(
+                    ToolCallBlock(
+                        id="long-command",
+                        name="run_command",
+                        arguments={
+                            "command": "printf '%s' $$ > command.pid; sleep 30",
+                            "timeout_ms": 60_000,
+                        },
+                    )
+                )
+            ]
+        )
+        runtime = runtime_for_provider(
+            provider,
+            tool_registry_factory=create_test_tool_registry,
+        )
+        thread = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(runtime.run_turn(thread.thread_id, "Run then cancel."))
+        pid_file = tmp_path / "command.pid"
+        for _ in range(100):
+            if pid_file.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert pid_file.exists()
+        process_id = int(pid_file.read_text(encoding="utf-8"))
+        assert runtime.cancel_turn(thread.thread_id) is True
+        summary = await active
+        return summary, process_id
+
+    summary, process_id = asyncio.run(scenario())
+
+    assert summary.status is TurnStatus.CANCELLED
+    with pytest.raises(ProcessLookupError):
+        os.kill(process_id, 0)

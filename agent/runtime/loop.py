@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 from agent.core.messages import TextBlock, ToolCallBlock
 from agent.tools.registry import ToolRegistry
+from agent.tools.types import ToolResult
 
 from .conversation import Conversation
 from .events import TurnEventEmitter
+from .errors import TurnLimitReached
 from .model_invoker import ModelInvoker
+from .run_controller import RunController
 
 
 @dataclass(frozen=True, slots=True)
 class LoopOutcome:
     final_text: str
-    iterations: int
-    tool_calls: int
-    usage: dict[str, int | None]
 
 
 class AgentLoop:
@@ -29,27 +30,24 @@ class AgentLoop:
         tools: ToolRegistry,
         model: ModelInvoker,
         events: TurnEventEmitter,
+        controller: RunController,
     ) -> LoopOutcome:
-        iterations = 0
-        tool_call_count = 0
-        usage_totals: dict[str, int | None] = {
-            "input_tokens": None,
-            "output_tokens": None,
-            "total_tokens": None,
-        }
-
         while True:
-            response = await model.chat(
-                conversation.request_messages(),
-                tools.definitions(),
+            controller.begin_iteration()
+            response = await controller.wait(
+                model.chat(
+                    conversation.request_messages(),
+                    tools.definitions(),
+                )
             )
-            iterations += 1
             conversation.append_assistant(response.message)
-            for name in usage_totals:
-                value = getattr(response.usage, name)
-                if value is not None:
-                    usage_totals[name] = (usage_totals[name] or 0) + value
-            events.model_response(response, iterations)
+            assistant_text = "".join(
+                block.text
+                for block in response.message.content
+                if isinstance(block, TextBlock)
+            )
+            controller.record_model_response(response.usage, assistant_text)
+            events.model_response(response, controller.iterations)
 
             tool_calls = [
                 block
@@ -57,21 +55,91 @@ class AgentLoop:
                 if isinstance(block, ToolCallBlock)
             ]
             if not tool_calls:
-                return LoopOutcome(
-                    final_text="".join(
-                        block.text
-                        for block in response.message.content
-                        if isinstance(block, TextBlock)
-                    ),
-                    iterations=iterations,
-                    tool_calls=tool_call_count,
-                    usage=usage_totals,
-                )
+                return LoopOutcome(final_text=assistant_text)
 
-            for call in tool_calls:
+            for index, call in enumerate(tool_calls):
                 events.tool_requested(call)
+                try:
+                    controller.begin_tool()
+                except TurnLimitReached:
+                    self._append_skipped_results(
+                        conversation,
+                        events,
+                        tool_calls[index:],
+                        reason="tool call budget reached",
+                        first_request_emitted=True,
+                    )
+                    raise
                 events.tool_started(call)
-                result = await tools.execute_async(call)
-                conversation.append_tool_result(result.to_message_block(call.id))
-                tool_call_count += 1
-                events.tool_finished(call, result)
+                try:
+                    result = await controller.wait(tools.execute_async(call))
+                except TurnLimitReached:
+                    result = ToolResult(
+                        content="tool cancelled because the Turn execution deadline was reached",
+                        metadata={},
+                        error_code="LIMIT_REACHED",
+                    )
+                    self._record_tool_result(conversation, events, call, result)
+                    self._append_skipped_results(
+                        conversation,
+                        events,
+                        tool_calls[index + 1 :],
+                        reason="Turn execution deadline reached",
+                    )
+                    raise
+                except asyncio.CancelledError:
+                    result = ToolResult(
+                        content="tool cancelled with its active Turn",
+                        metadata={},
+                        error_code="CANCELLED",
+                    )
+                    self._record_tool_result(conversation, events, call, result)
+                    self._append_skipped_results(
+                        conversation,
+                        events,
+                        tool_calls[index + 1 :],
+                        reason="Turn cancelled",
+                        error_code="CANCELLED",
+                    )
+                    raise
+                self._record_tool_result(conversation, events, call, result)
+                try:
+                    controller.record_tool_result(call, result)
+                except TurnLimitReached:
+                    self._append_skipped_results(
+                        conversation,
+                        events,
+                        tool_calls[index + 1 :],
+                        reason="repeated tool failure limit reached",
+                    )
+                    raise
+
+    @staticmethod
+    def _append_skipped_results(
+        conversation: Conversation,
+        events: TurnEventEmitter,
+        calls: list[ToolCallBlock],
+        *,
+        reason: str,
+        error_code: str = "LIMIT_REACHED",
+        first_request_emitted: bool = False,
+    ) -> None:
+        for index, call in enumerate(calls):
+            if index > 0 or not first_request_emitted:
+                events.tool_requested(call)
+            result = ToolResult(
+                content=reason,
+                metadata={"executed": False},
+                error_code=error_code,
+            )
+            AgentLoop._record_tool_result(conversation, events, call, result)
+
+    @staticmethod
+    def _record_tool_result(
+        conversation: Conversation,
+        events: TurnEventEmitter,
+        call: ToolCallBlock,
+        result: ToolResult,
+    ) -> None:
+        conversation.append_tool_result(result.to_message_block(call.id))
+        events.tool_finished(call, result)

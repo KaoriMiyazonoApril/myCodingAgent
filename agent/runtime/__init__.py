@@ -4,6 +4,7 @@ from .errors import SettingsConflictError, ThreadBusyError, UnsupportedModelSett
 from .events import AgentEvent, EventBatch
 from .prompt import PromptBuilder
 from .settings import (
+    AgentLimits,
     ModelSettings,
     ThinkingKeep,
     ThinkingSettings,
@@ -19,6 +20,7 @@ __all__ = [
     "AgentEvent",
     "EventBatch",
     "SCHEMA_VERSION",
+    "AgentLimits",
     "ThreadBusyError",
     "PromptBuilder",
     "ModelSettings",

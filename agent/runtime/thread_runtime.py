@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from agent.model.errors import LLMError
 from agent.model.provider import LLMProvider
 from agent.tools.registry import ToolRegistry
 
 from .conversation import Conversation
-from .errors import SettingsConflictError, ThreadBusyError
+from .errors import SettingsConflictError, ThreadBusyError, TurnLimitReached
 from .events import EventBatch, EventBuffer, TurnEventEmitter, utc_now
 from .loop import AgentLoop
 from .model_invoker import ModelInvoker
 from .prompt import PromptBuilder
+from .run_controller import RunController
 from .settings import (
     ModelSettings,
     ThreadSettings,
@@ -31,6 +34,14 @@ ProviderResolver = Callable[[str, str], LLMProvider]
 
 
 @dataclass(slots=True)
+class _ActiveTurn:
+    turn_id: str
+    controller: RunController
+    events: TurnEventEmitter
+    started_at: str
+
+
+@dataclass(slots=True)
 class _ThreadRecord:
     thread_id: str
     workspace: Path
@@ -38,7 +49,7 @@ class _ThreadRecord:
     conversation: Conversation
     settings: ThreadSettings
     status: ThreadStatus = ThreadStatus.IDLE
-    active_turn_id: str | None = None
+    active_turn: _ActiveTurn | None = None
     completed_turns: int = 0
     created_at: str = ""
     updated_at: str = ""
@@ -59,6 +70,7 @@ class ThreadRuntime:
         prompt_builder: PromptBuilder | None = None,
         event_buffer_capacity: int = 512,
         reasoning_visibility: str = "hidden",
+        model_retry_delays: tuple[float, ...] = (0.1, 0.2),
     ) -> None:
         if reasoning_visibility not in {"hidden", "debug"}:
             raise ValueError("reasoning_visibility must be 'hidden' or 'debug'")
@@ -68,6 +80,13 @@ class ThreadRuntime:
             or event_buffer_capacity < 1
         ):
             raise ValueError("event_buffer_capacity must be a positive integer")
+        if not isinstance(model_retry_delays, tuple) or any(
+            isinstance(delay, bool)
+            or not isinstance(delay, (int, float))
+            or delay < 0
+            for delay in model_retry_delays
+        ):
+            raise ValueError("model_retry_delays must be non-negative numbers")
         self._tool_registry_factory = tool_registry_factory
         self._provider_resolver = provider_resolver
         self._default_settings = default_settings
@@ -78,6 +97,7 @@ class ThreadRuntime:
         self._threads: dict[str, _ThreadRecord] = {}
         self._event_buffer_capacity = event_buffer_capacity
         self._reasoning_visibility = reasoning_visibility
+        self._model_retry_delays = model_retry_delays
 
     def create_thread(self, workspace: Path) -> ThreadSnapshot:
         normalized_workspace = workspace.resolve()
@@ -128,9 +148,12 @@ class ThreadRuntime:
             turn_config.provider_config_id,
             turn_config.model,
         )
-        model = ModelInvoker(provider, turn_config)
+        model = ModelInvoker(
+            provider,
+            turn_config,
+            retry_delays=self._model_retry_delays,
+        )
         record.status = ThreadStatus.RUNNING
-        record.active_turn_id = turn_id
         record.conversation.append_user(user_text)
         record.updated_at = utc_now()
         assert record.events is not None
@@ -140,7 +163,18 @@ class ThreadRuntime:
             buffer=record.events,
             reasoning_visibility=self._reasoning_visibility,
         )
+        controller = RunController(turn_config.limits)
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        controller.bind(current_task)
         started_at = utc_now()
+        active_turn = _ActiveTurn(
+            turn_id=turn_id,
+            controller=controller,
+            events=events,
+            started_at=started_at,
+        )
+        record.active_turn = active_turn
         events.emit(
             "turn_started",
             {
@@ -148,6 +182,11 @@ class ThreadRuntime:
                 "settings_version": turn_config.settings_version,
                 "provider_config_id": turn_config.provider_config_id,
                 "model": turn_config.model,
+                "limits": {
+                    "max_iterations": turn_config.limits.max_iterations,
+                    "max_tool_calls": turn_config.limits.max_tool_calls,
+                    "max_execution_seconds": turn_config.limits.max_execution_seconds,
+                },
             },
         )
         try:
@@ -156,35 +195,54 @@ class ThreadRuntime:
                 record.tools,
                 model,
                 events,
+                controller,
             )
-            record.completed_turns += 1
-            summary = TurnSummary(
-                schema_version=SCHEMA_VERSION,
-                turn_id=turn_id,
-                thread_id=thread_id,
+            return self._finish_turn(
+                record,
+                active_turn,
                 status=TurnStatus.COMPLETED,
                 stop_reason="completed",
                 final_text=outcome.final_text,
-                iterations=outcome.iterations,
-                tool_calls=outcome.tool_calls,
-                usage=outcome.usage,
-                started_at=started_at,
-                ended_at=utc_now(),
+                event_type="turn_completed",
             )
-            record.latest_turn = deepcopy(summary)
-            record.updated_at = summary.ended_at
-            events.emit("turn_completed", {"summary": summary.to_dict()})
-            return summary
-        except Exception:
-            record.updated_at = utc_now()
-            events.emit(
-                "turn_failed",
-                {"error": {"code": "RUNTIME_ERROR", "message": "turn failed"}},
+        except TurnLimitReached as error:
+            return self._finish_turn(
+                record,
+                active_turn,
+                status=TurnStatus.LIMIT_REACHED,
+                stop_reason=error.reason,
+                final_text=controller.last_assistant_text,
+                event_type="turn_limit_reached",
             )
-            raise
+        except asyncio.CancelledError:
+            return self._finish_turn(
+                record,
+                active_turn,
+                status=TurnStatus.CANCELLED,
+                stop_reason="cancelled",
+                final_text=controller.last_assistant_text,
+                event_type="turn_cancelled",
+            )
+        except Exception as error:
+            is_model_error = isinstance(error, LLMError)
+            public_error = {
+                "code": "LLM_ERROR" if is_model_error else "RUNTIME_ERROR",
+                "message": (
+                    "model request failed" if is_model_error else "turn failed"
+                ),
+            }
+            return self._finish_turn(
+                record,
+                active_turn,
+                status=TurnStatus.FAILED,
+                stop_reason="model_error" if is_model_error else "runtime_error",
+                final_text=controller.last_assistant_text,
+                event_type="turn_failed",
+                error=public_error,
+            )
         finally:
             record.status = ThreadStatus.IDLE
-            record.active_turn_id = None
+            record.active_turn = None
             record.updated_at = utc_now()
 
     def get_snapshot(self, thread_id: str) -> ThreadSnapshot:
@@ -201,6 +259,18 @@ class ThreadRuntime:
         events = self._threads[thread_id].events
         assert events is not None
         return events.read(after_event_id)
+
+    def cancel_turn(self, thread_id: str) -> bool:
+        """Request cancellation of the Thread's active model/tool operation."""
+
+        record = self._threads[thread_id]
+        active_turn = record.active_turn
+        if active_turn is None:
+            return False
+        cancelled = active_turn.controller.cancel()
+        if cancelled:
+            active_turn.events.emit("turn_cancel_requested", {})
+        return cancelled
 
     def update_settings(
         self,
@@ -225,12 +295,15 @@ class ThreadRuntime:
 
     @staticmethod
     def _snapshot(record: _ThreadRecord) -> ThreadSnapshot:
+        active_turn_id = (
+            None if record.active_turn is None else record.active_turn.turn_id
+        )
         return ThreadSnapshot(
             schema_version=SCHEMA_VERSION,
             thread_id=record.thread_id,
             workspace=record.workspace.as_posix(),
             status=record.status,
-            active_turn_id=record.active_turn_id,
+            active_turn_id=active_turn_id,
             completed_turns=record.completed_turns,
             settings=record.settings,
             messages=record.conversation.public_messages(),
@@ -238,3 +311,34 @@ class ThreadRuntime:
             updated_at=record.updated_at,
             latest_turn=deepcopy(record.latest_turn),
         )
+
+    @staticmethod
+    def _finish_turn(
+        record: _ThreadRecord,
+        active_turn: _ActiveTurn,
+        *,
+        status: TurnStatus,
+        stop_reason: str,
+        final_text: str,
+        event_type: str,
+        error: dict[str, object] | None = None,
+    ) -> TurnSummary:
+        summary = TurnSummary(
+            schema_version=SCHEMA_VERSION,
+            turn_id=active_turn.turn_id,
+            thread_id=record.thread_id,
+            status=status,
+            stop_reason=stop_reason,
+            final_text=final_text,
+            iterations=active_turn.controller.iterations,
+            tool_calls=active_turn.controller.tool_calls,
+            usage=deepcopy(active_turn.controller.usage),
+            started_at=active_turn.started_at,
+            ended_at=utc_now(),
+            error=error,
+        )
+        record.completed_turns += 1
+        record.latest_turn = deepcopy(summary)
+        record.updated_at = summary.ended_at
+        active_turn.events.emit(event_type, {"summary": summary.to_dict()})
+        return summary

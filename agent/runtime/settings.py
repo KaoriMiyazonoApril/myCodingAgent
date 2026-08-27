@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from agent.model.types import ThinkingCapabilities
@@ -22,6 +22,35 @@ class ThinkingKeep(str, Enum):
 
     NONE = "none"
     ALL = "all"
+
+
+@dataclass(frozen=True, slots=True)
+class AgentLimits:
+    """Public, bounded execution budgets frozen into one Turn."""
+
+    max_iterations: int = 20
+    max_tool_calls: int = 50
+    max_execution_seconds: float = 15 * 60
+
+    def __post_init__(self) -> None:
+        self._validate_integer("max_iterations", self.max_iterations, maximum=100)
+        self._validate_integer("max_tool_calls", self.max_tool_calls, maximum=500)
+        if (
+            isinstance(self.max_execution_seconds, bool)
+            or not isinstance(self.max_execution_seconds, (int, float))
+            or not 0 < self.max_execution_seconds <= 60 * 60
+        ):
+            raise ValueError(
+                "max_execution_seconds must be greater than 0 and at most 3600"
+            )
+    @staticmethod
+    def _validate_integer(name: str, value: int, *, maximum: int) -> None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= maximum
+        ):
+            raise ValueError(f"{name} must be between 1 and {maximum}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +116,7 @@ class ModelSettings:
     temperature: float | None = None
     max_tokens: int | None = None
     thinking: ThinkingSettings | None = None
+    limits: AgentLimits = field(default_factory=AgentLimits)
 
     def __post_init__(self) -> None:
         if (
@@ -112,6 +142,8 @@ class ModelSettings:
             self.thinking, ThinkingSettings
         ):
             raise ValueError("thinking must be ThinkingSettings or None")
+        if not isinstance(self.limits, AgentLimits):
+            raise ValueError("limits must be AgentLimits")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +162,7 @@ class ThreadSettings(ModelSettings):
             temperature=settings.temperature,
             max_tokens=settings.max_tokens,
             thinking=settings.thinking,
+            limits=settings.limits,
             version=version,
         )
 
@@ -143,6 +176,7 @@ class TurnSettingsOverride:
     temperature: float | None | _Unset = _UNSET
     max_tokens: int | None | _Unset = _UNSET
     thinking: ThinkingSettings | None | _Unset = _UNSET
+    limits: AgentLimits | _Unset = _UNSET
 
     def apply(self, defaults: ModelSettings) -> ModelSettings:
         return ModelSettings(
@@ -163,6 +197,7 @@ class TurnSettingsOverride:
             thinking=(
                 defaults.thinking if self.thinking is _UNSET else self.thinking
             ),
+            limits=defaults.limits if self.limits is _UNSET else self.limits,
         )
 
 
@@ -197,6 +232,7 @@ class TurnConfig(ModelSettings):
             temperature=settings.temperature,
             max_tokens=settings.max_tokens,
             thinking=settings.thinking,
+            limits=settings.limits,
             settings_version=settings_version,
             system_prompt=system_prompt,
         )

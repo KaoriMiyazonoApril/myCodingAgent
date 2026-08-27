@@ -15,3 +15,13 @@ class UnsupportedModelSettingError(ValueError):
     """Raised before a request when a selected model rejects a public option."""
 
     code = "UNSUPPORTED_MODEL_SETTING"
+
+
+class TurnLimitReached(RuntimeError):
+    """An execution budget or deterministic failure loop stopped a Turn."""
+
+    code = "LIMIT_REACHED"
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason

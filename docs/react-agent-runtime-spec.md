@@ -69,6 +69,16 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   event ID 游标读取，游标已淘汰时返回 `cursor_expired = true`，调用方据此重新读取
   Snapshot。reasoning 默认不进入任何公开状态或普通事件；仅当后端显式配置 `debug` 时，
   才紧随模型响应发出独立的 `model_reasoning` 事件。
+- Ticket 05 已实现 Turn 运行控制：`ModelInvoker` 仅对 retryable `LLMError` 在三次总尝试
+  内重试；`RunController` 统一累计模型迭代、工具调用、usage、执行 deadline 与连续相同
+  失败指纹。公开 `AgentLimits` 提供 20 次迭代、50 次工具调用和 15 分钟执行时间的默认值，
+  并对调用方输入设置硬上限。预算终止返回带具体 `stop_reason` 的
+  `LIMIT_REACHED` Summary；连续三次相同失败是固定的运行保护规则，而不是调用方可放宽的
+  设置，同时为同一批次内未执行的工具调用补齐结构化结果。
+- `ThreadRuntime.cancel_turn()` 会取消当前模型或工具协程并返回 `CANCELLED` Summary；命令
+  工具沿既有 `CommandSandboxBackend` contract 终止整个进程组。RunController 还提供审批
+  deadline 暂停/恢复语义，供 Ticket 07 的 Policy 审批流程组合；全局并发上限与 workspace
+  lease 由 Ticket 06 接入。
 
 ## User Stories
 

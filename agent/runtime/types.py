@@ -17,9 +17,12 @@ class ThreadStatus(str, Enum):
 
 
 class TurnStatus(str, Enum):
-    """Terminal status exposed for the first Runtime tracer bullet."""
+    """Terminal state of one public Turn summary."""
 
     COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    LIMIT_REACHED = "limit_reached"
 
 
 SCHEMA_VERSION = 1
