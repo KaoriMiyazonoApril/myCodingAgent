@@ -31,6 +31,7 @@ from agent.model.types import (
 from agent.runtime import (
     AgentLimits,
     ModelSettings,
+    PolicyDecision,
     SettingsConflictError,
     ThinkingKeep,
     ThinkingSettings,
@@ -1542,4 +1543,328 @@ def test_global_active_turn_limit_fails_closed(max_active_turns) -> None:
             ),
             tool_registry_factory=empty_tools,
             max_active_turns=max_active_turns,
+        )
+
+
+class FixedPolicy:
+    def __init__(self, decision: PolicyDecision) -> None:
+        self.decision = decision
+        self.calls: list[ToolCallBlock] = []
+
+    def decide(self, call: ToolCallBlock) -> PolicyDecision:
+        self.calls.append(call)
+        return self.decision
+
+
+def recording_registry(executions: list[str]) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="record",
+            description="Record a value.",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        ),
+        lambda arguments: (
+            executions.append(str(arguments["value"]))
+            or ToolResult(content="recorded", metadata={})
+        ),
+    )
+    return registry
+
+
+def test_default_policy_allows_valid_tools(tmp_path) -> None:
+    executions: list[str] = []
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="allowed", name="record", arguments={"value": "yes"}
+                )
+            ),
+            final_response("Allowed by default."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=lambda _: recording_registry(executions),
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Use the tool."))
+
+    assert executions == ["yes"]
+    assert summary.status is TurnStatus.COMPLETED
+
+
+def test_policy_denial_returns_structured_result_and_continues(tmp_path) -> None:
+    executions: list[str] = []
+    policy = FixedPolicy(PolicyDecision.DENY)
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="denied", name="record", arguments={"value": "never"}
+                )
+            ),
+            final_response("Adapted after denial."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=lambda _: recording_registry(executions),
+        tool_policy=policy,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Respect policy."))
+
+    assert executions == []
+    assert len(policy.calls) == 1
+    assert summary.status is TurnStatus.COMPLETED
+    denied_result = provider.requests[1].messages[-1].content[0]
+    assert isinstance(denied_result, ToolResultBlock)
+    assert denied_result.error_code == "POLICY_DENIED"
+
+
+def test_policy_failure_preserves_complete_tool_history_for_the_next_turn(
+    tmp_path,
+) -> None:
+    class BrokenPolicy:
+        def decide(self, call: ToolCallBlock) -> PolicyDecision:
+            raise RuntimeError("private policy failure")
+
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(id="broken-first", name="missing", arguments={}),
+                ToolCallBlock(id="broken-second", name="missing", arguments={}),
+            ),
+            final_response("A later Turn still works."),
+        ]
+    )
+    runtime = runtime_for_provider(provider, tool_policy=BrokenPolicy())
+    thread = runtime.create_thread(tmp_path)
+
+    failed = asyncio.run(runtime.run_turn(thread.thread_id, "Policy fails."))
+    recovered = asyncio.run(runtime.run_turn(thread.thread_id, "Continue safely."))
+
+    assert failed.status is TurnStatus.FAILED
+    assert recovered.status is TurnStatus.COMPLETED
+    tool_results = [
+        message.content[0]
+        for message in provider.requests[1].messages
+        if message.role == "tool"
+    ]
+    assert [result.tool_call_id for result in tool_results] == [
+        "broken-first",
+        "broken-second",
+    ]
+    assert all(result.error_code == "INTERNAL_ERROR" for result in tool_results)
+    assert "private policy failure" not in json.dumps(
+        runtime.get_snapshot(thread.thread_id).to_dict()
+    )
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_external_approval_resumes_with_execution_or_policy_denial(
+    tmp_path,
+    approved,
+) -> None:
+    async def scenario():
+        executions: list[str] = []
+        provider = ScriptedProvider(
+            [
+                tool_response(
+                    ToolCallBlock(
+                        id="approval-call",
+                        name="record",
+                        arguments={"value": "approved"},
+                    )
+                ),
+                final_response("Approval resolved."),
+            ]
+        )
+        runtime = runtime_for_provider(
+            provider,
+            tool_registry_factory=lambda _: recording_registry(executions),
+            tool_policy=FixedPolicy(PolicyDecision.REQUIRE_APPROVAL),
+        )
+        thread = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(runtime.run_turn(thread.thread_id, "Ask first."))
+        for _ in range(100):
+            if runtime.get_snapshot(thread.thread_id).status is ThreadStatus.WAITING_APPROVAL:
+                break
+            await asyncio.sleep(0.005)
+        snapshot = runtime.get_snapshot(thread.thread_id)
+        assert snapshot.status is ThreadStatus.WAITING_APPROVAL
+        approval_event = next(
+            event
+            for event in runtime.get_events(thread.thread_id).events
+            if event.type == "approval_requested"
+        )
+        approval_id = approval_event.payload["approval_id"]
+        assert runtime.resolve_approval(
+            thread.thread_id,
+            approval_id=approval_id,
+            approved=approved,
+        ) is True
+        summary = await active
+        return runtime, thread.thread_id, summary, executions, provider
+
+    runtime, thread_id, summary, executions, provider = asyncio.run(scenario())
+
+    assert summary.status is TurnStatus.COMPLETED
+    assert executions == (["approved"] if approved else [])
+    result = provider.requests[1].messages[-1].content[0]
+    assert isinstance(result, ToolResultBlock)
+    assert result.error_code is (None if approved else "POLICY_DENIED")
+    event_types = [event.type for event in runtime.get_events(thread_id).events]
+    assert event_types.index("approval_requested") < event_types.index(
+        "approval_resolved"
+    )
+
+
+def test_approval_wait_pauses_later_tools_and_execution_deadline(tmp_path) -> None:
+    async def scenario():
+        executions: list[str] = []
+        provider = ScriptedProvider(
+            [
+                tool_response(
+                    ToolCallBlock(
+                        id="first-approved",
+                        name="record",
+                        arguments={"value": "first"},
+                    ),
+                    ToolCallBlock(
+                        id="second-approved",
+                        name="record",
+                        arguments={"value": "second"},
+                    ),
+                ),
+                final_response("Both completed."),
+            ]
+        )
+        runtime = runtime_for_provider(
+            provider,
+            tool_registry_factory=lambda _: recording_registry(executions),
+            tool_policy=FixedPolicy(PolicyDecision.REQUIRE_APPROVAL),
+            approval_timeout_seconds=1,
+            default_settings=ModelSettings(
+                provider_config_id="test-provider",
+                model="test-model",
+                limits=AgentLimits(max_execution_seconds=0.03),
+            ),
+        )
+        thread = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(runtime.run_turn(thread.thread_id, "Approve both."))
+        approval_ids: list[str] = []
+        for expected_count in (1, 2):
+            for _ in range(100):
+                requested = [
+                    event
+                    for event in runtime.get_events(thread.thread_id).events
+                    if event.type == "approval_requested"
+                ]
+                if len(requested) >= expected_count:
+                    break
+                await asyncio.sleep(0.005)
+            assert executions == (["first"] if expected_count == 2 else [])
+            approval_id = requested[-1].payload["approval_id"]
+            approval_ids.append(approval_id)
+            await asyncio.sleep(0.04)
+            assert runtime.resolve_approval(
+                thread.thread_id,
+                approval_id=approval_id,
+                approved=True,
+            )
+        return await active, executions, approval_ids
+
+    summary, executions, approval_ids = asyncio.run(scenario())
+
+    assert summary.status is TurnStatus.COMPLETED
+    assert executions == ["first", "second"]
+    assert len(set(approval_ids)) == 2
+
+
+def test_approval_timeout_fails_turn_with_safe_reason(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(id="timeout", name="missing", arguments={})
+            )
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_policy=FixedPolicy(PolicyDecision.REQUIRE_APPROVAL),
+        approval_timeout_seconds=0.02,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Let approval expire."))
+
+    assert summary.status is TurnStatus.FAILED
+    assert summary.stop_reason == "approval_timeout"
+    assert summary.error == {
+        "code": "APPROVAL_TIMEOUT",
+        "message": "tool approval timed out",
+    }
+
+
+def test_cancelling_approval_wait_cancels_turn_and_releases_workspace(
+    tmp_path,
+) -> None:
+    async def scenario():
+        provider = ScriptedProvider(
+            [
+                tool_response(
+                    ToolCallBlock(id="cancel-approval", name="missing", arguments={})
+                ),
+                final_response("New turn."),
+            ]
+        )
+        runtime = runtime_for_provider(
+            provider,
+            tool_policy=FixedPolicy(PolicyDecision.REQUIRE_APPROVAL),
+        )
+        first = runtime.create_thread(tmp_path)
+        second = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(runtime.run_turn(first.thread_id, "Wait."))
+        for _ in range(100):
+            if runtime.get_snapshot(first.thread_id).status is ThreadStatus.WAITING_APPROVAL:
+                break
+            await asyncio.sleep(0.005)
+        assert runtime.cancel_turn(first.thread_id)
+        cancelled = await active
+        next_turn = await runtime.run_turn(second.thread_id, "Lease was released.")
+        return runtime, first.thread_id, cancelled, next_turn
+
+    runtime, thread_id, cancelled, next_turn = asyncio.run(scenario())
+
+    assert cancelled.status is TurnStatus.CANCELLED
+    assert next_turn.status is TurnStatus.COMPLETED
+    assert runtime.resolve_approval(
+        thread_id,
+        approval_id="stale",
+        approved=True,
+    ) is False
+
+
+@pytest.mark.parametrize("approval_timeout_seconds", [0, True, 3601])
+def test_approval_timeout_configuration_fails_closed(
+    approval_timeout_seconds,
+) -> None:
+    with pytest.raises(ValueError, match="approval_timeout_seconds"):
+        ThreadRuntime(
+            provider_resolver=lambda _config_id, _model: ScriptedProvider([]),
+            default_settings=ModelSettings(
+                provider_config_id="test-provider", model="test-model"
+            ),
+            tool_registry_factory=empty_tools,
+            approval_timeout_seconds=approval_timeout_seconds,
         )

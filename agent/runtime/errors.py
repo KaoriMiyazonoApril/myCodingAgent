@@ -33,3 +33,7 @@ class TurnLimitReached(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class ApprovalTimeoutError(RuntimeError):
+    """An external tool approval did not arrive before its own timeout."""

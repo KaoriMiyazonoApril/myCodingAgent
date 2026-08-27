@@ -77,13 +77,20 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   设置，同时为同一批次内未执行的工具调用补齐结构化结果。
 - `ThreadRuntime.cancel_turn()` 会取消当前模型或工具协程并返回 `CANCELLED` Summary；命令
   工具沿既有 `CommandSandboxBackend` contract 终止整个进程组。RunController 还提供审批
-  deadline 暂停/恢复语义，供 Ticket 07 的 Policy 审批流程组合；全局并发上限与 workspace
-  lease 由 Ticket 06 接入。
+  deadline 暂停/恢复语义，供 Policy 审批流程组合；全局并发上限与 workspace lease 已由
+  Ticket 06 接入。
 - Ticket 06 已实现相交 workspace 并发互斥：`WorkspaceLeaseManager` 在 Turn 启动时对真实
   规范化路径立即申请 lease，相同、祖先和后代路径均以 `WORKSPACE_BUSY` 拒绝且不排队；
   不相交 workspace 可以真正并发。Runtime 默认允许四个活跃 Turn，并通过后端构造参数在
   1–32 的硬范围内调整容量。多个空闲 Thread 仍可绑定同一 workspace，只有活跃 Turn 持有
   lease；完成、失败、取消和预算终止都在统一 `finally` 路径释放 lease。
+- Ticket 07 已实现 Policy 与外部审批：`ToolCoordinator` 统一顺序执行、预算检查、Policy
+  决策、审批等待、工具结果补齐和生命周期事件，让 `AgentLoop` 只保留模型调用、完成判断与
+  一次工具批次委派。默认 `AllowAllPolicy` 只表达允许，不宣称识别危险命令；`DENY` 返回
+  `POLICY_DENIED`，`REQUIRE_APPROVAL` 把 Thread 切换为 `WAITING_APPROVAL` 并发出带独立 ID
+  的 `approval_requested`。调用方通过 `resolve_approval()` 批准或拒绝；取消与独立审批超时
+  均安全终止，审批等待通过 `RunController` 暂停执行 deadline 且始终继续持有 workspace
+  lease。
 
 ## User Stories
 

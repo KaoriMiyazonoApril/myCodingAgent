@@ -14,11 +14,17 @@ from agent.model.provider import LLMProvider
 from agent.tools.registry import ToolRegistry
 
 from .conversation import Conversation
-from .errors import SettingsConflictError, ThreadBusyError, TurnLimitReached
+from .errors import (
+    ApprovalTimeoutError,
+    SettingsConflictError,
+    ThreadBusyError,
+    TurnLimitReached,
+)
 from .events import EventBatch, EventBuffer, TurnEventEmitter, utc_now
 from .loop import AgentLoop
 from .model_invoker import ModelInvoker
 from .prompt import PromptBuilder
+from .policy import AllowAllPolicy, ToolPolicy
 from .run_controller import RunController
 from .settings import (
     ModelSettings,
@@ -27,6 +33,7 @@ from .settings import (
     TurnSettingsOverride,
 )
 from .types import SCHEMA_VERSION, ThreadSnapshot, ThreadStatus, TurnStatus, TurnSummary
+from .tool_coordinator import ToolCoordinator
 from .workspace_lease import WorkspaceLeaseManager
 
 
@@ -38,6 +45,7 @@ ProviderResolver = Callable[[str, str], LLMProvider]
 class _ActiveTurn:
     turn_id: str
     controller: RunController
+    tools: ToolCoordinator
     events: TurnEventEmitter
     started_at: str
 
@@ -73,6 +81,8 @@ class ThreadRuntime:
         reasoning_visibility: str = "hidden",
         model_retry_delays: tuple[float, ...] = (0.1, 0.2),
         max_active_turns: int = 4,
+        tool_policy: ToolPolicy | None = None,
+        approval_timeout_seconds: float = 5 * 60,
     ) -> None:
         if reasoning_visibility not in {"hidden", "debug"}:
             raise ValueError("reasoning_visibility must be 'hidden' or 'debug'")
@@ -89,6 +99,18 @@ class ThreadRuntime:
             for delay in model_retry_delays
         ):
             raise ValueError("model_retry_delays must be non-negative numbers")
+        if (
+            isinstance(approval_timeout_seconds, bool)
+            or not isinstance(approval_timeout_seconds, (int, float))
+            or not 0 < approval_timeout_seconds <= 60 * 60
+        ):
+            raise ValueError(
+                "approval_timeout_seconds must be greater than 0 and at most 3600"
+            )
+        if tool_policy is not None and not callable(
+            getattr(tool_policy, "decide", None)
+        ):
+            raise ValueError("tool_policy must provide decide(call)")
         self._tool_registry_factory = tool_registry_factory
         self._provider_resolver = provider_resolver
         self._default_settings = default_settings
@@ -101,6 +123,8 @@ class ThreadRuntime:
         self._reasoning_visibility = reasoning_visibility
         self._model_retry_delays = model_retry_delays
         self._workspace_leases = WorkspaceLeaseManager(max_active_turns)
+        self._tool_policy = tool_policy or AllowAllPolicy()
+        self._approval_timeout_seconds = approval_timeout_seconds
 
     def create_thread(self, workspace: Path) -> ThreadSnapshot:
         normalized_workspace = workspace.resolve()
@@ -172,9 +196,19 @@ class ThreadRuntime:
             current_task = asyncio.current_task()
             assert current_task is not None
             controller.bind(current_task)
+            tools = ToolCoordinator(
+                registry=record.tools,
+                conversation=record.conversation,
+                events=events,
+                controller=controller,
+                policy=self._tool_policy,
+                approval_timeout_seconds=self._approval_timeout_seconds,
+                set_waiting=lambda waiting: self._set_waiting(record, waiting),
+            )
             active_turn = _ActiveTurn(
                 turn_id=turn_id,
                 controller=controller,
+                tools=tools,
                 events=events,
                 started_at=utc_now(),
             )
@@ -212,7 +246,7 @@ class ThreadRuntime:
         try:
             outcome = await self._loop.run(
                 record.conversation,
-                record.tools,
+                active_turn.tools,
                 model,
                 active_turn.events,
                 controller,
@@ -242,6 +276,19 @@ class ThreadRuntime:
                 stop_reason="cancelled",
                 final_text=controller.last_assistant_text,
                 event_type="turn_cancelled",
+            )
+        except ApprovalTimeoutError:
+            return self._finish_turn(
+                record,
+                active_turn,
+                status=TurnStatus.FAILED,
+                stop_reason="approval_timeout",
+                final_text=controller.last_assistant_text,
+                event_type="turn_failed",
+                error={
+                    "code": "APPROVAL_TIMEOUT",
+                    "message": "tool approval timed out",
+                },
             )
         except Exception as error:
             is_model_error = isinstance(error, LLMError)
@@ -288,6 +335,22 @@ class ThreadRuntime:
             active_turn.events.emit("turn_cancel_requested", {})
         return cancelled
 
+    def resolve_approval(
+        self,
+        thread_id: str,
+        *,
+        approval_id: str,
+        approved: bool,
+    ) -> bool:
+        """Resolve the active approval when both Thread and request ID match."""
+
+        if not isinstance(approved, bool):
+            raise ValueError("approved must be a boolean")
+        active_turn = self._threads[thread_id].active_turn
+        if active_turn is None:
+            return False
+        return active_turn.tools.resolve_approval(approval_id, approved)
+
     def update_settings(
         self,
         thread_id: str,
@@ -308,6 +371,13 @@ class ThreadRuntime:
         record.settings = updated
         record.updated_at = utc_now()
         return updated
+
+    @staticmethod
+    def _set_waiting(record: _ThreadRecord, waiting: bool) -> None:
+        record.status = (
+            ThreadStatus.WAITING_APPROVAL if waiting else ThreadStatus.RUNNING
+        )
+        record.updated_at = utc_now()
 
     @staticmethod
     def _snapshot(record: _ThreadRecord) -> ThreadSnapshot:

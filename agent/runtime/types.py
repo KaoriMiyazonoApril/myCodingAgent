@@ -14,6 +14,7 @@ class ThreadStatus(str, Enum):
 
     IDLE = "idle"
     RUNNING = "running"
+    WAITING_APPROVAL = "waiting_approval"
 
 
 class TurnStatus(str, Enum):
