@@ -64,7 +64,8 @@ reasoning 历史由 `ProviderCapabilities.reasoning_retention` 的三态策略�
 含 reasoning 的 assistant turn。适配器使用 `reasoning_input_field` 指定的字段发送保留
 内容，并依次从 `reasoning_output_fields` 声明的响应字段中解析 reasoning；因此网关若使用
 `reasoning_details` 等非默认字段，只需配置 capability，无需修改适配器。供应商私有的
-thinking 启用参数仍由调用方通过 `extra_body` 指定。
+thinking 启用参数在该底层边界仍通过 `extra_body` 指定。Agent Runtime 不向前端公开这个
+任意参数逃生口，而是从 allowlisted `ThinkingSettings` 生成受限的 `thinking` 对象。
 
 解析响应时，文本变成 `TextBlock`，能力声明匹配到的字符串 reasoning 字段变成
 `ReasoningBlock`。工具调用参数用 `json.loads` 解析为 `dict`。空参数
@@ -94,7 +95,8 @@ envelope：`ok`、`content`、`metadata`、`error_code` 会一起进入 tool mes
 退役的 `deepseek-chat` / `deepseek-reasoner` 特例；其 reasoning 使用
 `TOOL_CHAIN_ONLY`，且 tool-call assistant message 需要非 null content。Kimi/Moonshot
 预设使用 `ALWAYS`，与 preserved thinking 默认保留完整历史的行为对齐；只有调用方实际
-开启 thinking 时，才应通过 `extra_body` 传入相应的 `thinking.keep` 等私有参数。GLM
+开启 thinking 时，底层调用方可通过 `extra_body` 传入相应的 `thinking.keep` 等私有参数；
+Runtime 调用方则使用安全的 `ThinkingSettings`。GLM
 预设继续使用 `TOOL_CHAIN_ONLY`。API key 不会出现在 `ProviderConfig` 的默认 repr 中，
 示例也只从环境变量读取 key。
 

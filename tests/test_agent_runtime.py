@@ -1,14 +1,39 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from agent.core.messages import Message, TextBlock, ToolCallBlock, ToolResultBlock
+from agent.core.messages import (
+    Message,
+    ReasoningBlock,
+    TextBlock,
+    ToolCallBlock,
+    ToolResultBlock,
+)
+from agent.model.openai_compatible import OpenAICompatibleProvider
 from agent.model.provider import LLMProvider
-from agent.model.types import LLMRequest, LLMResponse, Usage
-from agent.runtime import ThreadBusyError, ThreadRuntime, ThreadStatus, TurnStatus
+from agent.model.types import (
+    LLMRequest,
+    LLMResponse,
+    ProviderCapabilities,
+    ProviderConfig,
+    ReasoningRetention,
+    Usage,
+)
+from agent.runtime import (
+    ModelSettings,
+    SettingsConflictError,
+    ThinkingKeep,
+    ThinkingSettings,
+    ThreadBusyError,
+    ThreadRuntime,
+    ThreadStatus,
+    TurnStatus,
+)
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
 from tests.sandbox_support import create_test_tool_registry
@@ -45,8 +70,393 @@ class PausingProvider(LLMProvider):
         )
 
 
+class PausingToolProvider(LLMProvider):
+    """Pause the first request, then require one tool iteration."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.requests: list[LLMRequest] = []
+
+    async def chat(self, request: LLMRequest) -> LLMResponse:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            self.started.set()
+            await self.release.wait()
+            return LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[
+                        ToolCallBlock(
+                            id="call_missing",
+                            name="missing",
+                            arguments={},
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+                usage=Usage(),
+            )
+        answer = "First turn complete." if len(self.requests) == 2 else "Next turn."
+        return LLMResponse(
+            message=Message(role="assistant", content=[TextBlock(text=answer)]),
+            finish_reason="stop",
+            usage=Usage(),
+        )
+
+
+class RecordingCompletions:
+    """External SDK boundary fake that records encoded request payloads."""
+
+    def __init__(self, responses: list[object]) -> None:
+        self._responses = iter(responses)
+        self.requests: list[dict[str, object]] = []
+
+    async def create(self, **payload):
+        self.requests.append(payload)
+        return next(self._responses)
+
+
+def sdk_response(
+    text: str,
+    *,
+    reasoning_content: str | None = None,
+) -> object:
+    message = SimpleNamespace(
+        role="assistant",
+        content=text,
+        tool_calls=None,
+        reasoning_content=reasoning_content,
+    )
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="stop")],
+        usage=None,
+    )
+
+
 def empty_tools(_: Path) -> ToolRegistry:
     return ToolRegistry()
+
+
+def runtime_for_provider(
+    provider: LLMProvider,
+    *,
+    tool_registry_factory=empty_tools,
+    default_settings: ModelSettings | None = None,
+    additional_system_instructions: str | None = None,
+) -> ThreadRuntime:
+    return ThreadRuntime(
+        provider_resolver=lambda _config_id, _model: provider,
+        default_settings=default_settings
+        or ModelSettings(provider_config_id="test-provider", model="test-model"),
+        tool_registry_factory=tool_registry_factory,
+        additional_system_instructions=additional_system_instructions,
+    )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: ModelSettings(provider_config_id="   ", model="model"),
+        lambda: ModelSettings(provider_config_id="provider", model=1),
+        lambda: ModelSettings(
+            provider_config_id="provider", model="model", temperature=True
+        ),
+        lambda: ModelSettings(
+            provider_config_id="provider", model="model", max_tokens=0
+        ),
+        lambda: ModelSettings(
+            provider_config_id="provider",
+            model="model",
+            thinking=ThinkingSettings(enabled=False, budget_tokens=1),
+        ),
+    ],
+)
+def test_public_model_settings_fail_closed(factory) -> None:
+    with pytest.raises(ValueError):
+        factory()
+
+
+def test_completed_thread_accepts_a_second_turn_with_preserved_history(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(
+                    role="assistant", content=[TextBlock(text="First answer.")]
+                ),
+                finish_reason="stop",
+                usage=Usage(),
+            ),
+            LLMResponse(
+                message=Message(
+                    role="assistant", content=[TextBlock(text="Second answer.")]
+                ),
+                finish_reason="stop",
+                usage=Usage(),
+            ),
+        ]
+    )
+    resolved: list[tuple[str, str]] = []
+
+    def resolve_provider(provider_config_id: str, model: str) -> LLMProvider:
+        resolved.append((provider_config_id, model))
+        return provider
+
+    runtime = ThreadRuntime(
+        provider_resolver=resolve_provider,
+        default_settings=ModelSettings(
+            provider_config_id="course-provider",
+            model="course-model",
+        ),
+        tool_registry_factory=empty_tools,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    first = asyncio.run(runtime.run_turn(thread.thread_id, "First question."))
+    second = asyncio.run(runtime.run_turn(thread.thread_id, "Second question."))
+
+    assert first.final_text == "First answer."
+    assert second.final_text == "Second answer."
+    assert resolved == [
+        ("course-provider", "course-model"),
+        ("course-provider", "course-model"),
+    ]
+    assert provider.requests[1].messages == [
+        provider.requests[0].messages[0],
+        Message(role="user", content=[TextBlock(text="First question.")]),
+        Message(role="assistant", content=[TextBlock(text="First answer.")]),
+        Message(role="user", content=[TextBlock(text="Second question.")]),
+    ]
+
+
+def test_thread_settings_reject_a_stale_version_without_overwriting(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider([])
+    runtime = runtime_for_provider(
+        provider,
+        default_settings=ModelSettings(
+            provider_config_id="provider-a",
+            model="model-a",
+            temperature=0.2,
+            max_tokens=1000,
+        ),
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    updated = runtime.update_settings(
+        thread.thread_id,
+        expected_version=0,
+        settings=ModelSettings(
+            provider_config_id="provider-b",
+            model="model-b",
+            temperature=0.7,
+            max_tokens=2000,
+        ),
+    )
+
+    assert updated.version == 1
+    assert updated.provider_config_id == "provider-b"
+    assert runtime.get_snapshot(thread.thread_id).settings == updated
+    with pytest.raises(SettingsConflictError) as captured:
+        runtime.update_settings(
+            thread.thread_id,
+            expected_version=0,
+            settings=ModelSettings(
+                provider_config_id="stale-provider",
+                model="stale-model",
+            ),
+        )
+    assert captured.value.code == "SETTINGS_CONFLICT"
+    assert runtime.get_snapshot(thread.thread_id).settings == updated
+
+
+def test_active_turn_freezes_settings_until_its_tool_chain_finishes(
+    tmp_path,
+) -> None:
+    async def scenario() -> tuple[list[LLMRequest], float | None]:
+        provider = PausingToolProvider()
+        runtime = runtime_for_provider(
+            provider,
+            default_settings=ModelSettings(
+                provider_config_id="provider",
+                model="model",
+                temperature=0.2,
+                max_tokens=1000,
+            ),
+        )
+        thread = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(
+            runtime.run_turn(thread.thread_id, "Start tool work.")
+        )
+        await provider.started.wait()
+        runtime.update_settings(
+            thread.thread_id,
+            expected_version=0,
+            settings=ModelSettings(
+                provider_config_id="provider",
+                model="model",
+                temperature=0.8,
+                max_tokens=2000,
+            ),
+        )
+        provider.release.set()
+        await active
+        await runtime.run_turn(thread.thread_id, "Use the new settings.")
+        return provider.requests, runtime.get_snapshot(thread.thread_id).settings.temperature
+
+    requests, current_temperature = asyncio.run(scenario())
+
+    assert [request.temperature for request in requests] == [0.2, 0.2, 0.8]
+    assert [request.max_tokens for request in requests] == [1000, 1000, 2000]
+    assert current_temperature == 0.8
+
+
+def test_one_turn_override_changes_provider_and_thinking_without_rewriting_defaults(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(role="assistant", content=[TextBlock(text="Override.")]),
+                finish_reason="stop",
+                usage=Usage(),
+            ),
+            LLMResponse(
+                message=Message(role="assistant", content=[TextBlock(text="Default.")]),
+                finish_reason="stop",
+                usage=Usage(),
+            ),
+        ]
+    )
+    resolved: list[tuple[str, str]] = []
+
+    def resolve_provider(provider_config_id: str, model: str) -> LLMProvider:
+        resolved.append((provider_config_id, model))
+        return provider
+
+    defaults = ModelSettings(
+        provider_config_id="provider-a",
+        model="model-a",
+        temperature=0.2,
+        max_tokens=1000,
+    )
+    override = ModelSettings(
+        provider_config_id="provider-b",
+        model="model-b",
+        temperature=0.9,
+        max_tokens=3000,
+        thinking=ThinkingSettings(
+            enabled=True,
+            budget_tokens=512,
+            keep=ThinkingKeep.ALL,
+        ),
+    )
+    runtime = ThreadRuntime(
+        provider_resolver=resolve_provider,
+        default_settings=defaults,
+        tool_registry_factory=empty_tools,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    asyncio.run(
+        runtime.run_turn(
+            thread.thread_id,
+            "Use an override.",
+            settings_override=override,
+        )
+    )
+    asyncio.run(runtime.run_turn(thread.thread_id, "Use defaults."))
+
+    assert resolved == [("provider-b", "model-b"), ("provider-a", "model-a")]
+    assert provider.requests[0].temperature == 0.9
+    assert provider.requests[0].max_tokens == 3000
+    assert provider.requests[0].extra_body == {
+        "thinking": {
+            "type": "enabled",
+            "budget_tokens": 512,
+            "keep": "all",
+        }
+    }
+    assert provider.requests[1].temperature == 0.2
+    assert provider.requests[1].extra_body is None
+    snapshot = runtime.get_snapshot(thread.thread_id)
+    assert snapshot.settings.provider_config_id == "provider-a"
+    assert snapshot.settings.version == 0
+
+
+def test_switching_models_reencodes_old_reasoning_and_keeps_secrets_private(
+    tmp_path,
+) -> None:
+    first_completions = RecordingCompletions(
+        [sdk_response("First answer.", reasoning_content="private chain")]
+    )
+    second_completions = RecordingCompletions([sdk_response("Second answer.")])
+    first_provider = OpenAICompatibleProvider(
+        ProviderConfig(
+            provider="first",
+            base_url="https://secret-first.invalid/v1",
+            api_key="first-secret-key",
+            model="model-a",
+            capabilities=ProviderCapabilities(
+                reasoning_retention=ReasoningRetention.ALWAYS,
+                reasoning_input_field="reasoning_content",
+            ),
+        ),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=first_completions)
+        ),
+    )
+    second_provider = OpenAICompatibleProvider(
+        ProviderConfig(
+            provider="second",
+            base_url="https://secret-second.invalid/v1",
+            api_key="second-secret-key",
+            model="model-b",
+            capabilities=ProviderCapabilities(
+                reasoning_retention=ReasoningRetention.NEVER,
+                reasoning_input_field=None,
+            ),
+        ),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=second_completions)
+        ),
+    )
+    providers = {"config-a": first_provider, "config-b": second_provider}
+    runtime = ThreadRuntime(
+        provider_resolver=lambda config_id, _model: providers[config_id],
+        default_settings=ModelSettings(
+            provider_config_id="config-a",
+            model="model-a",
+        ),
+        tool_registry_factory=empty_tools,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    asyncio.run(runtime.run_turn(thread.thread_id, "First question."))
+    runtime.update_settings(
+        thread.thread_id,
+        expected_version=0,
+        settings=ModelSettings(
+            provider_config_id="config-b",
+            model="model-b",
+        ),
+    )
+    asyncio.run(runtime.run_turn(thread.thread_id, "Second question."))
+
+    assert first_completions.requests[0]["model"] == "model-a"
+    second_payload = second_completions.requests[0]
+    assert second_payload["model"] == "model-b"
+    first_assistant = second_payload["messages"][2]
+    assert first_assistant["content"] == "First answer."
+    assert "reasoning_content" not in first_assistant
+    public_snapshot = repr(asdict(runtime.get_snapshot(thread.thread_id)))
+    assert "first-secret-key" not in public_snapshot
+    assert "second-secret-key" not in public_snapshot
+    assert "secret-first.invalid" not in public_snapshot
+    assert "secret-second.invalid" not in public_snapshot
 
 
 def test_user_can_complete_a_turn_without_tool_calls(tmp_path) -> None:
@@ -61,7 +471,7 @@ def test_user_can_complete_a_turn_without_tool_calls(tmp_path) -> None:
             )
         ]
     )
-    runtime = ThreadRuntime(provider=provider, tool_registry_factory=empty_tools)
+    runtime = runtime_for_provider(provider)
     thread = runtime.create_thread(tmp_path)
 
     summary = asyncio.run(runtime.run_turn(thread.thread_id, "Inspect the project."))
@@ -107,8 +517,9 @@ def test_model_can_use_a_real_file_tool_and_continue_to_a_final_answer(
             ),
         ]
     )
-    runtime = ThreadRuntime(
-        provider=provider, tool_registry_factory=create_test_tool_registry
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
     )
     thread = runtime.create_thread(tmp_path)
 
@@ -157,9 +568,8 @@ def test_additional_system_instructions_preserve_default_coding_rules(
             )
         ]
     )
-    runtime = ThreadRuntime(
-        provider=provider,
-        tool_registry_factory=empty_tools,
+    runtime = runtime_for_provider(
+        provider,
         additional_system_instructions="Follow the course rubric.",
     )
     thread = runtime.create_thread(tmp_path)
@@ -179,7 +589,7 @@ def test_additional_system_instructions_preserve_default_coding_rules(
 def test_thread_rejects_a_second_turn_while_one_is_running(tmp_path) -> None:
     async def scenario() -> tuple[TurnStatus, ThreadStatus]:
         provider = PausingProvider()
-        runtime = ThreadRuntime(provider=provider, tool_registry_factory=empty_tools)
+        runtime = runtime_for_provider(provider)
         thread = runtime.create_thread(tmp_path)
         first_turn = asyncio.create_task(
             runtime.run_turn(thread.thread_id, "Start the first turn.")
@@ -254,8 +664,9 @@ def test_multiple_tools_and_a_recoverable_error_preserve_result_order(
             or ToolResult(content="recorded", metadata={})
         ),
     )
-    runtime = ThreadRuntime(
-        provider=provider, tool_registry_factory=lambda _: registry
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=lambda _: registry,
     )
     thread = runtime.create_thread(tmp_path)
 

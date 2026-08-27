@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from .settings import ThreadSettings
+
 
 class ThreadStatus(str, Enum):
     """Whether a Thread can currently accept a new Turn."""
@@ -28,6 +30,7 @@ class ThreadSnapshot:
     status: ThreadStatus
     active_turn_id: str | None
     completed_turns: int
+    settings: ThreadSettings
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,4 +43,3 @@ class TurnSummary:
     final_text: str
     iterations: int
     tool_calls: int
-

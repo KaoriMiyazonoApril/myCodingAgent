@@ -38,11 +38,9 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 
 - Ticket 01 的最小 tracer bullet 已完成：调用方可通过 `ThreadRuntime` 创建内存 Thread、
   提交一个 Turn，并让完整模型响应与现有工具注册表顺序循环，直至模型返回最终文本。
-- 当前公开结果只包含基础 Thread 生命周期与 Turn 的最终文本、迭代数和工具调用数；完整
-  settings、事件、预算、跨 workspace 并发、Policy、diff 与严格链接安全仍由后续 ticket
-  实现。
-- 第一阶段使用单个注入的 `LLMProvider` 和按 workspace 构造的 `ToolRegistry`。模型切换
-  与版本化设置将在多轮设置阶段扩展，不属于当前 tracer bullet。
+- 当前公开结果包含基础 Thread 生命周期、版本化安全设置，以及 Turn 的最终文本、迭代数
+  和工具调用数；事件、预算、跨 workspace 并发、Policy、diff 与严格链接安全仍由后续
+  ticket 实现。
 - `PromptBuilder` 已提供供应商无关的默认 coding-agent 约束，并把 Runtime 附加指令置于
   默认约束之后，避免调用方定制时覆盖 workspace 路径、文件工具、错误处理和验证要求。
 - Runtime 集成测试通过临时 workspace 中的真实 `read_file` 工具验证闭环；更完整的
@@ -51,6 +49,11 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   共享 capability probe、输出、超时和取消 contract。普通 Runtime 测试不再要求开发主机
   可运行 Bubblewrap，生产组合仍 fail-fast 且绝不回退到 host shell。严格 workspace 链接
   禁令仍属于后续安全 ticket。
+- Ticket 03 已实现多 Turn 与设置冻结：`Conversation` 独占合法历史，Runtime 通过公开
+  provider 配置 ID 和模型解析每个 Turn 的 `LLMProvider`，`ModelInvoker` 将冻结的
+  temperature、max tokens 与 allowlisted thinking 设置应用于整个工具链。默认设置更新
+  使用单调版本和 `SETTINGS_CONFLICT`，一次性完整 override 不改写 Thread 默认值；API key、
+  base URL 与任意 `extra_body` 均不属于公开设置。
 
 ## User Stories
 
