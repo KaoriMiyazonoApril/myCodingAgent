@@ -116,6 +116,10 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   清理路径释放 workspace lease 后进入 `CLOSED`。关闭操作幂等，快照和历史仍可读取；新的
   Turn 与设置修改以 `THREAD_CLOSED` 拒绝。验收测试通过真实文件与命令工具覆盖正常
   read/edit/test/diff 链路及 failed-test reporting，而不是只断言伪造的内部调用。
+- Review Ticket 01 已收紧同步工具取消语义：同步 executor 收到取消或执行 deadline 后先在
+  worker thread 中运行至静止，`RunController` 再把已完成的真实 `ToolResult` 交给
+  `ToolCoordinator` 记录历史、diff 与事件，随后按原请求终止 Turn。workspace lease 只在该
+  协调完成后释放，因此相交 Turn 不会与失去所有权的后台写线程并发。
 
 ## User Stories
 
@@ -214,6 +218,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - `Conversation` owns ordered internal `Message` values and constructs each model request history. It preserves valid tool-call/tool-result pairings and delegates provider-specific reasoning encoding to existing model capabilities. Switching models between Turns retains text and tool history while allowing the selected provider adapter to filter reasoning according to its capabilities.
 - `ModelInvoker` wraps the existing `LLMProvider` seam. It applies immutable Turn generation settings and retries only errors whose existing taxonomy marks `retryable`. The default is at most three attempts with short exponential backoff. Authentication, invalid request, configuration, and response-parse failures do not retry.
 - `ToolCoordinator` wraps the existing `ToolRegistry` execution seam without moving tool capability behavior into the Runtime. It executes calls sequentially, consults Policy, manages an approval pause, emits lifecycle events, propagates cancellation, converts results to conversation blocks, and ensures every accepted call receives a corresponding result.
+- Synchronous registry executors run in worker threads that cannot be forcibly stopped by coroutine cancellation. Their async dispatch therefore defers cancellation propagation until the worker is quiescent and marks the reconciled result internally. `RunController` returns only that marked result to `ToolCoordinator`, which records its actual history and file effects before a cancellation or deadline checkpoint terminates the Turn. The workspace lease remains held throughout this reconciliation.
 - Policy has three decisions: `ALLOW`, `DENY`, and `REQUIRE_APPROVAL`. The initial adapter allows all valid calls. `DENY` produces a safe `POLICY_DENIED` tool result. `REQUIRE_APPROVAL` changes the Thread to `WAITING_APPROVAL`, stops launching later calls, and awaits an external decision or an independent approval timeout.
 - `RunController` is the single source of truth for one Turn's maximum iterations, maximum tool calls, execution deadline, cancellation, approval-clock suspension, and repeated-failure detection. `ThreadRuntime` owns the shared active-Turn capacity. Defaults are 20 model iterations, 50 tool calls, 15 minutes of execution time, three identical consecutive failures, and four active Turns globally.
 - A repeated failure fingerprint consists of tool name, canonically normalized arguments, and error code. Only three consecutive identical fingerprints stop a Turn. Different failed operations do not count as one repeated sequence.

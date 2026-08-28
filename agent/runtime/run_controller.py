@@ -141,13 +141,29 @@ class RunController:
                     continue
 
                 operation_task.cancel()
-                await asyncio.gather(operation_task, return_exceptions=True)
+                outcome = (await asyncio.gather(
+                    operation_task,
+                    return_exceptions=True,
+                ))[0]
                 await self._cancel_tasks(control_tasks)
+                if (
+                    isinstance(outcome, ToolResult)
+                    and outcome._settled_after_cancellation
+                ):
+                    return outcome  # type: ignore[return-value]
                 raise TurnLimitReached("execution_timeout")
         except asyncio.CancelledError:
             operation_task.cancel()
             await self._cancel_tasks(control_tasks)
-            await asyncio.gather(operation_task, return_exceptions=True)
+            outcome = (await asyncio.gather(
+                operation_task,
+                return_exceptions=True,
+            ))[0]
+            if (
+                isinstance(outcome, ToolResult)
+                and outcome._settled_after_cancellation
+            ):
+                return outcome  # type: ignore[return-value]
             raise
 
     def pause_deadline(self) -> None:

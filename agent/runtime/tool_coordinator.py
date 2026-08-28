@@ -126,10 +126,22 @@ class ToolCoordinator:
             self._record(call, result)
             try:
                 self._controller.record_tool_result(call, result)
-            except TurnLimitReached:
+                self._controller.checkpoint()
+            except TurnLimitReached as error:
                 self._append_skipped(
                     calls[index + 1 :],
-                    reason="repeated tool failure limit reached",
+                    reason=(
+                        "repeated tool failure limit reached"
+                        if error.reason == "repeated_tool_failure"
+                        else "Turn execution deadline reached"
+                    ),
+                )
+                raise
+            except asyncio.CancelledError:
+                self._append_skipped(
+                    calls[index + 1 :],
+                    reason="Turn cancelled",
+                    error_code="CANCELLED",
                 )
                 raise
 

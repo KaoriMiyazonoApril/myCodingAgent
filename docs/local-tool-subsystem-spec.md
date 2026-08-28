@@ -63,7 +63,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 - `ToolResult.to_message_block` binds an execution result to a tool call. The model adapter serializes `ok`, content, metadata, and error code together as a JSON tool-message envelope.
 - The common executable-tool interface accepts an existing, already accepted tool call and returns an execution result. Individual tools contain capability behavior only: they do not perform approval, permission-policy, UI, agent-loop, or conversation-history work.
 - The registry is a deep module with a small interface: registration, lookup, definition enumeration, and consistent execution dispatch. It owns no workspace configuration, file system, process service, policy, or runtime state.
-- The registry offers synchronous `execute` for CLI/tests and `execute_async` for Agent Loop/UI callers. Ordinary synchronous tools use a worker thread; tools with an async executor, notably `run_command`, remain natively async and cancellable.
+- The registry offers synchronous `execute` for CLI/tests and `execute_async` for Agent Loop/UI callers. Ordinary synchronous tools use a worker thread; cancellation waits for that worker to become quiescent and marks its returned result for Runtime reconciliation before the Turn may release shared state. Tools with an async executor, notably `run_command`, remain natively async and cancellable.
 - Runtime composition is explicit: it constructs shared filesystem and process modules from the configured workspace, injects those modules into tools, then registers tools. No global workspace configuration is introduced.
 - A filesystem module centralizes relative-path normalization, absolute-path rejection, workspace containment, final symlink containment, UTF-8 validation, regular-file validation, atomic text replacement, and controlled traversal. It accepts `/` path separators at the tool interface and returns workspace-relative POSIX paths.
 - Absolute paths and any lexical or resolved path escaping the workspace are rejected. An internal symlink is usable only when its resolved target remains inside the configured workspace. During `glob` and `grep`, a file symlink is followed only when its resolved target also remains below the caller-selected `path`; directory symlinks are not traversed.
@@ -122,7 +122,9 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
   metadata 中返回 stdout、stderr、持续时间、退出码、`command_succeeded`、sandbox、
   超时和截断状态。非零退出返回 `COMMAND_FAILED`，超时返回 `TIMEOUT`。
 - `registry.py` 的 `ToolRegistry` 提供注册、查找、定义列举及对既有
-  `ToolCallBlock` 的统一分派；它不保存任何工作区配置。
+  `ToolCallBlock` 的统一分派；它不保存任何工作区配置。同步工具在 worker thread 中执行，
+  取消或 deadline 到达时会先等待 worker 静止，再把实际结果交还 Runtime 记录，避免后台
+  文件修改越过 workspace lease 生命周期。
 - `local.py` 显式组合共享的文件系统与进程服务，并注册
   `read_file`、`write_file`、`edit_file`、`glob`、`grep`、`run_command` 六个工具。
   组合函数可显式接收一个 `CommandSandboxBackend`；未提供时只使用生产 Bubblewrap，

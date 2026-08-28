@@ -4,9 +4,9 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] 取消或超时时，Runtime 等待同步工具执行真正静止后再释放 workspace lease。
-- [ ] 同步工具在取消请求后完成的文件变化进入 diff/event，或在无法完整恢复时明确报告 `diff_complete=false`。
-- [ ] 相交 workspace 的下一 Turn 在旧同步工具仍可能写入时继续得到 `WORKSPACE_BUSY`。
-- [ ] 命令工具的进程组取消语义保持不变，并有 Runtime seam 回归测试。
+- [x] 取消或超时时，Runtime 等待同步工具执行真正静止后再释放 workspace lease。
+- [x] 同步工具在取消请求后完成的文件变化进入 diff/event，或在无法完整恢复时明确报告 `diff_complete=false`。
+- [x] 相交 workspace 的下一 Turn 在旧同步工具仍可能写入时继续得到 `WORKSPACE_BUSY`。
+- [x] 命令工具的进程组取消语义保持不变，并有 Runtime seam 回归测试。

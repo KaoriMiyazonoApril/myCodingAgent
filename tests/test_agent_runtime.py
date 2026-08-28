@@ -5,6 +5,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -1721,6 +1722,178 @@ def test_cancelling_run_command_terminates_its_process_group(tmp_path) -> None:
     assert summary.status is TurnStatus.CANCELLED
     with pytest.raises(ProcessLookupError):
         os.kill(process_id, 0)
+
+
+def test_cancelling_a_sync_file_tool_keeps_lease_until_changes_are_tracked(
+    tmp_path,
+) -> None:
+    async def scenario() -> tuple[TurnSummary, TurnSummary]:
+        started = threading.Event()
+        release = threading.Event()
+        target = tmp_path / "result.txt"
+
+        def slow_write(arguments: dict[str, object]) -> ToolResult:
+            started.set()
+            if not release.wait(timeout=2):
+                raise RuntimeError("test did not release slow write")
+            content = str(arguments["content"])
+            target.write_text(content, encoding="utf-8")
+            return ToolResult(
+                content="write completed",
+                metadata={"path": "result.txt", "bytes_written": len(content)},
+            )
+
+        def tools(_: Path) -> ToolRegistry:
+            registry = ToolRegistry()
+            registry.register(
+                ToolDefinition(
+                    name="write_file",
+                    description="Write one file slowly",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["path", "content"],
+                        "additionalProperties": False,
+                    },
+                ),
+                slow_write,
+            )
+            return registry
+
+        provider = ScriptedProvider(
+            [
+                tool_response(
+                    ToolCallBlock(
+                        id="slow-write",
+                        name="write_file",
+                        arguments={"path": "result.txt", "content": "done\n"},
+                    )
+                ),
+                final_response("Next turn completed."),
+            ]
+        )
+        runtime = runtime_for_provider(provider, tool_registry_factory=tools)
+        first = runtime.create_thread(tmp_path)
+        second = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(runtime.run_turn(first.thread_id, "Write slowly."))
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+        assert runtime.cancel_turn(first.thread_id)
+        try:
+            await asyncio.sleep(0)
+            assert not active.done()
+            with pytest.raises(WorkspaceBusyError):
+                await runtime.run_turn(second.thread_id, "Must remain blocked.")
+        finally:
+            release.set()
+        cancelled = await active
+        next_turn = await runtime.run_turn(second.thread_id, "Now continue.")
+        return cancelled, next_turn
+
+    cancelled, next_turn = asyncio.run(scenario())
+
+    assert cancelled.status is TurnStatus.CANCELLED
+    assert cancelled.modified_files == ["result.txt"]
+    assert cancelled.diff_complete is True
+    assert "+done" in cancelled.file_diffs[0]["diff"]
+    assert (tmp_path / "result.txt").read_text(encoding="utf-8") == "done\n"
+    assert next_turn.status is TurnStatus.COMPLETED
+
+
+def test_sync_file_tool_timeout_waits_for_quiescence_and_tracks_final_change(
+    tmp_path,
+) -> None:
+    async def scenario() -> tuple[TurnSummary, TurnSummary]:
+        started = threading.Event()
+        release = threading.Event()
+        target = tmp_path / "timed.txt"
+
+        def slow_write(arguments: dict[str, object]) -> ToolResult:
+            started.set()
+            if not release.wait(timeout=2):
+                raise RuntimeError("test did not release timed write")
+            content = str(arguments["content"])
+            target.write_text(content, encoding="utf-8")
+            return ToolResult(
+                content="write completed",
+                metadata={"path": "timed.txt", "bytes_written": len(content)},
+            )
+
+        def tools(_: Path) -> ToolRegistry:
+            registry = ToolRegistry()
+            registry.register(
+                ToolDefinition(
+                    name="write_file",
+                    description="Write one file after the deadline",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["path", "content"],
+                        "additionalProperties": False,
+                    },
+                ),
+                slow_write,
+            )
+            return registry
+
+        provider = ScriptedProvider(
+            [
+                tool_response(
+                    ToolCallBlock(
+                        id="timed-write",
+                        name="write_file",
+                        arguments={"path": "timed.txt", "content": "late\n"},
+                    )
+                ),
+                final_response("Next turn completed."),
+            ]
+        )
+        runtime = runtime_for_provider(
+            provider,
+            tool_registry_factory=tools,
+            default_settings=ModelSettings(
+                provider_config_id="test-provider",
+                model="test-model",
+                limits=AgentLimits(max_execution_seconds=0.02),
+            ),
+        )
+        first = runtime.create_thread(tmp_path)
+        second = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(runtime.run_turn(first.thread_id, "Write late."))
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+        try:
+            await asyncio.sleep(0.04)
+            assert not active.done()
+            with pytest.raises(WorkspaceBusyError):
+                await runtime.run_turn(second.thread_id, "Must remain blocked.")
+        finally:
+            release.set()
+        limited = await active
+        next_turn = await runtime.run_turn(
+            second.thread_id,
+            "Now continue.",
+            settings_override=TurnSettingsOverride(
+                limits=AgentLimits(max_execution_seconds=1),
+            ),
+        )
+        return limited, next_turn
+
+    limited, next_turn = asyncio.run(scenario())
+
+    assert limited.status is TurnStatus.LIMIT_REACHED
+    assert limited.stop_reason == "execution_timeout"
+    assert limited.modified_files == ["timed.txt"]
+    assert limited.diff_complete is True
+    assert "+late" in limited.file_diffs[0]["diff"]
+    assert (tmp_path / "timed.txt").read_text(encoding="utf-8") == "late\n"
+    assert next_turn.status is TurnStatus.COMPLETED
 
 
 def test_turns_in_unrelated_workspaces_run_concurrently(tmp_path) -> None:

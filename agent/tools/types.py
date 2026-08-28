@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -101,6 +101,12 @@ class ToolResult:
     content: str
     metadata: dict[str, Any]
     error_code: str | None = None
+    _settled_after_cancellation: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def is_error(self) -> bool:

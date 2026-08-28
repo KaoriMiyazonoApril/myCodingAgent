@@ -82,7 +82,16 @@ class ToolRegistry:
         """Dispatch without blocking an async Agent Loop or UI event loop."""
         registered = self._tools.get(call.name)
         if registered is None or registered[2] is None:
-            return await asyncio.to_thread(self.execute, call)
+            worker = asyncio.create_task(asyncio.to_thread(self.execute, call))
+            cancellation_seen = False
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancellation_seen = True
+            result = worker.result()
+            result._settled_after_cancellation = cancellation_seen
+            return result
         if call.arguments_error is not None:
             return self.execute(call)
         try:
