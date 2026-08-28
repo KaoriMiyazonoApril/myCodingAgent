@@ -7,6 +7,12 @@ class ThreadBusyError(RuntimeError):
     code = "THREAD_BUSY"
 
 
+class ThreadClosedError(RuntimeError):
+    """A closed Thread cannot accept commands that mutate its state."""
+
+    code = "THREAD_CLOSED"
+
+
 class WorkspaceBusyError(RuntimeError):
     """A workspace overlaps an active Turn or global capacity is full."""
 

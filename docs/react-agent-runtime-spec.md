@@ -43,8 +43,8 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   同时具备保守的上下文容量预检与 Turn 提交幂等。
 - `PromptBuilder` 已提供供应商无关的默认 coding-agent 约束，并把 Runtime 附加指令置于
   默认约束之后，避免调用方定制时覆盖 workspace 路径、文件工具、错误处理和验证要求。
-- Runtime 集成测试通过临时 workspace 中的真实 `read_file` 工具验证闭环；更完整的
-  read/edit/test/diff 场景随 ChangeTracker 和运行控制阶段补充。
+- Runtime 集成测试通过临时 workspace 中的真实本地工具验证 read/edit/test/diff 完整闭环，
+  并单独验证非零测试退出码作为结构化失败回传给模型后由最终答复诚实报告。
 - Ticket 02 已提取公共 `CommandSandboxBackend`：生产 Bubblewrap 与确定性测试 adapter
   共享 capability probe、输出、超时和取消 contract。普通 Runtime 测试不再要求开发主机
   可运行 Bubblewrap，生产组合仍 fail-fast 且绝不回退到 host shell。Ticket 09 已在生产
@@ -111,6 +111,11 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   error code 的失败 Summary，历史从不被静默删除或总结。`run_turn()` 接受有界
   `idempotency_key`；同 key、同 payload 的进行中重试等待原 Turn，完成后重试返回原 Summary，
   不同 payload 复用同 key 明确返回 `IDEMPOTENCY_CONFLICT`，不会创建第二个 Turn。
+- Ticket 11 已补齐 Thread 关闭生命周期与最终验收：`close_thread()` 对空闲 Thread 立即进入
+  `CLOSED`，对活跃 Thread 发出 `thread_close_requested`、取消当前模型或工具操作，并在统一
+  清理路径释放 workspace lease 后进入 `CLOSED`。关闭操作幂等，快照和历史仍可读取；新的
+  Turn 与设置修改以 `THREAD_CLOSED` 拒绝。验收测试通过真实文件与命令工具覆盖正常
+  read/edit/test/diff 链路及 failed-test reporting，而不是只断言伪造的内部调用。
 
 ## User Stories
 
@@ -203,7 +208,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 
 - `Thread` is the long-lived conversation concept. It owns one immutable, normalized workspace reference, ordered conversation history, mutable default settings, a current status, an optional active Turn ID, and timestamps. Thread data is in-memory in the first version.
 - `Turn` is one user message plus one complete ReAct execution. A Thread may have many sequential Turns. A new Turn may be submitted only while its Thread is `IDLE`; submission changes the state atomically so two callers cannot both start.
-- Thread states are `IDLE`, `RUNNING`, `WAITING_APPROVAL`, and `CLOSED`. Turn states are `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, and `LIMIT_REACHED`. A completed, failed, cancelled, or limited Turn returns its Thread to `IDLE` unless the Thread is being closed.
+- Thread states are `IDLE`, `RUNNING`, `WAITING_APPROVAL`, and `CLOSED`. Turn states are `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, and `LIMIT_REACHED`. A completed, failed, cancelled, or limited Turn returns its Thread to `IDLE` unless the Thread is being closed. `close_thread()` is idempotent: it closes an idle Thread immediately, or marks an active Thread as closing, requests cancellation, and lets the existing terminal cleanup path release leases before publishing `CLOSED`. Snapshots and retained events remain readable after closure; commands that would mutate the Thread fail with `THREAD_CLOSED`.
 - `ThreadRuntime` is the highest external seam and the primary test surface. Its small interface covers Thread creation, settings updates, Turn submission, cancellation, approval resolution, event consumption, snapshot retrieval, and Thread closure. Transport adapters call this interface rather than reaching into Agent Loop modules.
 - The Agent Loop is deliberately narrow: request a model response, append the assistant message, finish if no tool calls exist, otherwise execute all calls in order and append all matching tool results. It does not implement retry, Policy, event serialization, file diffing, workspace locking, or provider-specific reasoning rules inline.
 - `Conversation` owns ordered internal `Message` values and constructs each model request history. It preserves valid tool-call/tool-result pairings and delegates provider-specific reasoning encoding to existing model capabilities. Switching models between Turns retains text and tool history while allowing the selected provider adapter to filter reasoning according to its capabilities.

@@ -38,7 +38,9 @@ from agent.runtime import (
     ThinkingKeep,
     ThinkingSettings,
     ThreadBusyError,
+    ThreadClosedError,
     ThreadRuntime,
+    ThreadSnapshot,
     ThreadStatus,
     TurnSettingsOverride,
     TurnStatus,
@@ -961,6 +963,110 @@ def test_model_can_use_a_real_file_tool_and_continue_to_a_final_answer(
     )
 
 
+def test_acceptance_read_edit_test_and_diff_loop_uses_real_local_tools(
+    tmp_path,
+) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("def answer():\n    return 1\n", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="accept-read",
+                    name="read_file",
+                    arguments={"path": "app.py"},
+                )
+            ),
+            tool_response(
+                ToolCallBlock(
+                    id="accept-edit",
+                    name="edit_file",
+                    arguments={
+                        "path": "app.py",
+                        "old_string": "return 1",
+                        "new_string": "return 2",
+                    },
+                )
+            ),
+            tool_response(
+                ToolCallBlock(
+                    id="accept-test",
+                    name="run_command",
+                    arguments={
+                        "command": (
+                            "python3 -c \"import app; "
+                            "assert app.answer() == 2; print('passed')\""
+                        )
+                    },
+                )
+            ),
+            final_response("Updated app.py and validation passed."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Change the answer."))
+
+    assert summary.status is TurnStatus.COMPLETED
+    assert summary.final_text == "Updated app.py and validation passed."
+    assert summary.iterations == 4
+    assert summary.tool_calls == 3
+    assert source.read_text(encoding="utf-8") == "def answer():\n    return 2\n"
+    assert summary.modified_files == ["app.py"]
+    assert "-    return 1" in summary.file_diffs[0]["diff"]
+    assert "+    return 2" in summary.file_diffs[0]["diff"]
+    assert summary.diff_complete is False
+    command_result = provider.requests[3].messages[-1].content[0]
+    assert isinstance(command_result, ToolResultBlock)
+    assert command_result.error_code is None
+    assert command_result.metadata["exit_code"] == 0
+    assert command_result.metadata["stdout"] == "passed\n"
+
+
+def test_acceptance_failed_validation_is_returned_to_the_model_and_reported(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="failed-test",
+                    name="run_command",
+                    arguments={
+                        "command": (
+                            "python3 -c \"import sys; "
+                            "print('test failed', file=sys.stderr); sys.exit(3)\""
+                        )
+                    },
+                )
+            ),
+            final_response("Validation failed with exit status 3; no success claimed."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Run validation."))
+
+    result = provider.requests[1].messages[-1].content[0]
+    assert isinstance(result, ToolResultBlock)
+    assert result.error_code == "COMMAND_FAILED"
+    assert result.metadata["exit_code"] == 3
+    assert result.metadata["stderr"] == "test failed\n"
+    assert summary.status is TurnStatus.COMPLETED
+    assert summary.final_text == (
+        "Validation failed with exit status 3; no success claimed."
+    )
+    assert summary.diff_complete is False
+
+
 def test_additional_system_instructions_preserve_default_coding_rules(
     tmp_path,
 ) -> None:
@@ -1017,6 +1123,74 @@ def test_thread_rejects_a_second_turn_while_one_is_running(tmp_path) -> None:
 
     assert turn_status is TurnStatus.COMPLETED
     assert thread_status is ThreadStatus.IDLE
+
+
+def test_closing_an_idle_thread_preserves_snapshot_and_rejects_mutation(
+    tmp_path,
+) -> None:
+    runtime = runtime_for_provider(ScriptedProvider([final_response("Finished.")]))
+    thread = runtime.create_thread(tmp_path)
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Finish once."))
+
+    assert runtime.close_thread(thread.thread_id) is True
+    snapshot = runtime.get_snapshot(thread.thread_id)
+
+    assert snapshot.status is ThreadStatus.CLOSED
+    assert snapshot.latest_turn == summary
+    assert len(snapshot.messages) == 2
+    assert runtime.close_thread(thread.thread_id) is False
+    with pytest.raises(ThreadClosedError) as turn_error:
+        asyncio.run(runtime.run_turn(thread.thread_id, "Too late."))
+    with pytest.raises(ThreadClosedError) as settings_error:
+        runtime.update_settings(
+            thread.thread_id,
+            expected_version=0,
+            settings=ModelSettings(
+                provider_config_id="test-provider",
+                model="another-model",
+            ),
+        )
+    assert turn_error.value.code == "THREAD_CLOSED"
+    assert settings_error.value.code == "THREAD_CLOSED"
+
+
+def test_closing_an_active_thread_cancels_it_and_releases_workspace(
+    tmp_path,
+) -> None:
+    async def scenario() -> tuple[
+        TurnSummary,
+        ThreadSnapshot,
+        TurnSummary,
+        list[str],
+    ]:
+        provider = PausingProvider()
+        runtime = runtime_for_provider(provider)
+        closing_thread = runtime.create_thread(tmp_path)
+        next_thread = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(
+            runtime.run_turn(closing_thread.thread_id, "Keep running.")
+        )
+        await provider.started.wait()
+        assert runtime.close_thread(closing_thread.thread_id) is True
+        cancelled = await active
+        closed_snapshot = runtime.get_snapshot(closing_thread.thread_id)
+        event_types = [
+            event.type
+            for event in runtime.get_events(closing_thread.thread_id).events
+        ]
+        provider.release.set()
+        next_summary = await runtime.run_turn(next_thread.thread_id, "Continue.")
+        return cancelled, closed_snapshot, next_summary, event_types
+
+    cancelled, closed_snapshot, next_summary, event_types = asyncio.run(scenario())
+
+    assert cancelled.status is TurnStatus.CANCELLED
+    assert closed_snapshot.status is ThreadStatus.CLOSED
+    assert closed_snapshot.active_turn_id is None
+    assert next_summary.status is TurnStatus.COMPLETED
+    assert event_types.index("thread_close_requested") < event_types.index(
+        "turn_cancelled"
+    )
 
 
 def test_oversized_first_request_is_rejected_without_mutating_history(tmp_path) -> None:

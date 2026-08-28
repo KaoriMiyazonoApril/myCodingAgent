@@ -15,11 +15,14 @@ class ThreadStatus(str, Enum):
     IDLE = "idle"
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
+    CLOSED = "closed"
 
 
 class TurnStatus(str, Enum):
-    """Terminal state of one public Turn summary."""
+    """Lifecycle states used by current and future public Turn views."""
 
+    QUEUED = "queued"
+    RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"

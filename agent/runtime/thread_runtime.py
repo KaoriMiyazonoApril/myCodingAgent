@@ -21,6 +21,7 @@ from .errors import (
     IdempotencyConflictError,
     SettingsConflictError,
     ThreadBusyError,
+    ThreadClosedError,
     TurnLimitReached,
 )
 from .events import EventBatch, EventBuffer, TurnEventEmitter, utc_now
@@ -80,6 +81,7 @@ class _ThreadRecord:
     idempotent_submissions: dict[str, _IdempotentSubmission] = field(
         default_factory=dict
     )
+    closing: bool = False
 
 
 class ThreadRuntime:
@@ -209,6 +211,8 @@ class ThreadRuntime:
                 assert existing.future is not None
                 return deepcopy(await asyncio.shield(existing.future))
         if record.status is not ThreadStatus.IDLE:
+            if record.status is ThreadStatus.CLOSED or record.closing:
+                raise ThreadClosedError(f"thread is closed: {thread_id}")
             raise ThreadBusyError(f"thread already has an active turn: {thread_id}")
         turn_id = str(uuid4())
         turn_config = (
@@ -316,7 +320,9 @@ class ThreadRuntime:
                     submission.future.cancel()
             raise
         finally:
-            record.status = ThreadStatus.IDLE
+            record.status = (
+                ThreadStatus.CLOSED if record.closing else ThreadStatus.IDLE
+            )
             record.active_turn = None
             record.updated_at = utc_now()
             self._workspace_leases.release(workspace_lease)
@@ -457,6 +463,8 @@ class ThreadRuntime:
         settings: ModelSettings,
     ) -> ThreadSettings:
         record = self._threads[thread_id]
+        if record.status is ThreadStatus.CLOSED or record.closing:
+            raise ThreadClosedError(f"thread is closed: {thread_id}")
         if record.settings.version != expected_version:
             raise SettingsConflictError(
                 f"settings version {expected_version} is stale; "
@@ -469,6 +477,22 @@ class ThreadRuntime:
         record.settings = updated
         record.updated_at = utc_now()
         return updated
+
+    def close_thread(self, thread_id: str) -> bool:
+        """Close an idle Thread or cancel its active Turn before closing it."""
+
+        record = self._threads[thread_id]
+        if record.status is ThreadStatus.CLOSED or record.closing:
+            return False
+        record.closing = True
+        record.updated_at = utc_now()
+        active_turn = record.active_turn
+        if active_turn is None:
+            record.status = ThreadStatus.CLOSED
+            return True
+        active_turn.events.emit("thread_close_requested", {})
+        active_turn.controller.cancel()
+        return True
 
     @staticmethod
     def _validate_idempotency_key(idempotency_key: str | None) -> None:
