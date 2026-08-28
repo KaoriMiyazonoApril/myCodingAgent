@@ -177,7 +177,23 @@ class CommandSandboxBackend(ABC):
                 await asyncio.wait_for(asyncio.shield(wait_task), timeout=0.1)
             except TimeoutError:
                 process.kill()
-                await asyncio.gather(wait_task, return_exceptions=True)
+                self._close_output_transports(process)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(wait_task), timeout=0.1
+                    )
+                except TimeoutError:
+                    wait_task.cancel()
+                    await asyncio.gather(wait_task, return_exceptions=True)
+
+    @staticmethod
+    def _close_output_transports(process: asyncio.subprocess.Process) -> None:
+        """Close asyncio's pipe transports after the owned process is killed."""
+
+        for stream in (process.stdout, process.stderr):
+            transport = getattr(stream, "_transport", None)
+            if transport is not None:
+                transport.close()
 
     @staticmethod
     def _signal_process_group(process_id: int, signal_number: signal.Signals) -> None:

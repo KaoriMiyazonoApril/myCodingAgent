@@ -618,6 +618,32 @@ def test_timeout_returns_even_if_detached_descendant_keeps_pipe_open(tmp_path) -
     assert result.metadata["stdout"] == "begun"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="setsid is POSIX-only")
+def test_deterministic_timeout_has_bounded_wait_for_detached_pipe_owner(
+    tmp_path,
+) -> None:
+    registry = create_local_tool_registry(
+        tmp_path,
+        sandbox_backend=DeterministicSandboxBackend(),
+    )
+    start = time.monotonic()
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="call_deterministic_detached_timeout",
+            name="run_command",
+            arguments={
+                "command": "setsid sh -c 'sleep 1' & printf begun; sleep 1",
+                "timeout_ms": 30,
+            },
+        )
+    )
+
+    assert result.error_code == "TIMEOUT"
+    assert time.monotonic() - start < 0.5
+    assert result.metadata["stdout"] == "begun"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX-only")
 def test_completed_command_returns_even_if_background_child_keeps_pipe_open(tmp_path) -> None:
     registry = create_bubblewrap_tool_registry_or_skip(tmp_path)
