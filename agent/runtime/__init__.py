@@ -3,8 +3,10 @@
 from .errors import (
     SettingsConflictError,
     ThreadBusyError,
+    UnsafeWorkspaceError,
     UnsupportedModelSettingError,
     WorkspaceBusyError,
+    WorkspaceValidationLimitError,
 )
 from .events import AgentEvent, EventBatch
 from .prompt import PromptBuilder
@@ -29,6 +31,7 @@ __all__ = [
     "AgentLimits",
     "AllowAllPolicy",
     "ThreadBusyError",
+    "UnsafeWorkspaceError",
     "PromptBuilder",
     "PolicyDecision",
     "ModelSettings",
@@ -40,6 +43,7 @@ __all__ = [
     "TurnSettingsOverride",
     "UnsupportedModelSettingError",
     "WorkspaceBusyError",
+    "WorkspaceValidationLimitError",
     "ThreadSnapshot",
     "ThreadStatus",
     "TurnStatus",

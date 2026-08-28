@@ -38,17 +38,17 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 
 - Ticket 01 的最小 tracer bullet 已完成：调用方可通过 `ThreadRuntime` 创建内存 Thread、
   提交一个 Turn，并让完整模型响应与现有工具注册表顺序循环，直至模型返回最终文本。
-- 当前公开结果包含基础 Thread 生命周期、版本化安全设置，以及 Turn 的最终文本、迭代数
-  和工具调用数；事件、预算、跨 workspace 并发、Policy、diff 与严格链接安全仍由后续
-  ticket 实现。
+- 当前公开结果已覆盖完整 Thread 生命周期、版本化安全设置、阶段事件、运行预算、跨
+  workspace 并发、Policy 与审批、文件 diff，以及严格 workspace 链接和挂载安全；
+  保守的上下文容量预检与提交幂等仍由后续 ticket 实现。
 - `PromptBuilder` 已提供供应商无关的默认 coding-agent 约束，并把 Runtime 附加指令置于
   默认约束之后，避免调用方定制时覆盖 workspace 路径、文件工具、错误处理和验证要求。
 - Runtime 集成测试通过临时 workspace 中的真实 `read_file` 工具验证闭环；更完整的
   read/edit/test/diff 场景随 ChangeTracker 和运行控制阶段补充。
 - Ticket 02 已提取公共 `CommandSandboxBackend`：生产 Bubblewrap 与确定性测试 adapter
   共享 capability probe、输出、超时和取消 contract。普通 Runtime 测试不再要求开发主机
-  可运行 Bubblewrap，生产组合仍 fail-fast 且绝不回退到 host shell。严格 workspace 链接
-  禁令仍属于后续安全 ticket。
+  可运行 Bubblewrap，生产组合仍 fail-fast 且绝不回退到 host shell。Ticket 09 已在生产
+  backend 上补充 link syscall 禁令及对应 capability probe。
 - Ticket 03 已实现多 Turn 与设置冻结：`Conversation` 独占合法历史，Runtime 通过公开
   provider 配置 ID 和模型解析每个 Turn 的 `LLMProvider`，`ModelInvoker` 将冻结的
   temperature、max tokens 与 allowlisted thinking 设置应用于整个工具链。默认设置更新
@@ -96,6 +96,14 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   `read_file` 与文件写入会刷新已知内容指纹，外部变化在覆盖前返回 `FILE_CHANGED`，模型
   重新读取后可安全重试。只由文件工具修改的 Turn 报告 `diff_complete = true`；实际执行过
   `run_command` 的 Turn 保守报告 `false`，且不会猜测无法恢复 original 的命令改动文件。
+- Ticket 09 已实现严格 workspace 安全：Thread 创建拒绝 symlink 根，每个 Turn 在模型调用前
+  完整扫描普通条目并拒绝 symbolic link、regular-file hard link 和嵌套 mount/bind mount；
+  扫描按条目数与单调时间双预算 fail closed 为 `WORKSPACE_VALIDATION_LIMIT`。文件工具路径
+  逐组件使用 no-follow metadata，Turn 验证后新出现的 symlink 或 hard link 也返回
+  `WORKSPACE_LINK`。生产 `BubblewrapSandboxBackend` 通过 libseccomp 导出 cBPF，阻止
+  `symlink`、`symlinkat`、`link` 和 `linkat`，并在组合时运行真实 link probe；libseccomp、
+  内核过滤或 link-blocking 能力不足均提前报告 sandbox unavailable，绝不降级。过滤只阻止
+  新建链接，可信只读系统树中的既有链接仍可供普通 Linux 命令解析。
 
 ## User Stories
 

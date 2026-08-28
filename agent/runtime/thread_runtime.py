@@ -36,6 +36,7 @@ from .settings import (
 from .types import SCHEMA_VERSION, ThreadSnapshot, ThreadStatus, TurnStatus, TurnSummary
 from .tool_coordinator import ToolCoordinator
 from .workspace_lease import WorkspaceLeaseManager
+from .workspace_validator import WorkspaceValidator
 
 
 ToolRegistryFactory = Callable[[Path], ToolRegistry]
@@ -85,6 +86,9 @@ class ThreadRuntime:
         max_active_turns: int = 4,
         tool_policy: ToolPolicy | None = None,
         approval_timeout_seconds: float = 5 * 60,
+        workspace_validation_max_entries: int = 100_000,
+        workspace_validation_max_seconds: float = 10,
+        workspace_validation_clock: Callable[[], float] | None = None,
     ) -> None:
         if reasoning_visibility not in {"hidden", "debug"}:
             raise ValueError("reasoning_visibility must be 'hidden' or 'debug'")
@@ -127,11 +131,16 @@ class ThreadRuntime:
         self._workspace_leases = WorkspaceLeaseManager(max_active_turns)
         self._tool_policy = tool_policy or AllowAllPolicy()
         self._approval_timeout_seconds = approval_timeout_seconds
+        validator_options: dict[str, object] = {
+            "max_entries": workspace_validation_max_entries,
+            "max_seconds": workspace_validation_max_seconds,
+        }
+        if workspace_validation_clock is not None:
+            validator_options["clock"] = workspace_validation_clock
+        self._workspace_validator = WorkspaceValidator(**validator_options)
 
     def create_thread(self, workspace: Path) -> ThreadSnapshot:
-        normalized_workspace = workspace.resolve()
-        if not normalized_workspace.is_dir():
-            raise ValueError("workspace must be an existing directory")
+        normalized_workspace = self._workspace_validator.normalize_root(workspace)
         thread_id = str(uuid4())
         created_at = utc_now()
         record = _ThreadRecord(
@@ -183,6 +192,11 @@ class ThreadRuntime:
             retry_delays=self._model_retry_delays,
         )
         workspace_lease = self._workspace_leases.acquire(record.workspace)
+        try:
+            self._workspace_validator.validate(record.workspace)
+        except Exception:
+            self._workspace_leases.release(workspace_lease)
+            raise
         record.status = ThreadStatus.RUNNING
         try:
             record.conversation.append_user(user_text)

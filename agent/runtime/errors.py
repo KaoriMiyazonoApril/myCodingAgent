@@ -13,6 +13,18 @@ class WorkspaceBusyError(RuntimeError):
     code = "WORKSPACE_BUSY"
 
 
+class UnsafeWorkspaceError(RuntimeError):
+    """A workspace contains a forbidden link, mount or uninspectable entry."""
+
+    code = "UNSAFE_WORKSPACE"
+
+
+class WorkspaceValidationLimitError(RuntimeError):
+    """A complete workspace scan exceeded its configured resource budget."""
+
+    code = "WORKSPACE_VALIDATION_LIMIT"
+
+
 class SettingsConflictError(RuntimeError):
     """A settings update used an obsolete Thread version."""
 

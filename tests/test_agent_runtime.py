@@ -41,7 +41,9 @@ from agent.runtime import (
     TurnSettingsOverride,
     TurnStatus,
     UnsupportedModelSettingError,
+    UnsafeWorkspaceError,
     WorkspaceBusyError,
+    WorkspaceValidationLimitError,
 )
 from agent.runtime.run_controller import RunController
 from agent.tools.registry import ToolRegistry
@@ -2264,3 +2266,142 @@ def test_read_fingerprint_matches_the_exact_content_returned_to_model(
     conflict = provider.requests[2].messages[-1].content[0]
     assert isinstance(conflict, ToolResultBlock)
     assert conflict.error_code == "FILE_CHANGED"
+
+
+def test_workspace_root_symlink_is_rejected_before_tool_composition(tmp_path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    runtime = runtime_for_provider(ScriptedProvider([]))
+
+    with pytest.raises(UnsafeWorkspaceError) as captured:
+        runtime.create_thread(linked)
+
+    assert captured.value.code == "UNSAFE_WORKSPACE"
+
+
+@pytest.mark.parametrize("link_kind", ["symbolic", "hard"])
+def test_turn_rejects_persistent_workspace_links(tmp_path, link_kind) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("data", encoding="utf-8")
+    if link_kind == "symbolic":
+        (tmp_path / "linked.txt").symlink_to(target)
+    else:
+        os.link(target, tmp_path / "linked.txt")
+    runtime = runtime_for_provider(ScriptedProvider([final_response()]))
+    thread = runtime.create_thread(tmp_path)
+
+    with pytest.raises(UnsafeWorkspaceError) as captured:
+        asyncio.run(runtime.run_turn(thread.thread_id, "Validate first."))
+
+    assert captured.value.code == "UNSAFE_WORKSPACE"
+    assert runtime.get_snapshot(thread.thread_id).status is ThreadStatus.IDLE
+
+
+def test_nested_mount_point_is_rejected_at_runtime_seam(tmp_path, monkeypatch) -> None:
+    nested = tmp_path / "mounted"
+    nested.mkdir()
+    monkeypatch.setattr(
+        "agent.runtime.workspace_validator.mounted_paths",
+        lambda: frozenset({nested.resolve()}),
+    )
+    runtime = runtime_for_provider(ScriptedProvider([final_response()]))
+    thread = runtime.create_thread(tmp_path)
+
+    with pytest.raises(UnsafeWorkspaceError, match="mount"):
+        asyncio.run(runtime.run_turn(thread.thread_id, "Reject nested mount."))
+
+
+def test_workspace_entry_budget_fails_closed(tmp_path) -> None:
+    (tmp_path / "one.txt").write_text("1", encoding="utf-8")
+    (tmp_path / "two.txt").write_text("2", encoding="utf-8")
+    runtime = runtime_for_provider(
+        ScriptedProvider([final_response()]),
+        workspace_validation_max_entries=1,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    with pytest.raises(WorkspaceValidationLimitError) as captured:
+        asyncio.run(runtime.run_turn(thread.thread_id, "Bound validation."))
+
+    assert captured.value.code == "WORKSPACE_VALIDATION_LIMIT"
+
+
+def test_workspace_time_budget_fails_closed(tmp_path) -> None:
+    (tmp_path / "one.txt").write_text("1", encoding="utf-8")
+    clock_values = iter((0.0, 0.0, 2.0))
+    runtime = runtime_for_provider(
+        ScriptedProvider([final_response()]),
+        workspace_validation_max_seconds=1,
+        workspace_validation_clock=lambda: next(clock_values),
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    with pytest.raises(WorkspaceValidationLimitError):
+        asyncio.run(runtime.run_turn(thread.thread_id, "Time-box validation."))
+
+
+@pytest.mark.parametrize("link_kind", ["symbolic", "hard"])
+def test_file_tools_reject_links_created_after_turn_validation(
+    tmp_path,
+    link_kind,
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("secret\n", encoding="utf-8")
+
+    class LinkCreatingProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.requests: list[LLMRequest] = []
+
+        async def chat(self, request: LLMRequest) -> LLMResponse:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                linked = tmp_path / "late-link.txt"
+                if link_kind == "symbolic":
+                    linked.symlink_to(source)
+                else:
+                    os.link(source, linked)
+                return tool_response(
+                    ToolCallBlock(
+                        id="late-link",
+                        name="read_file",
+                        arguments={"path": "late-link.txt"},
+                    )
+                )
+            return final_response("Link rejected.")
+
+    provider = LinkCreatingProvider()
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Do not follow links."))
+
+    assert summary.status is TurnStatus.COMPLETED
+    result = provider.requests[1].messages[-1].content[0]
+    assert isinstance(result, ToolResultBlock)
+    assert result.error_code == "WORKSPACE_LINK"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("workspace_validation_max_entries", 0),
+        ("workspace_validation_max_entries", True),
+        ("workspace_validation_max_seconds", 0),
+        ("workspace_validation_max_seconds", True),
+    ],
+)
+def test_workspace_validation_configuration_fails_closed(name, value) -> None:
+    with pytest.raises(ValueError, match=name):
+        ThreadRuntime(
+            provider_resolver=lambda _config_id, _model: ScriptedProvider([]),
+            default_settings=ModelSettings(
+                provider_config_id="test-provider", model="test-model"
+            ),
+            tool_registry_factory=empty_tools,
+            **{name: value},
+        )

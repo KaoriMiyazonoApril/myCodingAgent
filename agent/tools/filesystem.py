@@ -34,8 +34,15 @@ class WorkspaceFilesystem:
     """Resolve and validate paths below one configured workspace root."""
 
     def __init__(self, workspace_root: Path) -> None:
-        self.root = workspace_root.resolve()
-        if not self.root.is_dir():
+        candidate = Path(workspace_root).absolute()
+        try:
+            metadata = os.stat(candidate, follow_symlinks=False)
+        except OSError as error:
+            raise ValueError("workspace_root must be an existing directory") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("workspace_root must not be a symbolic link")
+        self.root = candidate.resolve(strict=True)
+        if not stat.S_ISDIR(metadata.st_mode):
             raise ValueError("workspace_root must be an existing directory")
 
     def resolve(self, raw_path: object) -> tuple[Path, str]:
@@ -45,17 +52,27 @@ class WorkspaceFilesystem:
         candidate = Path(raw_path)
         if candidate.is_absolute():
             raise ToolOperationError("WORKSPACE_ESCAPE", "absolute paths are not allowed")
+        if ".." in candidate.parts:
+            raise ToolOperationError("WORKSPACE_ESCAPE", "path escapes the workspace")
 
-        try:
-            target = (self.root / candidate).resolve()
-        except RuntimeError as error:
-            raise ToolOperationError("WORKSPACE_ESCAPE", "path cannot be resolved safely") from error
-        except OSError as error:
-            raise ToolOperationError("IO_ERROR", "could not resolve path") from error
-        try:
-            relative = target.relative_to(self.root)
-        except ValueError as error:
-            raise ToolOperationError("WORKSPACE_ESCAPE", "path escapes the workspace") from error
+        relative = Path(*[part for part in candidate.parts if part not in {"", "."}])
+        target = self.root
+        for part in relative.parts:
+            target = target / part
+            try:
+                metadata = os.stat(target, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise ToolOperationError("IO_ERROR", "could not inspect path") from error
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ToolOperationError(
+                    "WORKSPACE_LINK", "workspace symbolic links are forbidden"
+                )
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+                raise ToolOperationError(
+                    "WORKSPACE_LINK", "workspace hard links are forbidden"
+                )
         return target, relative.as_posix()
 
     def _resolve_text_file(
@@ -171,18 +188,30 @@ class WorkspaceFilesystem:
                 ) from error
             for entry in entries:
                 try:
-                    if entry.is_dir(follow_symlinks=False):
-                        if entry.name not in DEFAULT_IGNORED_DIRECTORIES:
-                            yield from walk(Path(entry.path))
-                        continue
+                    metadata = entry.stat(follow_symlinks=False)
                     candidate = Path(entry.path)
-                    resolved = candidate.resolve()
-                    resolved.relative_to(selected)
-                    resolved.relative_to(self.root)
-                except (OSError, RuntimeError, ValueError):
-                    continue
-                if resolved.is_file():
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise ToolOperationError(
+                            "WORKSPACE_LINK",
+                            f"workspace symbolic link is forbidden: {candidate.name}",
+                        )
+                    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+                        raise ToolOperationError(
+                            "WORKSPACE_LINK",
+                            f"workspace hard link is forbidden: {candidate.name}",
+                        )
+                    if stat.S_ISDIR(metadata.st_mode):
+                        if entry.name not in DEFAULT_IGNORED_DIRECTORIES:
+                            yield from walk(candidate)
+                        continue
+                except ToolOperationError:
+                    raise
+                except OSError as error:
+                    raise ToolOperationError(
+                        "IO_ERROR", f"could not inspect workspace entry: {entry.name}"
+                    ) from error
+                if stat.S_ISREG(metadata.st_mode):
                     workspace_relative = candidate.relative_to(self.root).as_posix()
-                    yield resolved, workspace_relative
+                    yield candidate, workspace_relative
 
         yield from walk(selected)

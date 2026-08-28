@@ -104,6 +104,7 @@ def test_failed_bubblewrap_probe_does_not_leave_backend_executable(
     probe_results = iter(
         (
             SimpleNamespace(returncode=0, stderr=b""),
+            SimpleNamespace(returncode=0, stderr=b""),
             SimpleNamespace(returncode=1, stderr=b"user namespaces disabled"),
         )
     )
@@ -132,6 +133,33 @@ def test_failed_bubblewrap_probe_does_not_leave_backend_executable(
                 command="true",
                 timeout_ms=100,
             )
+        )
+
+
+def test_bubblewrap_fails_early_when_link_blocking_probe_can_create_a_link(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    backend = BubblewrapSandboxBackend()
+    monkeypatch.setattr("agent.tools.process.shutil.which", lambda _: "/usr/bin/bwrap")
+    probe_results = iter(
+        (
+            SimpleNamespace(returncode=0, stderr=b""),
+            SimpleNamespace(returncode=99, stderr=b"link unexpectedly succeeded"),
+        )
+    )
+    monkeypatch.setattr(
+        "agent.tools.process.subprocess.run",
+        lambda *args, **kwargs: next(probe_results),
+    )
+
+    with pytest.raises(CommandSandboxUnavailableError, match="link-blocking"):
+        backend.check_available(tmp_path)
+    with pytest.raises(CommandSandboxUnavailableError, match="capability check"):
+        backend._build_command(
+            workspace_root=tmp_path,
+            command="true",
+            relative_cwd=".",
         )
 
 
@@ -347,7 +375,7 @@ def test_glob_uses_relative_pathlib_matching_for_recursive_patterns(tmp_path) ->
     assert recursive.content == "src/nested/deep.py\nsrc/root.py"
 
 
-def test_search_symlinks_must_remain_inside_selected_subtree(tmp_path) -> None:
+def test_search_rejects_workspace_symlinks_instead_of_skipping_them(tmp_path) -> None:
     (tmp_path / "other.txt").write_text("needle\n", encoding="utf-8")
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "link.txt").symlink_to("../other.txt")
@@ -368,10 +396,8 @@ def test_search_symlinks_must_remain_inside_selected_subtree(tmp_path) -> None:
         )
     )
 
-    assert grep_result.error_code is None
-    assert grep_result.content == ""
-    assert glob_result.error_code is None
-    assert glob_result.content == ""
+    assert grep_result.error_code == "WORKSPACE_LINK"
+    assert glob_result.error_code == "WORKSPACE_LINK"
 
 
 def test_glob_rejects_absolute_or_escaping_patterns(tmp_path) -> None:
@@ -476,6 +502,32 @@ def test_run_command_can_write_inside_without_modifying_host_sibling(tmp_path) -
     assert (tmp_path / "generated.txt").read_text(encoding="utf-8") == "created"
     assert outside_attempt.error_code is None
     assert outside.read_text(encoding="utf-8") == "unchanged"
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap is unavailable")
+def test_production_sandbox_blocks_workspace_symbolic_and_hard_links(
+    tmp_path,
+) -> None:
+    (tmp_path / "target.txt").write_text("target", encoding="utf-8")
+    registry = create_bubblewrap_tool_registry_or_skip(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="blocked-links",
+            name="run_command",
+            arguments={
+                "command": (
+                    "ln -s target.txt symbolic.txt 2>/dev/null; symbolic_status=$?; "
+                    "ln target.txt hard.txt 2>/dev/null; hard_status=$?; "
+                    "test $symbolic_status -ne 0 -a $hard_status -ne 0"
+                )
+            },
+        )
+    )
+
+    assert result.error_code is None
+    assert not (tmp_path / "symbolic.txt").exists()
+    assert not (tmp_path / "hard.txt").exists()
 
 
 def test_local_tool_composition_checks_command_isolation_capability_early(
@@ -670,7 +722,7 @@ def test_workspace_escapes_unknown_tools_and_duplicate_registration_are_structur
     duplicate.register(definition, lambda _: unknown)
 
     assert escaped.error_code == "WORKSPACE_ESCAPE"
-    assert linked.error_code == "WORKSPACE_ESCAPE"
+    assert linked.error_code == "WORKSPACE_LINK"
     assert unknown.error_code == "UNKNOWN_TOOL"
     try:
         duplicate.register(definition, lambda _: unknown)
@@ -688,7 +740,35 @@ def test_symlink_loops_are_reported_as_workspace_path_errors(tmp_path) -> None:
         ToolCallBlock(id="call_loop", name="read_file", arguments={"path": "loop"})
     )
 
-    assert result.error_code == "WORKSPACE_ESCAPE"
+    assert result.error_code == "WORKSPACE_LINK"
+
+
+def test_file_tools_reject_hard_links_and_symlinked_parent_components(
+    tmp_path,
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("content", encoding="utf-8")
+    hard_link = tmp_path / "hard.txt"
+    os.link(source, hard_link)
+    real_directory = tmp_path / "real"
+    real_directory.mkdir()
+    (real_directory / "nested.txt").write_text("nested", encoding="utf-8")
+    (tmp_path / "linked-parent").symlink_to(real_directory, target_is_directory=True)
+    registry = create_test_tool_registry(tmp_path)
+
+    hard_result = registry.execute(
+        ToolCallBlock(id="hard", name="read_file", arguments={"path": "hard.txt"})
+    )
+    parent_result = registry.execute(
+        ToolCallBlock(
+            id="parent-link",
+            name="read_file",
+            arguments={"path": "linked-parent/nested.txt"},
+        )
+    )
+
+    assert hard_result.error_code == "WORKSPACE_LINK"
+    assert parent_result.error_code == "WORKSPACE_LINK"
 
 
 def test_all_six_definitions_are_closed_object_schemas(tmp_path) -> None:
