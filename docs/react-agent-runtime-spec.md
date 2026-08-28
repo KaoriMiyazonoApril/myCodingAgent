@@ -120,6 +120,9 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   worker thread 中运行至静止，`RunController` 再把已完成的真实 `ToolResult` 交给
   `ToolCoordinator` 记录历史、diff 与事件，随后按原请求终止 Turn。workspace lease 只在该
   协调完成后释放，因此相交 Turn 不会与失去所有权的后台写线程并发。
+- Review Ticket 02 已将 no-follow 检查扩展到 workspace 绝对路径的每个既存组件，并由
+  Runtime 根规范化与文件工具共同复用；最终 workspace 本身是普通目录但任意父组件为
+  symbolic link 时同样 fail closed，不再由 `resolve()` 静默接受路径别名。
 
 ## User Stories
 
@@ -229,7 +232,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Thinking request fields are fail-closed against the selected model's `ThinkingCapabilities` before the first model request. Provider defaults may be refined by exact-model `ModelProfile` overrides; unsupported thinking, budget, or keep values return `UNSUPPORTED_MODEL_SETTING` rather than passing an unchecked private body to the provider.
 - The workspace reference is immutable after Thread creation. Selecting another folder requires another Thread so old message paths and diffs never change meaning.
 - `WorkspaceLeaseManager` normalizes real workspace roots and treats equal paths or ancestor/descendant relationships as overlapping. Multiple Threads may refer to overlapping roots, but only one overlapping Turn may hold a lease. A conflict fails immediately with `WORKSPACE_BUSY`; there is no implicit queue. A lease is held during `RUNNING` and `WAITING_APPROVAL` and released on every terminal path.
-- Before a Turn enters the loop, workspace validation rejects a symlink root, any symlink path entry, regular files whose hard-link count exceeds one, and nested mount or bind-mount points. Validation is complete within configured entry and time budgets; reaching either budget fails closed with `WORKSPACE_VALIDATION_LIMIT`.
+- Before a Turn enters the loop, workspace validation rejects a symlink in any existing component of the selected root path, any symlink path entry, regular files whose hard-link count exceeds one, and nested mount or bind-mount points. Validation is complete within configured entry and time budgets; reaching either budget fails closed with `WORKSPACE_VALIDATION_LIMIT`.
 - File operations inspect path components without following links. The earlier behavior that allowed internal file symlinks is intentionally replaced by a strict workspace prohibition.
 - `CommandSandboxBackend` becomes a real seam because the strict production bubblewrap adapter and a deterministic test adapter both need to satisfy it. Its interface includes a capability probe and cancellable command execution. The production adapter must prevent workspace `symlink`, `symlinkat`, `link`, and `linkat` operations or report itself unavailable before the Turn starts.
 - The strict link prohibition applies to the persistent workspace. Trusted read-only links in the sandbox system runtime remain allowed so standard Linux executables work. Hostile external processes replacing workspace entries during a Turn are not claimed to be fully preventable by the application.

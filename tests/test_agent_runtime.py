@@ -2807,6 +2807,21 @@ def test_workspace_root_symlink_is_rejected_before_tool_composition(tmp_path) ->
     assert captured.value.code == "UNSAFE_WORKSPACE"
 
 
+def test_workspace_symlink_parent_is_rejected_before_tool_composition(tmp_path) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    workspace = real_parent / "workspace"
+    workspace.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    runtime = runtime_for_provider(ScriptedProvider([]))
+
+    with pytest.raises(UnsafeWorkspaceError) as captured:
+        runtime.create_thread(linked_parent / "workspace")
+
+    assert captured.value.code == "UNSAFE_WORKSPACE"
+
+
 @pytest.mark.parametrize("link_kind", ["symbolic", "hard"])
 def test_turn_rejects_persistent_workspace_links(tmp_path, link_kind) -> None:
     target = tmp_path / "target.txt"

@@ -22,6 +22,20 @@ def content_fingerprint(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def existing_path_components(path: Path) -> Iterator[tuple[Path, os.stat_result]]:
+    """Inspect each existing absolute path component without following links."""
+
+    absolute = Path(path).absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        try:
+            metadata = os.stat(current, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        yield current, metadata
+
+
 class ToolOperationError(Exception):
     """An expected local-tool failure with a stable, model-visible code."""
 
@@ -36,11 +50,15 @@ class WorkspaceFilesystem:
     def __init__(self, workspace_root: Path) -> None:
         candidate = Path(workspace_root).absolute()
         try:
+            for component, metadata in existing_path_components(candidate):
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise ValueError(
+                        "workspace_root path components must not be symbolic links: "
+                        f"{component.as_posix()}"
+                    )
             metadata = os.stat(candidate, follow_symlinks=False)
         except OSError as error:
             raise ValueError("workspace_root must be an existing directory") from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ValueError("workspace_root must not be a symbolic link")
         self.root = candidate.resolve(strict=True)
         if not stat.S_ISDIR(metadata.st_mode):
             raise ValueError("workspace_root must be an existing directory")
@@ -56,23 +74,22 @@ class WorkspaceFilesystem:
             raise ToolOperationError("WORKSPACE_ESCAPE", "path escapes the workspace")
 
         relative = Path(*[part for part in candidate.parts if part not in {"", "."}])
-        target = self.root
-        for part in relative.parts:
-            target = target / part
-            try:
-                metadata = os.stat(target, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            except OSError as error:
-                raise ToolOperationError("IO_ERROR", "could not inspect path") from error
-            if stat.S_ISLNK(metadata.st_mode):
-                raise ToolOperationError(
-                    "WORKSPACE_LINK", "workspace symbolic links are forbidden"
-                )
-            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
-                raise ToolOperationError(
-                    "WORKSPACE_LINK", "workspace hard links are forbidden"
-                )
+        target = self.root / relative
+        try:
+            components = existing_path_components(target)
+            for component, metadata in components:
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise ToolOperationError(
+                        "WORKSPACE_LINK", "workspace symbolic links are forbidden"
+                    )
+                if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+                    raise ToolOperationError(
+                        "WORKSPACE_LINK", "workspace hard links are forbidden"
+                    )
+        except ToolOperationError:
+            raise
+        except OSError as error:
+            raise ToolOperationError("IO_ERROR", "could not inspect path") from error
         return target, relative.as_posix()
 
     def _resolve_text_file(

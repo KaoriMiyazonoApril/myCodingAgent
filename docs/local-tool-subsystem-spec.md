@@ -115,7 +115,9 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 - `types.py` 定义既有的模型可见 `ToolDefinition`，以及执行域的 `ToolResult`。`error_code`
   为 `None` 表示成功；`ok` 与 `is_error` 均由该字段推导，不存在可独立修改的错误布尔值。
 - `filesystem.py` 的 `WorkspaceFilesystem` 是工作区路径、文本文件和原子写入的唯一
-  入口；`ToolOperationError` 将预期的本地操作失败编码为稳定错误码。
+  入口；共享的逐组件 no-follow 检查同时保护 workspace 根与每次工具路径解析，父目录中的
+  symbolic link 不会先被 `resolve` 跟随。`ToolOperationError` 将预期的本地操作失败编码为
+  稳定错误码。
 - `process.py` 的 `CommandSandboxBackend` 统一能力探测、异步输出采集、超时与进程组取消
   生命周期；生产 `BubblewrapSandboxBackend` 负责构造隔离命令，测试 adapter 通过同一
   contract 提供确定性执行。`CommandRunner` 通过受验证的初始目录运行一次 shell 命令，并分别在

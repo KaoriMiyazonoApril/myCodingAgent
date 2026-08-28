@@ -771,6 +771,18 @@ def test_file_tools_reject_hard_links_and_symlinked_parent_components(
     assert parent_result.error_code == "WORKSPACE_LINK"
 
 
+def test_tool_composition_rejects_a_workspace_with_a_symlink_parent(tmp_path) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    workspace = real_parent / "workspace"
+    workspace.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="path components"):
+        create_test_tool_registry(linked_parent / "workspace")
+
+
 def test_all_six_definitions_are_closed_object_schemas(tmp_path) -> None:
     registry = create_test_tool_registry(tmp_path)
     definitions = registry.definitions()

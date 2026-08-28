@@ -8,6 +8,8 @@ from pathlib import Path
 import stat
 import time
 
+from agent.tools.filesystem import existing_path_components
+
 from .errors import UnsafeWorkspaceError, WorkspaceValidationLimitError
 
 
@@ -69,11 +71,15 @@ class WorkspaceValidator:
     def normalize_root(workspace: Path) -> Path:
         candidate = Path(workspace).absolute()
         try:
+            for component, metadata in existing_path_components(candidate):
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise UnsafeWorkspaceError(
+                        "workspace path component must not be a symbolic link: "
+                        f"{component.as_posix()}"
+                    )
             metadata = os.stat(candidate, follow_symlinks=False)
         except OSError as error:
             raise ValueError("workspace must be an existing directory") from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise UnsafeWorkspaceError("workspace root must not be a symbolic link")
         if not stat.S_ISDIR(metadata.st_mode):
             raise ValueError("workspace must be an existing directory")
         return candidate.resolve(strict=True)
