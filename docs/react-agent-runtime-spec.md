@@ -57,6 +57,8 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   模型的 `ThinkingCapabilities`，Runtime 在请求前验证 thinking 开关、budget 和 keep，
   不支持的组合以 `UNSUPPORTED_MODEL_SETTING` 失败。API key、base URL 与任意
   `extra_body` 均不属于公开设置。
+- Web Host 可在 `create_thread(..., settings=...)` 中冻结创建时选择的公开模型设置；省略
+  参数时仍使用 Runtime 默认设置并保持 version 0，因此既有调用方语义不变。
 - Ticket 04 已实现版本化公开状态与阶段事件：`ThreadSnapshot` 现在包含脱敏后的完整公开
   对话、时间戳和最近一次 `TurnSummary`，两者均通过 `to_dict()` 产生可直接 JSON 编码的
   独立数据。公开消息保留用户/助手文本、工具调用与安全工具结果，但排除 system prompt、
@@ -240,6 +242,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - A repeated failure fingerprint consists of tool name, canonically normalized arguments, and error code. Only three consecutive identical fingerprints stop a Turn. Different failed operations do not count as one repeated sequence.
 - Normal completion occurs only when the assistant response contains no tool calls. Budget exhaustion and repeated failure produce `LIMIT_REACHED` with an exact stop reason. Cancellation produces `CANCELLED`. Non-retryable model or Runtime failures produce `FAILED`. Ordinary tool errors remain in the loop.
 - `ThreadSettings` contains the public defaults used by future Turns and has a monotonically increasing version. An update supplies its expected version; stale writes fail with `SETTINGS_CONFLICT`. Every accepted update appends a Thread-scoped `settings_updated` event carrying the new version and selected provider/model identity; its `turn_id` is null because the update is not owned by an active Turn. Settings accepted during an active Turn affect only subsequent Turns.
+- Thread creation may supply one initial `ModelSettings` value, which is converted directly to version-zero `ThreadSettings`; callers that omit it continue to receive the Runtime defaults.
 - `TurnConfig` is an immutable snapshot created when a Turn starts. A field-level `TurnSettingsOverride` is merged with Thread defaults first; an internal `UNSET` sentinel means inherit while explicit `None` clears an optional value for that Turn. The snapshot contains provider configuration reference, public model name, temperature, maximum output tokens, supported thinking options, PromptBuilder output, reasoning visibility, and effective Agent limits. Values cannot change during the Turn.
 - Frontend-controllable provider data is allowlisted. The public settings include provider configuration ID, public model, temperature, maximum output tokens, supported thinking options, and bounded Agent limits. API keys, base URLs, raw provider bodies, credentials, and backend hard ceilings are not public settings.
 - Thinking request fields are fail-closed against the selected model's `ThinkingCapabilities` before the first model request. Provider defaults may be refined by exact-model `ModelProfile` overrides; unsupported thinking, budget, or keep values return `UNSUPPORTED_MODEL_SETTING` rather than passing an unchecked private body to the provider.

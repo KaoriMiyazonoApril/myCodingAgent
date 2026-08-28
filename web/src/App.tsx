@@ -1,13 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
+  closeThread,
+  createThread,
   clearProviderCredential,
   discoverModels,
   getProviders,
+  getThread,
+  getThreads,
   getWorkspaces,
   saveProvider,
   selectProviderDefault,
   type ProviderView,
+  type ThreadView,
   type WorkspaceListing,
 } from "./api";
 import "./styles.css";
@@ -17,6 +22,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState<string | null>(null);
+  const [selectedWorkspace, setSelectedWorkspace] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -104,20 +110,27 @@ export function App() {
             onClose={() => setEditing(null)}
             onChange={(next) => {
               setProviders((current) =>
-                current.map((item) =>
-                  item.provider_id === next.provider_id ? next : item,
-                ),
+                current.map((item) => {
+                  if (item.provider_id === next.provider_id) {
+                    return next;
+                  }
+                  return next.is_default ? { ...item, is_default: false } : item;
+                }),
               );
             }}
           />
         ) : null}
       </section>
-      <WorkspacePicker />
+      <WorkspacePicker onSelect={setSelectedWorkspace} />
+      <ThreadPanel
+        workspace={selectedWorkspace}
+        providers={providers}
+      />
     </main>
   );
 }
 
-function WorkspacePicker() {
+function WorkspacePicker({ onSelect }: { onSelect: (path: string) => void }) {
   const [listing, setListing] = useState<WorkspaceListing | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -232,7 +245,10 @@ function WorkspacePicker() {
             <button
               type="button"
               className="primary-button"
-              onClick={() => setSelected(listing.path)}
+              onClick={() => {
+                setSelected(listing.path);
+                onSelect(listing.path);
+              }}
             >
               Use this workspace
             </button>
@@ -240,6 +256,176 @@ function WorkspacePicker() {
           </div>
         </div>
       ) : null}
+    </section>
+  );
+}
+
+type ThreadPanelProps = {
+  workspace: string | null;
+  providers: ProviderView[];
+};
+
+function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
+  const [threads, setThreads] = useState<ThreadView[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const active = threads.find(
+    (thread) => thread.snapshot.thread_id === activeId,
+  ) ?? null;
+
+  useEffect(() => {
+    let mounted = true;
+    void getThreads()
+      .then((response) => {
+        if (mounted) {
+          setThreads(response);
+          setActiveId((current) => current ?? response[0]?.snapshot.thread_id ?? null);
+          setError(null);
+        }
+      })
+      .catch((reason: unknown) => {
+        if (mounted) {
+          setError(reason instanceof Error ? reason.message : "Threads unavailable");
+        }
+      })
+      .finally(() => {
+        if (mounted) {
+          setLoading(false);
+        }
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const replaceThread = (next: ThreadView) => {
+    setThreads((current) =>
+      current.some(
+        (thread) => thread.snapshot.thread_id === next.snapshot.thread_id,
+      )
+        ? current.map((thread) =>
+            thread.snapshot.thread_id === next.snapshot.thread_id ? next : thread,
+          )
+        : [...current, next],
+    );
+    setActiveId(next.snapshot.thread_id);
+  };
+
+  const run = async (operation: () => Promise<void>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await operation();
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : "Thread request failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const create = () =>
+    run(async () => {
+      if (workspace === null) {
+        throw new Error("Select a workspace before creating a Thread");
+      }
+      replaceThread(await createThread(workspace));
+    });
+
+  const refresh = () =>
+    run(async () => {
+      if (activeId !== null) {
+        replaceThread(await getThread(activeId));
+      }
+    });
+
+  const close = () =>
+    run(async () => {
+      if (activeId !== null) {
+        replaceThread(await closeThread(activeId));
+      }
+    });
+
+  const providerName = active
+    ? providers.find(
+        (provider) =>
+          provider.provider_id === active.snapshot.settings.provider_config_id,
+      )?.display_name ?? active.snapshot.settings.provider_config_id
+    : null;
+
+  return (
+    <section className="setup-panel thread-panel" aria-labelledby="threads-heading">
+      <div className="thread-sidebar">
+        <div className="thread-sidebar-heading">
+          <div>
+            <p className="step-label">STEP 03 · THREADS</p>
+            <h2 id="threads-heading">Threads</h2>
+          </div>
+          <button
+            type="button"
+            className="primary-button"
+            disabled={busy || workspace === null}
+            onClick={() => void create()}
+          >
+            New thread
+          </button>
+        </div>
+        {loading ? <p className="status-line">Loading Threads…</p> : null}
+        <div className="thread-list">
+          {threads.map((thread) => (
+            <button
+              type="button"
+              key={thread.snapshot.thread_id}
+              className={
+                thread.snapshot.thread_id === activeId ? "active" : undefined
+              }
+              onClick={() => setActiveId(thread.snapshot.thread_id)}
+            >
+              <span>{thread.snapshot.thread_id}</span>
+              <small>{thread.snapshot.status}</small>
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="thread-detail">
+        {error ? (
+          <div className="inline-error" role="alert">
+            {error}
+          </div>
+        ) : null}
+        {active ? (
+          <>
+            <div className="thread-detail-heading">
+              <div>
+                <p className="step-label">ACTIVE THREAD</p>
+                <h3>{active.snapshot.thread_id}</h3>
+              </div>
+              <div className="thread-controls">
+                <button type="button" disabled={busy} onClick={() => void refresh()}>
+                  Refresh active thread
+                </button>
+                <button type="button" disabled={busy} onClick={() => void close()}>
+                  Close active thread
+                </button>
+              </div>
+            </div>
+            <p className="thread-workspace">{active.snapshot.workspace}</p>
+            <p className="thread-model">
+              {providerName} · {active.snapshot.settings.model} · settings v
+              {active.snapshot.settings.version}
+            </p>
+            <p className="thread-status">Status · {active.snapshot.status}</p>
+          </>
+        ) : (
+          <p className="thread-empty">
+            {workspace
+              ? "Create a Thread for the selected workspace."
+              : "Select a Host workspace to enable Thread creation."}
+          </p>
+        )}
+      </div>
     </section>
   );
 }

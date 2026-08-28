@@ -48,6 +48,49 @@ export type WorkspaceListing = {
   truncated: boolean;
 };
 
+export type ThreadSettings = {
+  provider_config_id: string;
+  model: string;
+  temperature: number | null;
+  max_tokens: number | null;
+  thinking: unknown | null;
+  limits: {
+    max_iterations: number;
+    max_tool_calls: number;
+    max_execution_seconds: number;
+  };
+  version: number;
+};
+
+export type ThreadView = {
+  schema_version: number;
+  snapshot: {
+    schema_version: number;
+    thread_id: string;
+    workspace: string;
+    status: "idle" | "running" | "waiting_approval" | "closed";
+    active_turn_id: string | null;
+    completed_turns: number;
+    settings: ThreadSettings;
+    messages: Array<Record<string, unknown>>;
+    created_at: string;
+    updated_at: string;
+    latest_turn: Record<string, unknown> | null;
+  };
+  event_cursor: string | null;
+  submission: null | Record<string, unknown>;
+};
+
+type ThreadsResponse = {
+  schema_version: number;
+  threads: ThreadView[];
+};
+
+type ThreadResponse = {
+  schema_version: number;
+  thread: ThreadView;
+};
+
 export async function getProviders(): Promise<ProvidersResponse> {
   return requestJson<ProvidersResponse>("/api/providers");
 }
@@ -55,6 +98,32 @@ export async function getProviders(): Promise<ProvidersResponse> {
 export async function getWorkspaces(path?: string): Promise<WorkspaceListing> {
   const query = path ? `?path=${encodeURIComponent(path)}` : "";
   return requestJson<WorkspaceListing>(`/api/workspaces${query}`);
+}
+
+export async function getThreads(): Promise<ThreadView[]> {
+  return (await requestJson<ThreadsResponse>("/api/threads")).threads;
+}
+
+export async function getThread(threadId: string): Promise<ThreadView> {
+  return (await requestJson<ThreadResponse>(`/api/threads/${threadId}`)).thread;
+}
+
+export async function createThread(workspace: string): Promise<ThreadView> {
+  return (
+    await requestJson<ThreadResponse>("/api/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace }),
+    })
+  ).thread;
+}
+
+export async function closeThread(threadId: string): Promise<ThreadView> {
+  return (
+    await requestJson<ThreadResponse>(`/api/threads/${threadId}/close`, {
+      method: "POST",
+    })
+  ).thread;
 }
 
 export async function saveProvider(

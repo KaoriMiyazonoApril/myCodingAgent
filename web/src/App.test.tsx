@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, expect, test, vi } from "vitest";
 
 import { App } from "./App";
@@ -9,7 +9,9 @@ beforeEach(() => {
     vi.fn(async (input: RequestInfo | URL) => ({
       ok: true,
       json: async () =>
-        String(input).startsWith("/api/workspaces")
+        String(input) === "/api/threads"
+          ? { schema_version: 1, threads: [] }
+          : String(input).startsWith("/api/workspaces")
           ? {
               schema_version: 1,
               path: "/workspace",
@@ -74,6 +76,12 @@ test("saves a key, discovers models, and selects a default", async () => {
       const path = String(input);
       const method = init?.method ?? "GET";
       requests.push({ method, path });
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [] }),
+        };
+      }
       if (path.startsWith("/api/workspaces")) {
         return {
           ok: true,
@@ -185,6 +193,12 @@ test("saves a key, discovers models, and selects a default", async () => {
 test("shows provider request failures inline", async () => {
   const fetchMock = vi.mocked(fetch);
   fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === "/api/threads") {
+      return {
+        ok: true,
+        json: async () => ({ schema_version: 1, threads: [] }),
+      } as Response;
+    }
     if (String(input).startsWith("/api/workspaces")) {
       return {
         ok: true,
@@ -250,6 +264,12 @@ test("navigates Host workspaces and selects the current directory", async () => 
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [] }),
+        } as Response;
+      }
       if (path.startsWith("/api/workspaces")) {
         workspaceRequests.push(path);
         const child = path.includes("%2Fhome%2Fstudent%2Fproject");
@@ -302,6 +322,12 @@ test("keeps workspace errors visible with a reload action", async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [] }),
+        } as Response;
+      }
       if (String(input).startsWith("/api/workspaces")) {
         return {
           ok: false,
@@ -331,4 +357,155 @@ test("keeps workspace errors visible with a reload action", async () => {
   expect(await screen.findByText("Workspace unavailable")).toBeInTheDocument();
   expect(screen.getByText("Workspace path is not accessible")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Reload roots" })).toBeInTheDocument();
+});
+
+test("creates switches refreshes and closes Host threads", async () => {
+  const requests: Array<{ path: string; method: string; body?: string }> = [];
+  const threadView = (id: string, workspace: string, status = "idle") => ({
+    schema_version: 1,
+    snapshot: {
+      schema_version: 1,
+      thread_id: id,
+      workspace,
+      status,
+      active_turn_id: null,
+      completed_turns: 0,
+      settings: {
+        provider_config_id: "deepseek",
+        model: "deepseek-chat",
+        temperature: null,
+        max_tokens: null,
+        thinking: null,
+        limits: {
+          max_iterations: 20,
+          max_tool_calls: 50,
+          max_execution_seconds: 900,
+        },
+        version: 0,
+      },
+      messages: [],
+      created_at: "2026-08-29T00:00:00Z",
+      updated_at: "2026-08-29T00:00:00Z",
+      latest_turn: null,
+    },
+    event_cursor: null,
+    submission: null,
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ path, method, body: init?.body as string | undefined });
+      if (path === "/api/providers") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            default_provider_id: "deepseek",
+            providers: [
+              {
+                provider_id: "deepseek",
+                display_name: "DeepSeek",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "deepseek-chat",
+                is_default: true,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (path.startsWith("/api/workspaces")) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            path: "/home/student/project",
+            parent: null,
+            roots: ["/home/student/project"],
+            entries: [],
+            truncated: false,
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads" && method === "GET") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            threads: [threadView("thread-existing", "/home/student/old")],
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads" && method === "POST") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread: threadView("thread-new", "/home/student/project"),
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads/thread-new") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread: threadView("thread-new", "/home/student/project"),
+          }),
+        } as Response;
+      }
+      if (path.endsWith("/close")) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread: threadView("thread-new", "/home/student/project", "closed"),
+          }),
+        } as Response;
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    }),
+  );
+
+  render(<App />);
+  expect(
+    await screen.findByRole("heading", { name: "thread-existing" }),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Use this workspace" }));
+  fireEvent.click(screen.getByRole("button", { name: "New thread" }));
+
+  expect(
+    await screen.findByRole("heading", { name: "thread-new" }),
+  ).toBeInTheDocument();
+  expect(screen.getAllByText("/home/student/project").length).toBeGreaterThan(0);
+  expect(screen.getByText("DeepSeek · deepseek-chat · settings v0")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Refresh active thread" }));
+  await waitFor(() =>
+    expect(requests.some(({ path }) => path === "/api/threads/thread-new")).toBe(true),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Close active thread" }));
+  expect(
+    await screen.findByText(
+      (_, element) =>
+        element?.classList.contains("thread-status") === true &&
+        element.textContent === "Status · closed",
+    ),
+  ).toBeInTheDocument();
+  expect(requests).toEqual(
+    expect.arrayContaining([
+      {
+        path: "/api/threads",
+        method: "POST",
+        body: JSON.stringify({ workspace: "/home/student/project" }),
+      },
+      { path: "/api/threads/thread-new", method: "GET", body: undefined },
+      {
+        path: "/api/threads/thread-new/close",
+        method: "POST",
+        body: undefined,
+      },
+    ]),
+  );
 });

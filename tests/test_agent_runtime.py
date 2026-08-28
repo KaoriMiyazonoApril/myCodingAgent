@@ -41,6 +41,7 @@ from agent.runtime import (
     ThreadBusyError,
     ThreadClosedError,
     ThreadRuntime,
+    ThreadSettings,
     ThreadSnapshot,
     ThreadStatus,
     TurnConfig,
@@ -366,6 +367,33 @@ def test_runtime_public_defaults_are_explicit_and_versioned(tmp_path) -> None:
     assert snapshot.settings.limits.max_iterations == 20
     assert snapshot.settings.limits.max_tool_calls == 50
     assert snapshot.settings.limits.max_execution_seconds == 900
+
+
+def test_thread_creation_can_freeze_optional_initial_settings(tmp_path) -> None:
+    runtime = runtime_for_provider(
+        ScriptedProvider([]),
+        default_settings=ModelSettings(
+            provider_config_id="default-provider",
+            model="default-model",
+        ),
+    )
+    initial = ModelSettings(
+        provider_config_id="web-provider",
+        model="web-model",
+        temperature=0.4,
+        max_tokens=2048,
+    )
+
+    configured = runtime.create_thread(tmp_path, settings=initial)
+    unchanged = runtime.create_thread(tmp_path)
+
+    assert configured.settings == ThreadSettings.from_model_settings(
+        initial,
+        version=0,
+    )
+    assert unchanged.settings.provider_config_id == "default-provider"
+    assert unchanged.settings.model == "default-model"
+    assert unchanged.settings.version == 0
 
 
 def test_turn_config_validates_and_freezes_reasoning_visibility() -> None:

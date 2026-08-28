@@ -391,6 +391,122 @@ button:disabled {
   margin-top: 0;
 }
 
+.thread-panel {
+  display: grid;
+  min-height: 390px;
+  grid-template-columns: minmax(240px, 0.34fr) minmax(0, 1fr);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #10182a;
+}
+
+.thread-sidebar {
+  padding: 18px;
+  border-right: 1px solid var(--border);
+  background: #0d1424;
+}
+
+.thread-sidebar-heading,
+.thread-detail-heading,
+.thread-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.thread-sidebar-heading,
+.thread-detail-heading {
+  justify-content: space-between;
+}
+
+.thread-sidebar h2,
+.thread-detail h3 {
+  margin: 7px 0 0;
+}
+
+.thread-sidebar .primary-button {
+  margin-top: 0;
+}
+
+.thread-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.thread-list button {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid #40506b;
+  border-radius: 8px;
+  color: #e7eef8;
+  text-align: left;
+  background: #141b2d;
+  cursor: pointer;
+}
+
+.thread-list button.active {
+  border-color: var(--accent);
+  background: #1a2b2a;
+}
+
+.thread-list span {
+  overflow: hidden;
+  font: 500 12px/1.2 "JetBrains Mono", ui-monospace, monospace;
+  text-overflow: ellipsis;
+}
+
+.thread-list small,
+.thread-model,
+.thread-status,
+.thread-empty {
+  color: var(--muted);
+}
+
+.thread-detail {
+  padding: 24px;
+}
+
+.thread-detail h3,
+.thread-workspace {
+  overflow-wrap: anywhere;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+}
+
+.thread-controls button {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid #52627c;
+  border-radius: 7px;
+  color: #dce5f2;
+  background: #1b2539;
+  cursor: pointer;
+}
+
+.thread-workspace {
+  margin-top: 44px;
+  font-size: 15px;
+}
+
+.thread-model,
+.thread-status {
+  font-size: 13px;
+}
+
+@media (max-width: 900px) {
+  .thread-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .thread-sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
 @media (max-width: 760px) {
   .provider-grid {
     grid-template-columns: 1fr;

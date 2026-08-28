@@ -164,7 +164,12 @@ class ThreadRuntime:
             validator_options["clock"] = workspace_validation_clock
         self._workspace_validator = WorkspaceValidator(**validator_options)
 
-    def create_thread(self, workspace: Path) -> ThreadSnapshot:
+    def create_thread(
+        self,
+        workspace: Path,
+        *,
+        settings: ModelSettings | None = None,
+    ) -> ThreadSnapshot:
         normalized_workspace = self._workspace_validator.normalize_root(workspace)
         thread_id = str(uuid4())
         created_at = utc_now()
@@ -173,7 +178,7 @@ class ThreadRuntime:
             workspace=normalized_workspace,
             tools=self._tool_registry_factory(normalized_workspace),
             settings=ThreadSettings.from_model_settings(
-                self._default_settings,
+                settings or self._default_settings,
                 version=0,
             ),
             conversation=Conversation(self._system_prompt),

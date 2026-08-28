@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+from typing import Protocol
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+from agent.runtime import (
+    AgentLimits,
+    ModelSettings,
+    SettingsConflictError,
+    ThinkingKeep,
+    ThinkingSettings,
+    ThreadClosedError,
+    UnsafeWorkspaceError,
+    WorkspaceValidationLimitError,
+)
 
 from .model_catalog import (
     ModelDiscovery,
@@ -21,13 +34,19 @@ from .provider_config import (
     SCHEMA_VERSION,
     UnknownProviderError,
 )
+from .thread_service import (
+    ConfigurationRequiredError,
+    RuntimeFactory,
+    ThreadHost,
+    ThreadNotFoundError,
+    production_runtime_factory,
+)
 from .workspace import (
     WorkspaceBrowser,
     WorkspaceBrowseError,
     WorkspaceNotAccessibleError,
     WorkspaceNotFoundError,
 )
-from typing import Protocol
 
 
 class ModelCatalog(Protocol):
@@ -49,11 +68,48 @@ class ProviderDefaultUpdate(BaseModel):
     model: str
 
 
+class ThreadCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace: str
+    provider_config_id: str | None = None
+    model: str | None = None
+
+
+class ThinkingUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    budget_tokens: int | None = None
+    keep: ThinkingKeep | None = None
+
+
+class LimitsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_iterations: int = 20
+    max_tool_calls: int = 50
+    max_execution_seconds: float = 15 * 60
+
+
+class ThreadSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int
+    provider_config_id: str
+    model: str
+    temperature: float | None = None
+    max_tokens: int | None = None
+    thinking: ThinkingUpdate | None = None
+    limits: LimitsUpdate = Field(default_factory=LimitsUpdate)
+
+
 def create_app(
     *,
     provider_store: ProviderStore,
     model_catalog: ModelCatalog,
     workspace_browser: WorkspaceBrowser | None = None,
+    runtime_factory: RuntimeFactory | None = None,
     dev_mode: bool = False,
 ) -> FastAPI:
     """Compose the local Host at its highest HTTP test seam."""
@@ -67,9 +123,15 @@ def create_app(
             allow_headers=["Content-Type", "Last-Event-ID"],
         )
     browser = workspace_browser or WorkspaceBrowser()
+    threads = ThreadHost(
+        provider_store=provider_store,
+        workspace_browser=browser,
+        runtime_factory=runtime_factory or production_runtime_factory(provider_store),
+    )
     app.state.provider_store = provider_store
     app.state.model_catalog = model_catalog
     app.state.workspace_browser = browser
+    app.state.thread_host = threads
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(
@@ -145,6 +207,55 @@ def create_app(
     ) -> JSONResponse:
         return _error_response(400, error.code, "Workspace path is not allowed")
 
+    @app.exception_handler(ConfigurationRequiredError)
+    async def configuration_required(
+        request: Request,
+        error: ConfigurationRequiredError,
+    ) -> JSONResponse:
+        return _error_response(409, error.code, "Provider and model configuration required")
+
+    @app.exception_handler(ThreadNotFoundError)
+    async def thread_not_found(
+        request: Request,
+        error: ThreadNotFoundError,
+    ) -> JSONResponse:
+        return _error_response(404, error.code, "Thread does not exist")
+
+    @app.exception_handler(SettingsConflictError)
+    async def settings_conflict(
+        request: Request,
+        error: SettingsConflictError,
+    ) -> JSONResponse:
+        return _error_response(409, error.code, "Thread settings changed")
+
+    @app.exception_handler(ThreadClosedError)
+    async def thread_closed(
+        request: Request,
+        error: ThreadClosedError,
+    ) -> JSONResponse:
+        return _error_response(409, error.code, "Thread is closed")
+
+    @app.exception_handler(UnsafeWorkspaceError)
+    async def unsafe_workspace(
+        request: Request,
+        error: UnsafeWorkspaceError,
+    ) -> JSONResponse:
+        return _error_response(400, error.code, "Runtime rejected the workspace")
+
+    @app.exception_handler(WorkspaceValidationLimitError)
+    async def workspace_validation_limit(
+        request: Request,
+        error: WorkspaceValidationLimitError,
+    ) -> JSONResponse:
+        return _error_response(400, error.code, "Workspace validation limit reached")
+
+    @app.exception_handler(ValueError)
+    async def invalid_argument(
+        request: Request,
+        error: ValueError,
+    ) -> JSONResponse:
+        return _error_response(400, "INVALID_ARGUMENT", "Request is invalid")
+
     @app.get("/api/health")
     async def health() -> dict[str, object]:
         return {
@@ -181,6 +292,61 @@ def create_app(
                 for entry in listing.entries
             ],
             "truncated": listing.truncated,
+        }
+
+    @app.get("/api/threads")
+    async def list_threads() -> dict[str, object]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "threads": threads.list_threads(),
+        }
+
+    @app.post("/api/threads", status_code=201)
+    async def create_thread(request: ThreadCreate) -> dict[str, object]:
+        thread = threads.create_thread(
+            request.workspace,
+            provider_config_id=request.provider_config_id,
+            model=request.model,
+        )
+        return {"schema_version": SCHEMA_VERSION, "thread": thread}
+
+    @app.get("/api/threads/{thread_id}")
+    async def get_thread(thread_id: str) -> dict[str, object]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "thread": threads.get_thread(thread_id),
+        }
+
+    @app.patch("/api/threads/{thread_id}/settings")
+    async def update_thread_settings(
+        thread_id: str,
+        request: ThreadSettingsUpdate,
+    ) -> dict[str, object]:
+        thinking = (
+            None
+            if request.thinking is None
+            else ThinkingSettings(**request.thinking.model_dump())
+        )
+        settings = ModelSettings(
+            provider_config_id=request.provider_config_id,
+            model=request.model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            thinking=thinking,
+            limits=AgentLimits(**request.limits.model_dump()),
+        )
+        thread = threads.update_settings(
+            thread_id,
+            expected_version=request.expected_version,
+            settings=settings,
+        )
+        return {"schema_version": SCHEMA_VERSION, "thread": thread}
+
+    @app.post("/api/threads/{thread_id}/close")
+    async def close_thread(thread_id: str) -> dict[str, object]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "thread": threads.close_thread(thread_id),
         }
 
     @app.put("/api/providers/{provider_id}")

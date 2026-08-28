@@ -80,27 +80,11 @@ class WorkspaceBrowser:
         return tuple(str(root) for root in self._roots)
 
     def list(self, requested_path: str | None = None) -> WorkspaceListing:
-        raw_path = requested_path if requested_path is not None else str(self._roots[0])
-        candidate = Path(raw_path).expanduser()
-        if not candidate.is_absolute() or ".." in candidate.parts:
-            raise WorkspaceOutsideRootError("Workspace path is outside configured roots")
-
-        candidate = Path(os.path.abspath(candidate))
+        candidate = Path(self.validate(requested_path))
         root = self._containing_root(candidate)
-        self._reject_symlink_components(root, candidate)
 
         try:
-            if not candidate.exists():
-                raise WorkspaceNotFoundError("Workspace path does not exist")
-            if not candidate.is_dir():
-                raise WorkspaceNotAccessibleError(
-                    "Workspace path is not a directory"
-                )
             entries = self._directory_entries(candidate)
-        except WorkspaceBrowseError:
-            raise
-        except FileNotFoundError as error:
-            raise WorkspaceNotFoundError("Workspace path does not exist") from error
         except PermissionError as error:
             raise WorkspaceNotAccessibleError(
                 "Workspace path is not accessible"
@@ -118,6 +102,42 @@ class WorkspaceBrowser:
             entries=tuple(entries[: self._limit]),
             truncated=len(entries) > self._limit,
         )
+
+    def validate(self, requested_path: str | None = None) -> str:
+        """Authorize one directory selection without inspecting its contents."""
+
+        raw_path = requested_path if requested_path is not None else str(self._roots[0])
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute() or ".." in candidate.parts:
+            raise WorkspaceOutsideRootError("Workspace path is outside configured roots")
+
+        candidate = Path(os.path.abspath(candidate))
+        root = self._containing_root(candidate)
+        self._reject_symlink_components(root, candidate)
+
+        try:
+            if not candidate.exists():
+                raise WorkspaceNotFoundError("Workspace path does not exist")
+            if not candidate.is_dir():
+                raise WorkspaceNotAccessibleError(
+                    "Workspace path is not a directory"
+                )
+            with os.scandir(candidate):
+                pass
+        except WorkspaceBrowseError:
+            raise
+        except FileNotFoundError as error:
+            raise WorkspaceNotFoundError("Workspace path does not exist") from error
+        except PermissionError as error:
+            raise WorkspaceNotAccessibleError(
+                "Workspace path is not accessible"
+            ) from error
+        except OSError as error:
+            raise WorkspaceNotAccessibleError(
+                "Workspace path could not be listed"
+            ) from error
+
+        return str(candidate)
 
     def _containing_root(self, candidate: Path) -> Path:
         for root in self._roots:
