@@ -6,39 +6,49 @@ import { App } from "./App";
 beforeEach(() => {
   vi.stubGlobal(
     "fetch",
-    vi.fn().mockResolvedValue({
+    vi.fn(async (input: RequestInfo | URL) => ({
       ok: true,
-      json: async () => ({
-        schema_version: 1,
-        default_provider_id: null,
-        providers: [
-          {
-            provider_id: "deepseek",
-            display_name: "DeepSeek",
-            configured: false,
-            credential_mask: null,
-            selected_model: null,
-            is_default: false,
-          },
-          {
-            provider_id: "moonshot",
-            display_name: "Moonshot / Kimi",
-            configured: false,
-            credential_mask: null,
-            selected_model: null,
-            is_default: false,
-          },
-          {
-            provider_id: "glm",
-            display_name: "GLM",
-            configured: false,
-            credential_mask: null,
-            selected_model: null,
-            is_default: false,
-          },
-        ],
-      }),
-    }),
+      json: async () =>
+        String(input).startsWith("/api/workspaces")
+          ? {
+              schema_version: 1,
+              path: "/workspace",
+              parent: null,
+              roots: ["/workspace"],
+              entries: [],
+              truncated: false,
+            }
+          : {
+              schema_version: 1,
+              default_provider_id: null,
+              providers: [
+                {
+                  provider_id: "deepseek",
+                  display_name: "DeepSeek",
+                  configured: false,
+                  credential_mask: null,
+                  selected_model: null,
+                  is_default: false,
+                },
+                {
+                  provider_id: "moonshot",
+                  display_name: "Moonshot / Kimi",
+                  configured: false,
+                  credential_mask: null,
+                  selected_model: null,
+                  is_default: false,
+                },
+                {
+                  provider_id: "glm",
+                  display_name: "GLM",
+                  configured: false,
+                  credential_mask: null,
+                  selected_model: null,
+                  is_default: false,
+                },
+              ],
+            },
+    })),
   );
 });
 
@@ -64,6 +74,19 @@ test("saves a key, discovers models, and selects a default", async () => {
       const path = String(input);
       const method = init?.method ?? "GET";
       requests.push({ method, path });
+      if (path.startsWith("/api/workspaces")) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            path: "/workspace",
+            parent: null,
+            roots: ["/workspace"],
+            entries: [],
+            truncated: false,
+          }),
+        };
+      }
       if (path.endsWith("/models/discover")) {
         return {
           ok: true,
@@ -162,6 +185,19 @@ test("saves a key, discovers models, and selects a default", async () => {
 test("shows provider request failures inline", async () => {
   const fetchMock = vi.mocked(fetch);
   fetchMock.mockImplementation(async (input, init) => {
+    if (String(input).startsWith("/api/workspaces")) {
+      return {
+        ok: true,
+        json: async () => ({
+          schema_version: 1,
+          path: "/workspace",
+          parent: null,
+          roots: ["/workspace"],
+          entries: [],
+          truncated: false,
+        }),
+      } as Response;
+    }
     if ((init?.method ?? "GET") === "PUT") {
       return {
         ok: false,
@@ -206,4 +242,93 @@ test("shows provider request failures inline", async () => {
   expect(
     await screen.findByRole("alert"),
   ).toHaveTextContent("Provider rejected the configured credential");
+});
+
+test("navigates Host workspaces and selects the current directory", async () => {
+  const workspaceRequests: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.startsWith("/api/workspaces")) {
+        workspaceRequests.push(path);
+        const child = path.includes("%2Fhome%2Fstudent%2Fproject");
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            path: child ? "/home/student/project" : "/home/student",
+            parent: child ? "/home/student" : "/home",
+            roots: ["/home/student", "/mnt/c/code"],
+            entries: child
+              ? [{ name: "src", path: "/home/student/project/src", type: "directory" }]
+              : [
+                  {
+                    name: "project",
+                    path: "/home/student/project",
+                    type: "directory",
+                  },
+                ],
+            truncated: false,
+          }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          schema_version: 1,
+          default_provider_id: null,
+          providers: [],
+        }),
+      } as Response;
+    }),
+  );
+
+  render(<App />);
+
+  expect(
+    await screen.findByRole("heading", { name: "Choose a workspace" }),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Open project" }));
+  expect(await screen.findByText("/home/student/project")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Use this workspace" }));
+  expect(screen.getByText("Selected · /home/student/project")).toBeInTheDocument();
+  expect(workspaceRequests).toContain(
+    "/api/workspaces?path=%2Fhome%2Fstudent%2Fproject",
+  );
+});
+
+test("keeps workspace errors visible with a reload action", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).startsWith("/api/workspaces")) {
+        return {
+          ok: false,
+          status: 403,
+          json: async () => ({
+            error: {
+              code: "WORKSPACE_NOT_ACCESSIBLE",
+              message: "Workspace path is not accessible",
+              details: {},
+            },
+          }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          schema_version: 1,
+          default_provider_id: null,
+          providers: [],
+        }),
+      } as Response;
+    }),
+  );
+
+  render(<App />);
+
+  expect(await screen.findByText("Workspace unavailable")).toBeInTheDocument();
+  expect(screen.getByText("Workspace path is not accessible")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Reload roots" })).toBeInTheDocument();
 });

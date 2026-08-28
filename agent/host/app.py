@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -19,6 +20,12 @@ from .provider_config import (
     ProviderStore,
     SCHEMA_VERSION,
     UnknownProviderError,
+)
+from .workspace import (
+    WorkspaceBrowser,
+    WorkspaceBrowseError,
+    WorkspaceNotAccessibleError,
+    WorkspaceNotFoundError,
 )
 from typing import Protocol
 
@@ -42,12 +49,27 @@ class ProviderDefaultUpdate(BaseModel):
     model: str
 
 
-def create_app(*, provider_store: ProviderStore, model_catalog: ModelCatalog) -> FastAPI:
+def create_app(
+    *,
+    provider_store: ProviderStore,
+    model_catalog: ModelCatalog,
+    workspace_browser: WorkspaceBrowser | None = None,
+    dev_mode: bool = False,
+) -> FastAPI:
     """Compose the local Host at its highest HTTP test seam."""
 
     app = FastAPI(title="Local Agent Host")
+    if dev_mode:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["http://127.0.0.1:5173"],
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+            allow_headers=["Content-Type", "Last-Event-ID"],
+        )
+    browser = workspace_browser or WorkspaceBrowser()
     app.state.provider_store = provider_store
     app.state.model_catalog = model_catalog
+    app.state.workspace_browser = browser
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(
@@ -102,6 +124,27 @@ def create_app(*, provider_store: ProviderStore, model_catalog: ModelCatalog) ->
     ) -> JSONResponse:
         return _error_response(502, error.code, "Provider is unavailable")
 
+    @app.exception_handler(WorkspaceNotFoundError)
+    async def workspace_not_found(
+        request: Request,
+        error: WorkspaceNotFoundError,
+    ) -> JSONResponse:
+        return _error_response(404, error.code, "Workspace path does not exist")
+
+    @app.exception_handler(WorkspaceNotAccessibleError)
+    async def workspace_not_accessible(
+        request: Request,
+        error: WorkspaceNotAccessibleError,
+    ) -> JSONResponse:
+        return _error_response(403, error.code, "Workspace path is not accessible")
+
+    @app.exception_handler(WorkspaceBrowseError)
+    async def invalid_workspace(
+        request: Request,
+        error: WorkspaceBrowseError,
+    ) -> JSONResponse:
+        return _error_response(400, error.code, "Workspace path is not allowed")
+
     @app.get("/api/health")
     async def health() -> dict[str, object]:
         return {
@@ -119,6 +162,25 @@ def create_app(*, provider_store: ProviderStore, model_catalog: ModelCatalog) ->
                 None if default is None else default["provider_id"]
             ),
             "providers": provider_store.list_public(),
+        }
+
+    @app.get("/api/workspaces")
+    async def workspaces(path: str | None = None) -> dict[str, object]:
+        listing = browser.list(path)
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "path": listing.path,
+            "parent": listing.parent,
+            "roots": list(listing.roots),
+            "entries": [
+                {
+                    "name": entry.name,
+                    "path": entry.path,
+                    "type": entry.type,
+                }
+                for entry in listing.entries
+            ],
+            "truncated": listing.truncated,
         }
 
     @app.put("/api/providers/{provider_id}")

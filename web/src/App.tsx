@@ -1,12 +1,14 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import {
   clearProviderCredential,
   discoverModels,
   getProviders,
+  getWorkspaces,
   saveProvider,
   selectProviderDefault,
   type ProviderView,
+  type WorkspaceListing,
 } from "./api";
 import "./styles.css";
 
@@ -110,7 +112,135 @@ export function App() {
           />
         ) : null}
       </section>
+      <WorkspacePicker />
     </main>
+  );
+}
+
+function WorkspacePicker() {
+  const [listing, setListing] = useState<WorkspaceListing | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async (path?: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      setListing(await getWorkspaces(path));
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : "Workspace request failed");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void getWorkspaces()
+      .then((response) => {
+        if (active) {
+          setListing(response);
+          setError(null);
+        }
+      })
+      .catch((reason: unknown) => {
+        if (active) {
+          setError(
+            reason instanceof Error ? reason.message : "Workspace request failed",
+          );
+        }
+      })
+      .finally(() => {
+        if (active) {
+          setLoading(false);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  return (
+    <section className="setup-panel workspace-panel" aria-labelledby="workspace-heading">
+      <div className="setup-copy">
+        <p className="step-label">STEP 02 · EXECUTION ROOT</p>
+        <h2 id="workspace-heading">Choose a workspace</h2>
+        <p className="lede">
+          Browse directories exposed by this Linux or WSL Host. Runtime validation
+          still applies when the Agent executes a task.
+        </p>
+      </div>
+
+      {error ? (
+        <div className="error-banner" role="alert">
+          <strong>Workspace unavailable</strong>
+          <span>{error}</span>
+          <button type="button" className="quiet-button" onClick={() => void load()}>
+            Reload roots
+          </button>
+        </div>
+      ) : null}
+      {loading && listing === null ? (
+        <p className="status-line">Loading Host directories…</p>
+      ) : null}
+
+      {listing ? (
+        <div className="workspace-browser" aria-busy={loading}>
+          <div className="workspace-roots" aria-label="Workspace roots">
+            {listing.roots.map((root) => (
+              <button key={root} type="button" onClick={() => void load(root)}>
+                {root}
+              </button>
+            ))}
+          </div>
+          <div className="path-bar">
+            <code>{listing.path}</code>
+            <button type="button" onClick={() => void load(listing.path)}>
+              Reload
+            </button>
+          </div>
+          {listing.parent ? (
+            <button
+              type="button"
+              className="directory-row"
+              aria-label="Open parent directory"
+              onClick={() => void load(listing.parent ?? undefined)}
+            >
+              <span aria-hidden="true">↰</span>
+              <span>..</span>
+            </button>
+          ) : null}
+          <div className="directory-list">
+            {listing.entries.map((entry) => (
+              <button
+                type="button"
+                className="directory-row"
+                key={entry.path}
+                aria-label={`Open ${entry.name}`}
+                onClick={() => void load(entry.path)}
+              >
+                <span aria-hidden="true">▸</span>
+                <span>{entry.name}</span>
+              </button>
+            ))}
+          </div>
+          {listing.truncated ? (
+            <p className="field-help">Showing the first 500 directories.</p>
+          ) : null}
+          <div className="workspace-actions">
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => setSelected(listing.path)}
+            >
+              Use this workspace
+            </button>
+            {selected ? <p className="success-line">Selected · {selected}</p> : null}
+          </div>
+        </div>
+      ) : null}
+    </section>
   );
 }
 

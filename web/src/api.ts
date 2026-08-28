@@ -33,8 +33,28 @@ export type ModelDiscoveryResponse = {
   cached: boolean;
 };
 
+export type WorkspaceEntry = {
+  name: string;
+  path: string;
+  type: "directory";
+};
+
+export type WorkspaceListing = {
+  schema_version: number;
+  path: string;
+  parent: string | null;
+  roots: string[];
+  entries: WorkspaceEntry[];
+  truncated: boolean;
+};
+
 export async function getProviders(): Promise<ProvidersResponse> {
   return requestJson<ProvidersResponse>("/api/providers");
+}
+
+export async function getWorkspaces(path?: string): Promise<WorkspaceListing> {
+  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  return requestJson<WorkspaceListing>(`/api/workspaces${query}`);
 }
 
 export async function saveProvider(

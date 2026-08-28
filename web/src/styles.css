@@ -115,6 +115,14 @@ h1 {
   letter-spacing: -0.045em;
 }
 
+.workspace-panel h2 {
+  max-width: 680px;
+  margin: 14px 0 18px;
+  font-size: clamp(30px, 5vw, 52px);
+  line-height: 1;
+  letter-spacing: -0.04em;
+}
+
 .lede {
   max-width: 620px;
   color: #bdc8d8;
@@ -296,6 +304,91 @@ button:disabled {
   border-left: 3px solid var(--danger);
   color: #ffe6e8;
   background: rgb(89 22 31 / 45%);
+}
+
+.workspace-browser {
+  max-width: 820px;
+  margin-top: 32px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #10182a;
+}
+
+.workspace-roots,
+.path-bar,
+.workspace-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.workspace-roots {
+  flex-wrap: wrap;
+}
+
+.workspace-roots button,
+.path-bar button,
+.directory-row {
+  min-height: 38px;
+  border: 1px solid #52627c;
+  border-radius: 7px;
+  color: #dce5f2;
+  background: #1b2539;
+  cursor: pointer;
+}
+
+.workspace-roots button,
+.path-bar button {
+  padding: 0 11px;
+  font: 500 12px/1 "JetBrains Mono", ui-monospace, monospace;
+}
+
+.path-bar {
+  justify-content: space-between;
+}
+
+.path-bar code {
+  overflow: hidden;
+  color: #e7eef8;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.directory-list {
+  max-height: 340px;
+  overflow: auto;
+}
+
+.directory-row {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+  border: 0;
+  border-bottom: 1px solid rgb(64 80 107 / 50%);
+  border-radius: 0;
+  text-align: left;
+  background: transparent;
+}
+
+.directory-row:hover {
+  background: #1b2539;
+}
+
+.workspace-actions {
+  flex-wrap: wrap;
+  border-top: 1px solid var(--border);
+  border-bottom: 0;
+}
+
+.workspace-actions .primary-button,
+.workspace-actions .success-line {
+  margin-top: 0;
 }
 
 @media (max-width: 760px) {
