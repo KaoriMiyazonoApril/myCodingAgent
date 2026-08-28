@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import signal
 import time
 from types import SimpleNamespace
 
@@ -725,6 +726,76 @@ def test_deterministic_timeout_has_bounded_wait_for_detached_pipe_owner(
     assert result.error_code == "TIMEOUT"
     assert time.monotonic() - start < 0.5
     assert result.metadata["stdout"] == "begun"
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(), reason="FD accounting requires procfs"
+)
+def test_repeated_detached_pipe_timeouts_do_not_retain_output_fds(tmp_path) -> None:
+    registry = create_local_tool_registry(
+        tmp_path,
+        sandbox_backend=DeterministicSandboxBackend(),
+    )
+    pid_file = tmp_path / "detached-pids.txt"
+
+    async def scenario() -> tuple[int, int]:
+        before = len(os.listdir("/proc/self/fd"))
+        try:
+            for _ in range(5):
+                result = await registry.execute_async(
+                    ToolCallBlock(
+                        id="detached-fd",
+                        name="run_command",
+                        arguments={
+                            "command": (
+                                "setsid sh -c 'echo $$ >> detached-pids.txt; "
+                                "sleep 1000' & printf x; sleep 1"
+                            ),
+                            "timeout_ms": 30,
+                        },
+                    )
+                )
+                assert result.error_code == "TIMEOUT"
+            await asyncio.sleep(0)
+            return before, len(os.listdir("/proc/self/fd"))
+        finally:
+            if pid_file.exists():
+                for raw_pid in pid_file.read_text(encoding="utf-8").splitlines():
+                    try:
+                        os.kill(int(raw_pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    before, after = asyncio.run(scenario())
+
+    assert after <= before + 2
+
+
+def test_task_cancellation_cleanup_has_a_fixed_wait_budget() -> None:
+    async def scenario() -> tuple[float, bool]:
+        release = asyncio.Event()
+
+        async def cancellation_resistant() -> None:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+        task = asyncio.create_task(cancellation_resistant())
+        await asyncio.sleep(0)
+        start = time.monotonic()
+        await CommandSandboxBackend._cancel_tasks([task])
+        elapsed = time.monotonic() - start
+        still_running = not task.done()
+        release.set()
+        await task
+        return elapsed, still_running
+
+    elapsed, still_running = asyncio.run(scenario())
+
+    assert elapsed < 0.3
+    assert still_running
 
 
 @pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX-only")

@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import Any
 
 from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem
 from agent.tools.types import ToolResult
@@ -152,6 +153,7 @@ class CommandSandboxBackend(ABC):
             )
         except TimeoutError:
             self._signal_process_group(process.pid, signal.SIGTERM)
+            self._close_output_transports(process)
             await self._cancel_tasks(tasks)
 
     async def _cleanup_cancelled(
@@ -161,6 +163,7 @@ class CommandSandboxBackend(ABC):
         capture_tasks: list[asyncio.Task[None]],
     ) -> None:
         await self._terminate_process_group(process, wait_task)
+        self._close_output_transports(process)
         await self._cancel_tasks(capture_tasks)
 
     async def _terminate_process_group(
@@ -178,13 +181,7 @@ class CommandSandboxBackend(ABC):
             except TimeoutError:
                 process.kill()
                 self._close_output_transports(process)
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(wait_task), timeout=0.1
-                    )
-                except TimeoutError:
-                    wait_task.cancel()
-                    await asyncio.gather(wait_task, return_exceptions=True)
+                await self._cancel_tasks([wait_task])
 
     @staticmethod
     def _close_output_transports(process: asyncio.subprocess.Process) -> None:
@@ -203,11 +200,16 @@ class CommandSandboxBackend(ABC):
             pass
 
     @staticmethod
-    async def _cancel_tasks(tasks: list[asyncio.Task[None]]) -> None:
+    async def _cancel_tasks(tasks: list[asyncio.Task[Any]]) -> None:
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if not tasks:
+            return
+        done, _ = await asyncio.wait(tasks, timeout=0.1)
+        for task in done:
+            if not task.cancelled():
+                task.exception()
 
 
 class BubblewrapSandboxBackend(CommandSandboxBackend):
