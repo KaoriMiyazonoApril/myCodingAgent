@@ -4,9 +4,9 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] `TurnConfig` 包含冻结且经过校验的 `reasoning_visibility`。
-- [ ] 空闲与活跃 Thread 的成功设置更新均产生版本化 `settings_updated` 事件。
-- [ ] 设置事件能够由现有事件 cursor 读取，并与最新 Snapshot 的设置版本一致。
-- [ ] reasoning 默认隐藏和 debug 独立事件行为继续通过 Runtime seam 测试。
+- [x] `TurnConfig` 包含冻结且经过校验的 `reasoning_visibility`。
+- [x] 空闲与活跃 Thread 的成功设置更新均产生版本化 `settings_updated` 事件。
+- [x] 设置事件能够由现有事件 cursor 读取，并与最新 Snapshot 的设置版本一致。
+- [x] reasoning 默认隐藏和 debug 独立事件行为继续通过 Runtime seam 测试。

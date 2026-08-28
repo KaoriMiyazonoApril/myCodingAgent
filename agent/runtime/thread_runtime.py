@@ -219,12 +219,14 @@ class ThreadRuntime:
             TurnConfig.from_thread_settings(
                 record.settings,
                 system_prompt=self._system_prompt,
+                reasoning_visibility=self._reasoning_visibility,
             )
             if settings_override is None
             else TurnConfig.from_model_settings(
                 settings_override.apply(record.settings),
                 settings_version=record.settings.version,
                 system_prompt=self._system_prompt,
+                reasoning_visibility=self._reasoning_visibility,
             )
         )
         provider = self._provider_resolver(
@@ -257,7 +259,7 @@ class ThreadRuntime:
                 thread_id=thread_id,
                 turn_id=turn_id,
                 buffer=record.events,
-                reasoning_visibility=self._reasoning_visibility,
+                reasoning_visibility=turn_config.reasoning_visibility,
             )
             controller = RunController(turn_config.limits)
             current_task = asyncio.current_task()
@@ -478,6 +480,16 @@ class ThreadRuntime:
         )
         record.settings = updated
         record.updated_at = utc_now()
+        assert record.events is not None
+        record.events.emit_thread(
+            thread_id=thread_id,
+            event_type="settings_updated",
+            payload={
+                "settings_version": updated.version,
+                "provider_config_id": updated.provider_config_id,
+                "model": updated.model,
+            },
+        )
         return updated
 
     def close_thread(self, thread_id: str) -> bool:

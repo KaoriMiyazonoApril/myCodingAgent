@@ -207,15 +207,26 @@ class TurnConfig(ModelSettings):
 
     settings_version: int = 0
     system_prompt: str = ""
+    reasoning_visibility: str = "hidden"
+
+    def __post_init__(self) -> None:
+        ModelSettings.__post_init__(self)
+        if self.reasoning_visibility not in {"hidden", "debug"}:
+            raise ValueError("reasoning_visibility must be 'hidden' or 'debug'")
 
     @classmethod
     def from_thread_settings(
-        cls, settings: ThreadSettings, *, system_prompt: str
+        cls,
+        settings: ThreadSettings,
+        *,
+        system_prompt: str,
+        reasoning_visibility: str,
     ) -> TurnConfig:
         return cls.from_model_settings(
             settings,
             settings_version=settings.version,
             system_prompt=system_prompt,
+            reasoning_visibility=reasoning_visibility,
         )
 
     @classmethod
@@ -225,6 +236,7 @@ class TurnConfig(ModelSettings):
         *,
         settings_version: int,
         system_prompt: str,
+        reasoning_visibility: str,
     ) -> TurnConfig:
         return cls(
             provider_config_id=settings.provider_config_id,
@@ -235,4 +247,5 @@ class TurnConfig(ModelSettings):
             limits=settings.limits,
             settings_version=settings_version,
             system_prompt=system_prompt,
+            reasoning_visibility=reasoning_visibility,
         )

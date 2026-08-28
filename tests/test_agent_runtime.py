@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import FrozenInstanceError, asdict
 import json
 import os
 from pathlib import Path
@@ -43,6 +43,7 @@ from agent.runtime import (
     ThreadRuntime,
     ThreadSnapshot,
     ThreadStatus,
+    TurnConfig,
     TurnSettingsOverride,
     TurnStatus,
     UnsupportedModelSettingError,
@@ -329,6 +330,19 @@ def test_thread_settings_reject_a_stale_version_without_overwriting(
     assert updated.version == 1
     assert updated.provider_config_id == "provider-b"
     assert runtime.get_snapshot(thread.thread_id).settings == updated
+    settings_events = [
+        event
+        for event in runtime.get_events(thread.thread_id).events
+        if event.type == "settings_updated"
+    ]
+    assert len(settings_events) == 1
+    assert settings_events[0].turn_id is None
+    assert settings_events[0].sequence == 1
+    assert settings_events[0].payload == {
+        "settings_version": updated.version,
+        "provider_config_id": "provider-b",
+        "model": "model-b",
+    }
     with pytest.raises(SettingsConflictError) as captured:
         runtime.update_settings(
             thread.thread_id,
@@ -340,6 +354,29 @@ def test_thread_settings_reject_a_stale_version_without_overwriting(
         )
     assert captured.value.code == "SETTINGS_CONFLICT"
     assert runtime.get_snapshot(thread.thread_id).settings == updated
+    assert len(runtime.get_events(thread.thread_id).events) == 1
+
+
+def test_turn_config_validates_and_freezes_reasoning_visibility() -> None:
+    settings = ModelSettings(provider_config_id="provider", model="model")
+
+    config = TurnConfig.from_model_settings(
+        settings,
+        settings_version=2,
+        system_prompt="System prompt",
+        reasoning_visibility="debug",
+    )
+
+    assert config.reasoning_visibility == "debug"
+    with pytest.raises(FrozenInstanceError):
+        config.reasoning_visibility = "hidden"
+    with pytest.raises(ValueError, match="reasoning_visibility"):
+        TurnConfig.from_model_settings(
+            settings,
+            settings_version=2,
+            system_prompt="System prompt",
+            reasoning_visibility="public",
+        )
 
 
 def test_active_turn_freezes_settings_until_its_tool_chain_finishes(
@@ -361,6 +398,7 @@ def test_active_turn_freezes_settings_until_its_tool_chain_finishes(
             runtime.run_turn(thread.thread_id, "Start tool work.")
         )
         await provider.started.wait()
+        turn_started = runtime.get_events(thread.thread_id).events[-1]
         runtime.update_settings(
             thread.thread_id,
             expected_version=0,
@@ -371,9 +409,26 @@ def test_active_turn_freezes_settings_until_its_tool_chain_finishes(
                 max_tokens=2000,
             ),
         )
+        settings_batch = runtime.get_events(
+            thread.thread_id,
+            after_event_id=turn_started.event_id,
+        )
+        assert not settings_batch.cursor_expired
+        assert [event.type for event in settings_batch.events] == [
+            "settings_updated"
+        ]
+        assert settings_batch.events[0].turn_id is None
+        assert settings_batch.events[0].payload["settings_version"] == 1
+        assert runtime.get_snapshot(thread.thread_id).settings.version == 1
         provider.release.set()
         await active
         await runtime.run_turn(thread.thread_id, "Use the new settings.")
+        event_types = [
+            event.type for event in runtime.get_events(thread.thread_id).events
+        ]
+        assert event_types.index("turn_started") < event_types.index(
+            "settings_updated"
+        ) < event_types.index("model_response")
         return provider.requests, runtime.get_snapshot(thread.thread_id).settings.temperature
 
     requests, current_temperature = asyncio.run(scenario())

@@ -124,7 +124,7 @@ class AgentEvent:
     schema_version: int
     event_id: str
     thread_id: str
-    turn_id: str
+    turn_id: str | None
     sequence: int
     type: str
     timestamp: str
@@ -154,9 +154,33 @@ class EventBuffer:
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
             raise ValueError("event_buffer_capacity must be a positive integer")
         self._events: deque[AgentEvent] = deque(maxlen=capacity)
+        self._thread_sequence = 0
 
     def append(self, event: AgentEvent) -> None:
         self._events.append(event)
+
+    def emit_thread(
+        self,
+        *,
+        thread_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AgentEvent:
+        """Append an event whose lifecycle scope is the Thread, not one Turn."""
+
+        self._thread_sequence += 1
+        event = AgentEvent(
+            schema_version=SCHEMA_VERSION,
+            event_id=str(uuid4()),
+            thread_id=thread_id,
+            turn_id=None,
+            sequence=self._thread_sequence,
+            type=event_type,
+            timestamp=utc_now(),
+            payload=json_safe(payload),
+        )
+        self.append(event)
+        return event
 
     def read(self, after_event_id: str | None = None) -> EventBatch:
         retained = list(self._events)
