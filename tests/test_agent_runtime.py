@@ -357,6 +357,17 @@ def test_thread_settings_reject_a_stale_version_without_overwriting(
     assert len(runtime.get_events(thread.thread_id).events) == 1
 
 
+def test_runtime_public_defaults_are_explicit_and_versioned(tmp_path) -> None:
+    runtime = runtime_for_provider(ScriptedProvider([]))
+
+    snapshot = runtime.create_thread(tmp_path)
+
+    assert snapshot.settings.version == 0
+    assert snapshot.settings.limits.max_iterations == 20
+    assert snapshot.settings.limits.max_tool_calls == 50
+    assert snapshot.settings.limits.max_execution_seconds == 900
+
+
 def test_turn_config_validates_and_freezes_reasoning_visibility() -> None:
     settings = ModelSettings(provider_config_id="provider", model="model")
 
@@ -807,6 +818,89 @@ def test_snapshot_and_summary_are_versioned_safe_json_with_public_history(
     assert snapshot.updated_at.endswith("Z")
     assert summary.started_at.endswith("Z")
     assert summary.ended_at.endswith("Z")
+
+
+def test_invalid_raw_provider_arguments_remain_consistent_through_runtime(
+    tmp_path,
+) -> None:
+    raw_arguments = '{"path":'
+    invalid_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call_invalid",
+                            function=SimpleNamespace(
+                                name="read_file",
+                                arguments=raw_arguments,
+                            ),
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=None,
+    )
+    completions = RecordingCompletions(
+        [invalid_response, sdk_response("Recovered from invalid arguments.")]
+    )
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(
+            provider="test",
+            base_url="https://example.invalid/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=create_test_tool_registry,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Read a file."))
+    snapshot = runtime.get_snapshot(thread.thread_id)
+    events = runtime.get_events(thread.thread_id).events
+
+    assert summary.status is TurnStatus.COMPLETED
+    assert snapshot.latest_turn == summary
+    assert [message["role"] for message in snapshot.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    public_call = snapshot.messages[1]["content"][0]
+    public_result = snapshot.messages[2]["content"][0]
+    assert public_call["raw_arguments"] == raw_arguments
+    assert public_call["arguments"] is None
+    assert public_call["arguments_error"] == "invalid JSON arguments"
+    assert public_result["tool_call_id"] == "call_invalid"
+    assert public_result["error_code"] == "INVALID_ARGUMENTS"
+
+    second_request_history = completions.requests[1]["messages"]
+    assert second_request_history[2]["tool_calls"][0]["function"][
+        "arguments"
+    ] == raw_arguments
+    encoded_tool_result = json.loads(second_request_history[3]["content"])
+    assert encoded_tool_result["error_code"] == "INVALID_ARGUMENTS"
+    assert encoded_tool_result["ok"] is False
+
+    requested = next(event for event in events if event.type == "tool_requested")
+    finished = next(event for event in events if event.type == "tool_finished")
+    completed = next(event for event in events if event.type == "turn_completed")
+    assert requested.payload["tool_call"]["raw_arguments"] == raw_arguments
+    assert requested.payload["tool_call"]["arguments_error"] == (
+        "invalid JSON arguments"
+    )
+    assert finished.payload["result"]["tool_call_id"] == "call_invalid"
+    assert finished.payload["result"]["error_code"] == "INVALID_ARGUMENTS"
+    assert completed.payload["summary"] == summary.to_dict()
 
 
 def test_turn_events_are_ordered_complete_and_json_compatible(tmp_path) -> None:
@@ -2050,6 +2144,32 @@ def test_global_active_turn_limit_is_configurable_and_fails_immediately(
         try:
             with pytest.raises(WorkspaceBusyError, match="capacity") as captured:
                 await runtime.run_turn(threads[2].thread_id, "No capacity.")
+            assert captured.value.code == "WORKSPACE_BUSY"
+        finally:
+            provider.release.set()
+            await asyncio.gather(*active)
+
+    asyncio.run(scenario())
+
+
+def test_global_active_turn_limit_defaults_to_four(tmp_path) -> None:
+    async def scenario() -> None:
+        provider = ConcurrentProvider()
+        runtime = runtime_for_provider(provider)
+        threads = []
+        for index in range(5):
+            workspace = tmp_path / f"workspace-{index}"
+            workspace.mkdir()
+            threads.append(runtime.create_thread(workspace))
+
+        active = [
+            asyncio.create_task(runtime.run_turn(thread.thread_id, "Hold capacity."))
+            for thread in threads[:4]
+        ]
+        await asyncio.wait_for(provider.wait_for_started(4), timeout=0.5)
+        try:
+            with pytest.raises(WorkspaceBusyError, match="capacity") as captured:
+                await runtime.run_turn(threads[4].thread_id, "Default is full.")
             assert captured.value.code == "WORKSPACE_BUSY"
         finally:
             provider.release.set()

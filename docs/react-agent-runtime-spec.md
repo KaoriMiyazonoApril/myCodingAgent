@@ -63,7 +63,8 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   reasoning、credentials 和内部 traceback。Summary 已提供终止原因、累计 usage、计数与
   时间戳；修改文件和 diff 字段现由 Ticket 08 的 `ChangeTracker` 填充。
 - 每个 Turn 通过 `TurnEventEmitter` 产生带 schema version、UUID、时间戳和单调 sequence
-  的完整阶段事件，包括 Turn 生命周期、模型完整响应与工具请求/开始/完成。Thread 使用
+  的完整阶段事件，包括 Turn 生命周期、模型完整响应与工具请求/开始/完成；默认设置更新
+  通过同一缓冲区产生 Thread-scoped 事件。Thread 使用
   可配置的定长 ring buffer；写入只淘汰最旧事件，不会等待消费者。`get_events()` 通过
   event ID 游标读取，游标已淘汰时返回 `cursor_expired = true`，调用方据此重新读取
   Snapshot。reasoning 默认不进入任何公开状态或普通事件；仅当后端显式配置 `debug` 时，
@@ -130,6 +131,11 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Review Ticket 04 已让成功的默认设置更新产生可由既有 cursor 读取的 Thread-scoped
   `settings_updated` 事件；事件版本与最新 Snapshot 一致。`reasoning_visibility` 也进入
   不可变 `TurnConfig` 并在构造时校验，事件 emitter 只读取该 Turn 冻结的值。
+- Review Ticket 05 已收口最终验收证据：真实 `OpenAICompatibleProvider` 的非法 raw tool
+  arguments 会原样穿过 Runtime 历史、事件与下一次模型请求，同时产生匹配的
+  `INVALID_ARGUMENTS` 结果并继续循环；测试还显式锁定设置版本 0、20/50/900 默认预算、
+  四个活跃 Turn 的默认全局上限，以及 Event、Snapshot、Summary 和最终工具历史的一致性。
+  原 Runtime tickets 05–10 与本组 review tickets 均已同步为完成状态。
 
 ## User Stories
 
@@ -272,11 +278,11 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Model retry tests assert that retryable failures recover within the attempt budget and that non-retryable failures perform no unnecessary retry. Backoff timing is injected or disabled in tests rather than tested with wall-clock sleeps.
 - Run-controller behavior is exercised through Runtime outcomes with small configured limits: normal completion, iteration limit, tool-call limit, deadline, repeated identical error, and cancellation.
 - Change tracking tests assert original-to-final diffs across repeated file-tool edits, new files, optimistic `FILE_CHANGED` conflicts, and explicit incomplete diff status after command execution.
-- Event tests assert schema version, IDs, monotonic sequence, safe payloads, status order, bounded-buffer gap behavior, Snapshot recovery, and default reasoning suppression. Debug tests verify reasoning appears only in its dedicated event.
+- Event tests assert schema version, IDs, scoped monotonic sequence, safe payloads, status order, settings-version consistency, bounded-buffer gap behavior, Snapshot recovery, and default reasoning suppression. Debug tests verify reasoning appears only in its dedicated event.
 - Settings tests assert immutable per-Turn snapshots, next-Turn application of mid-run updates, one-Turn overrides, version conflicts, model changes between Turns, hard server ceilings, and complete credential redaction.
 - Security tests assert rejection of workspace symlinks, symlinked path components, hard-linked regular files, nested mounts where test infrastructure permits, validation-budget exhaustion, and command sandbox link-creation attempts.
 - Existing provider tests are prior art for scripted provider responses and stable domain-type assertions. Existing local-tool tests are prior art for temporary workspace behavior, structured tool errors, command cancellation, and sandbox capability checks.
-- The acceptance suite covers at least: no-tool completion; read/edit/test/diff; failed-test reporting; invalid argument recovery; independent workspace concurrency; overlapping workspace rejection; a second Turn on one Thread; model switching between Turns; command cancellation; budget and repeated-failure termination; optimistic file conflicts; strict link/mount rejection; ordered events consistent with Snapshot and Summary; and absence of credentials, tracebacks, and default-hidden reasoning from public data.
+- The acceptance suite covers at least: no-tool completion; read/edit/test/diff; failed-test reporting; invalid raw provider-argument preservation and structured recovery; explicit default budgets and four-Turn capacity; independent workspace concurrency; overlapping workspace rejection; a second Turn on one Thread; model switching between Turns; command cancellation; budget and repeated-failure termination; optimistic file conflicts; strict link/mount rejection; ordered events consistent with final tool history, Snapshot, and Summary; and absence of credentials, tracebacks, and default-hidden reasoning from public data.
 - Tests should survive refactoring inside deep modules. A test that must inspect past `ThreadRuntime`, `LLMProvider`, `ToolRegistry`, or `CommandSandboxBackend` seams requires justification.
 
 ## Out of Scope

@@ -4,11 +4,10 @@
 
 **Blocked by:** 01: 实现最小单 Turn ReAct 闭环.
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] 仅 `retryable` LLM 错误最多重试三次，不可重试错误立即失败。
-- [ ] 默认迭代、工具和执行时间预算可配置，达到后返回 `LIMIT_REACHED` 与具体原因。
-- [ ] 连续三次相同工具、规范化参数和错误码会终止，其他错误组合不会误触发。
-- [ ] 取消从 `ThreadRuntime` 传播到当前 LLM 或工具协程及命令进程组。
-- [ ] 审批等待时间可以从执行 deadline 中暂停，为后续 Policy 阶段提供语义。
-
+- [x] 仅 `retryable` LLM 错误最多重试三次，不可重试错误立即失败。
+- [x] 默认迭代、工具和执行时间预算可配置，达到后返回 `LIMIT_REACHED` 与具体原因。
+- [x] 连续三次相同工具、规范化参数和错误码会终止，其他错误组合不会误触发。
+- [x] 取消从 `ThreadRuntime` 传播到当前 LLM 或工具协程及命令进程组。
+- [x] 审批等待时间可以从执行 deadline 中暂停，为后续 Policy 阶段提供语义。

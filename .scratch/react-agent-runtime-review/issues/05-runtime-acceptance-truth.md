@@ -4,9 +4,9 @@
 
 **Blocked by:** 01: 保证同步工具取消后的 workspace 静止性; 02: 拒绝 workspace 路径中的所有 symlink 父组件; 03: 管理命令 sandbox 的 seccomp 资源生命周期; 04: 补全设置事件与冻结的 Turn 配置.
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] Runtime 端到端测试证明非法 raw tool arguments 原样保留，并产生匹配的结构化错误结果后继续循环。
-- [ ] 默认设置版本、迭代、工具调用、执行时间和全局并发限制都有显式断言。
-- [ ] 事件、Snapshot、Summary 与最终工具历史的一致性验收覆盖新增行为。
-- [ ] 主规格、原 Runtime tickets 05–10 和本组 tickets 的状态与当前实现及测试同步。
+- [x] Runtime 端到端测试证明非法 raw tool arguments 原样保留，并产生匹配的结构化错误结果后继续循环。
+- [x] 默认设置版本、迭代、工具调用、执行时间和全局并发限制都有显式断言。
+- [x] 事件、Snapshot、Summary 与最终工具历史的一致性验收覆盖新增行为。
+- [x] 主规格、原 Runtime tickets 05–10 和本组 tickets 的状态与当前实现及测试同步。

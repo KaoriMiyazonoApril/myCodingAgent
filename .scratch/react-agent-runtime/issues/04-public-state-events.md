@@ -4,7 +4,7 @@
 
 **Blocked by:** 03: 支持多轮 Thread 与版本化模型设置.
 
-**Status:** completed
+**Status:** complete
 
 - [x] `ThreadSnapshot`、`TurnSummary` 和公开消息只包含版本化、安全、JSON-compatible 数据。
 - [x] 阶段事件包含稳定 envelope 和每 Turn 单调递增 sequence。
