@@ -154,17 +154,19 @@ class WorkspaceFilesystem:
         page: list[str] = []
         line_parts: list[str] = []
         total_lines = 0
+        current_line_has_content = False
         skip_lf_after_cr = False
 
         def retain_line() -> None:
-            nonlocal total_lines
+            nonlocal current_line_has_content, total_lines
             total_lines += 1
             if offset <= total_lines < offset + limit:
                 page.append("".join(line_parts))
             line_parts.clear()
+            current_line_has_content = False
 
         def consume(decoded: str) -> None:
-            nonlocal skip_lf_after_cr
+            nonlocal current_line_has_content, skip_lf_after_cr
             start = 0
             index = 0
             if skip_lf_after_cr and decoded:
@@ -178,7 +180,9 @@ class WorkspaceFilesystem:
                     index += 1
                     continue
                 if index > start:
-                    line_parts.append(decoded[start:index])
+                    current_line_has_content = True
+                    if offset <= total_lines + 1 < offset + limit:
+                        line_parts.append(decoded[start:index])
                 retain_line()
                 if character == "\r":
                     if index + 1 < len(decoded) and decoded[index + 1] == "\n":
@@ -188,7 +192,9 @@ class WorkspaceFilesystem:
                 index += 1
                 start = index
             if start < len(decoded):
-                line_parts.append(decoded[start:])
+                current_line_has_content = True
+                if offset <= total_lines + 1 < offset + limit:
+                    line_parts.append(decoded[start:])
 
         try:
             bytes_read = 0
@@ -215,7 +221,7 @@ class WorkspaceFilesystem:
             raise
         except OSError as error:
             raise ToolOperationError("IO_ERROR", f"could not read file: {relative}") from error
-        if line_parts:
+        if current_line_has_content:
             retain_line()
         return (
             page,

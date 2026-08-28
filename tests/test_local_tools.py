@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import signal
 import time
+import tracemalloc
 from types import SimpleNamespace
 
 import pytest
@@ -369,6 +370,29 @@ def test_streamed_read_preserves_splitlines_semantics(
     assert total_lines == len(content.splitlines())
     assert relative == "lines.txt"
     assert fingerprint == content_fingerprint(content.encode("utf-8"))
+
+
+def test_streamed_read_discards_non_requested_long_line_content(tmp_path) -> None:
+    target = tmp_path / "long-first-line.txt"
+    chunk = b"x" * (64 * 1024)
+    with target.open("wb") as output:
+        for _ in range(64):
+            output.write(chunk)
+        output.write(b"\nsecond")
+    filesystem = WorkspaceFilesystem(tmp_path)
+
+    tracemalloc.start()
+    try:
+        page, total_lines, _, _ = filesystem.read_text_page(
+            "long-first-line.txt", offset=2, limit=1
+        )
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert page == ["second"]
+    assert total_lines == 2
+    assert peak_bytes < 1024 * 1024
 
 
 def test_write_file_creates_parent_directories_and_text_file(tmp_path) -> None:
