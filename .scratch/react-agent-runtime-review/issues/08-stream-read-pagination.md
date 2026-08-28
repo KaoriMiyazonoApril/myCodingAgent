@@ -4,10 +4,10 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] `read_text_page` 不再通过整文件 `read_bytes()`、完整 decode 与 `splitlines()` 实现分页。
-- [ ] 流式路径仍验证文件大小、严格 UTF-8、NUL、regular-file 与 workspace 安全规则。
-- [ ] 返回页面、总行数、末尾换行、空文件和 content fingerprint 与既有公开语义一致。
-- [ ] 测试直接证明分页路径使用有界分块读取且不调用整文件读取 helper。
-- [ ] 本地工具规格与实现及验收证据同步。
+- [x] `read_text_page` 不再通过整文件 `read_bytes()`、完整 decode 与 `splitlines()` 实现分页。
+- [x] 流式路径仍验证文件大小、严格 UTF-8、NUL、regular-file 与 workspace 安全规则。
+- [x] 返回页面、总行数、末尾换行、空文件和 content fingerprint 与既有公开语义一致。
+- [x] 测试直接证明分页路径使用有界分块读取且不调用整文件读取 helper。
+- [x] 本地工具规格与实现及验收证据同步。

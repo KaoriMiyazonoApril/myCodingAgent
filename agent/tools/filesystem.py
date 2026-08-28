@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import os
+import codecs
 import hashlib
+import os
 from pathlib import Path
 import stat
 import tempfile
@@ -14,6 +15,21 @@ DEFAULT_IGNORED_DIRECTORIES = frozenset(
     {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", "build", "dist"}
 )
 MAX_TEXT_FILE_BYTES = 10 * 1024 * 1024
+READ_CHUNK_BYTES = 64 * 1024
+_LINE_SEPARATORS = frozenset(
+    {
+        "\n",
+        "\r",
+        "\v",
+        "\f",
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x85",
+        "\u2028",
+        "\u2029",
+    }
+)
 
 
 def content_fingerprint(content: bytes) -> str:
@@ -129,27 +145,83 @@ class WorkspaceFilesystem:
     def read_text_page(
         self, raw_path: object, *, offset: int, limit: int
     ) -> tuple[list[str], int, str, str]:
-        """Read one bounded text version and return its exact content fingerprint."""
+        """Stream one bounded text version and return its exact fingerprint."""
 
-        target, relative = self._resolve_text_file(raw_path)
+        byte_limit = MAX_TEXT_FILE_BYTES
+        target, relative = self._resolve_text_file(raw_path, max_bytes=byte_limit)
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        digest = hashlib.sha256()
+        page: list[str] = []
+        line_parts: list[str] = []
+        total_lines = 0
+        skip_lf_after_cr = False
+
+        def retain_line() -> None:
+            nonlocal total_lines
+            total_lines += 1
+            if offset <= total_lines < offset + limit:
+                page.append("".join(line_parts))
+            line_parts.clear()
+
+        def consume(decoded: str) -> None:
+            nonlocal skip_lf_after_cr
+            start = 0
+            index = 0
+            if skip_lf_after_cr and decoded:
+                if decoded[0] == "\n":
+                    index = 1
+                    start = 1
+                skip_lf_after_cr = False
+            while index < len(decoded):
+                character = decoded[index]
+                if character not in _LINE_SEPARATORS:
+                    index += 1
+                    continue
+                if index > start:
+                    line_parts.append(decoded[start:index])
+                retain_line()
+                if character == "\r":
+                    if index + 1 < len(decoded) and decoded[index + 1] == "\n":
+                        index += 1
+                    elif index + 1 == len(decoded):
+                        skip_lf_after_cr = True
+                index += 1
+                start = index
+            if start < len(decoded):
+                line_parts.append(decoded[start:])
+
         try:
-            content_bytes = target.read_bytes()
-            content = content_bytes.decode("utf-8")
+            bytes_read = 0
+            with target.open("rb") as source:
+                while chunk := source.read(READ_CHUNK_BYTES):
+                    bytes_read += len(chunk)
+                    if bytes_read > byte_limit:
+                        raise ToolOperationError(
+                            "FILE_TOO_LARGE",
+                            f"file exceeds the {byte_limit}-byte resource limit: {relative}",
+                        )
+                    if b"\0" in chunk:
+                        raise ToolOperationError(
+                            "NOT_TEXT", f"file contains NUL bytes: {relative}"
+                        )
+                    digest.update(chunk)
+                    consume(decoder.decode(chunk))
+                consume(decoder.decode(b"", final=True))
         except UnicodeDecodeError as error:
             raise ToolOperationError(
                 "NOT_TEXT", f"file is not valid UTF-8: {relative}"
             ) from error
+        except ToolOperationError:
+            raise
         except OSError as error:
             raise ToolOperationError("IO_ERROR", f"could not read file: {relative}") from error
-        if "\0" in content:
-            raise ToolOperationError("NOT_TEXT", f"file contains NUL bytes: {relative}")
-        lines = content.splitlines()
-        page = lines[offset - 1 : offset - 1 + limit]
+        if line_parts:
+            retain_line()
         return (
             page,
-            len(lines),
+            total_lines,
             relative,
-            content_fingerprint(content_bytes),
+            digest.hexdigest(),
         )
 
     def write_text_file(self, raw_path: object, content: object) -> tuple[str, int]:

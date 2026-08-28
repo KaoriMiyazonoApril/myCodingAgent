@@ -12,7 +12,7 @@ import pytest
 
 from agent.core.messages import ToolCallBlock
 from agent.tools.local import create_local_tool_registry
-from agent.tools.filesystem import content_fingerprint
+from agent.tools.filesystem import WorkspaceFilesystem, content_fingerprint
 from agent.tools.process import (
     BubblewrapSandboxBackend,
     CommandSandboxBackend,
@@ -285,6 +285,89 @@ def test_read_file_returns_numbered_page_and_metadata(tmp_path) -> None:
         "truncated": True,
         "content_fingerprint": content_fingerprint(b"first\nsecond\nthird\n"),
     }
+
+
+def test_read_text_page_streams_bounded_chunks_across_text_boundaries(
+    tmp_path, monkeypatch
+) -> None:
+    content = "abαxyz\r\nabα\nlast"
+    target = tmp_path / "chunked.txt"
+    target.write_text(content, encoding="utf-8")
+    filesystem = WorkspaceFilesystem(tmp_path)
+    original_open = Path.open
+    requested_sizes: list[int] = []
+
+    class TrackingReader:
+        def __init__(self, source) -> None:
+            self._source = source
+
+        def __enter__(self):
+            self._source.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._source.__exit__(*args)
+
+        def read(self, size: int = -1) -> bytes:
+            requested_sizes.append(size)
+            return self._source.read(size)
+
+    def tracking_open(path: Path, *args, **kwargs):
+        source = original_open(path, *args, **kwargs)
+        if path == target and args == ("rb",):
+            return TrackingReader(source)
+        return source
+
+    monkeypatch.setattr("agent.tools.filesystem.READ_CHUNK_BYTES", 4)
+    monkeypatch.setattr(Path, "open", tracking_open)
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("paged reads must not load the whole file")
+        ),
+    )
+
+    page, total_lines, relative, fingerprint = filesystem.read_text_page(
+        "chunked.txt", offset=2, limit=1
+    )
+
+    assert page == ["abα"]
+    assert total_lines == 3
+    assert relative == "chunked.txt"
+    assert fingerprint == content_fingerprint(content.encode("utf-8"))
+    assert len(requested_sizes) > 1
+    assert set(requested_sizes) == {4}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        "one",
+        "one\n",
+        "\n",
+        "one\n\n",
+        "one\r\ntwo\rthree",
+        "a\vb\fc\x1cd\x1de\x1ef\x85g\u2028h\u2029",
+    ],
+)
+def test_streamed_read_preserves_splitlines_semantics(
+    tmp_path, monkeypatch, content
+) -> None:
+    target = tmp_path / "lines.txt"
+    target.write_text(content, encoding="utf-8")
+    filesystem = WorkspaceFilesystem(tmp_path)
+    monkeypatch.setattr("agent.tools.filesystem.READ_CHUNK_BYTES", 1)
+
+    page, total_lines, relative, fingerprint = filesystem.read_text_page(
+        "lines.txt", offset=1, limit=2000
+    )
+
+    assert page == content.splitlines()
+    assert total_lines == len(content.splitlines())
+    assert relative == "lines.txt"
+    assert fingerprint == content_fingerprint(content.encode("utf-8"))
 
 
 def test_write_file_creates_parent_directories_and_text_file(tmp_path) -> None:
