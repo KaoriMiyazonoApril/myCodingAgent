@@ -451,3 +451,26 @@ def test_configuration_errors_use_project_exception(factory) -> None:
 def test_invalid_reasoning_capabilities_are_configuration_errors() -> None:
     with pytest.raises(LLMConfigurationError, match="reasoning_retention"):
         ProviderCapabilities(reasoning_retention=True)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("context_window", [0, True, -1])
+def test_invalid_context_window_capabilities_are_configuration_errors(
+    context_window,
+) -> None:
+    with pytest.raises(LLMConfigurationError, match="context_window_tokens"):
+        ProviderCapabilities(context_window_tokens=context_window)
+
+
+def test_model_profile_can_override_provider_context_window() -> None:
+    profile = ProviderProfile(
+        base_url="https://example.invalid",
+        default_capabilities=ProviderCapabilities(context_window_tokens=32_000),
+        model_profiles={
+            "large": ModelProfile(context_window_tokens=128_000),
+            "unknown": ModelProfile(context_window_tokens=None),
+        },
+    )
+
+    assert profile.capabilities_for("plain").context_window_tokens == 32_000
+    assert profile.capabilities_for("large").context_window_tokens == 128_000
+    assert profile.capabilities_for("unknown").context_window_tokens is None

@@ -25,6 +25,18 @@ class WorkspaceValidationLimitError(RuntimeError):
     code = "WORKSPACE_VALIDATION_LIMIT"
 
 
+class ContextLimitError(RuntimeError):
+    """A complete model request cannot fit the configured context budget."""
+
+    code = "CONTEXT_LIMIT"
+
+
+class IdempotencyConflictError(RuntimeError):
+    """An idempotency key was reused for a different Turn submission."""
+
+    code = "IDEMPOTENCY_CONFLICT"
+
+
 class SettingsConflictError(RuntimeError):
     """A settings update used an obsolete Thread version."""
 

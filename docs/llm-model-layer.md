@@ -68,7 +68,9 @@ thinking 启用参数在该底层边界仍通过 `extra_body` 指定。Agent Run
 任意参数逃生口，而是从 allowlisted `ThinkingSettings` 生成受限的 `thinking` 对象。
 `ProviderCapabilities.thinking` 使用 `ThinkingCapabilities` 声明所选模型是否支持开关、
 `budget_tokens` 以及允许的 `keep` 值；`ModelInvoker` 在第一次请求前逐项校验，未知或
-不支持的组合 fail closed 为 `UNSUPPORTED_MODEL_SETTING`。
+不支持的组合 fail closed 为 `UNSUPPORTED_MODEL_SETTING`。Capability 还可通过
+`context_window_tokens` 声明所选模型的上下文容量；Runtime 用它在每次请求前执行保守
+容量检查，但该字段不改变底层 API payload。
 
 解析响应时，文本变成 `TextBlock`，能力声明匹配到的字符串 reasoning 字段变成
 `ReasoningBlock`。工具调用参数用 `json.loads` 解析为 `dict`。空参数
@@ -92,9 +94,10 @@ envelope：`ok`、`content`、`metadata`、`error_code` 会一起进入 tool mes
 仍可用 `base_url` 覆盖。每个 `ProviderProfile` 提供默认 capabilities，并可通过精确模型
 名映射到 `ModelProfile` 的逐字段覆盖；未覆盖字段继承 provider 默认值。对于可空字段，
 内部 `UNSET` 表示继承，而显式 `None` 表示禁用，因此 model profile 可以清除 provider
-默认的 reasoning 输入字段。Thinking 能力同样可由精确模型 profile 整体覆盖，Runtime
-据此校验当前选择，而不是按 provider 名称猜测。调用方也可在创建配置时显式传入完整
-capabilities。
+默认的 reasoning 输入字段。Thinking 能力与 context window 同样可由精确模型 profile
+覆盖，Runtime 据此校验当前选择，而不是按 provider 名称猜测。预设不硬编码可能变化的
+模型容量；没有显式容量声明时，Runtime 使用自身的保守默认值。调用方也可在创建配置时
+显式传入完整 capabilities。
 
 当前 DeepSeek 预设面向 `deepseek-v4-flash` 与 `deepseek-v4-pro` 等当前模型，不再保留已
 退役的 `deepseek-chat` / `deepseek-reasoner` 特例；其 reasoning 使用

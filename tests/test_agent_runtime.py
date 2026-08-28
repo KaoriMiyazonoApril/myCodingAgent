@@ -30,6 +30,8 @@ from agent.model.types import (
 )
 from agent.runtime import (
     AgentLimits,
+    ContextLimitError,
+    IdempotencyConflictError,
     ModelSettings,
     PolicyDecision,
     SettingsConflictError,
@@ -206,6 +208,15 @@ def test_public_event_configuration_fails_closed(runtime_option) -> None:
             ),
             tool_registry_factory=empty_tools,
             **runtime_option,
+        )
+
+
+@pytest.mark.parametrize("context_window", [0, True, 10_000_001])
+def test_default_context_window_configuration_fails_closed(context_window) -> None:
+    with pytest.raises(ValueError, match="default_context_window_tokens"):
+        runtime_for_provider(
+            ScriptedProvider([]),
+            default_context_window_tokens=context_window,
         )
 
 
@@ -1006,6 +1017,174 @@ def test_thread_rejects_a_second_turn_while_one_is_running(tmp_path) -> None:
 
     assert turn_status is TurnStatus.COMPLETED
     assert thread_status is ThreadStatus.IDLE
+
+
+def test_oversized_first_request_is_rejected_without_mutating_history(tmp_path) -> None:
+    provider = ScriptedProvider([final_response()])
+    provider.capabilities = ProviderCapabilities(context_window_tokens=2_000)
+    runtime = runtime_for_provider(provider)
+    thread = runtime.create_thread(tmp_path)
+
+    with pytest.raises(ContextLimitError) as captured:
+        asyncio.run(runtime.run_turn(thread.thread_id, "x" * 5_000))
+
+    snapshot = runtime.get_snapshot(thread.thread_id)
+    assert captured.value.code == "CONTEXT_LIMIT"
+    assert provider.requests == []
+    assert snapshot.status is ThreadStatus.IDLE
+    assert snapshot.completed_turns == 0
+    assert snapshot.messages == []
+
+
+def test_context_is_checked_again_after_a_large_tool_result(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                ToolCallBlock(
+                    id="large-result",
+                    name="large_result",
+                    arguments={},
+                )
+            ),
+            final_response(),
+        ]
+    )
+    provider.capabilities = ProviderCapabilities(context_window_tokens=4_000)
+
+    def tools(_: Path) -> ToolRegistry:
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="large_result",
+                description="Return a deliberately large result",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            ),
+            lambda _arguments: ToolResult(content="x" * 5_000, metadata={}),
+        )
+        return registry
+
+    runtime = runtime_for_provider(provider, tool_registry_factory=tools)
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Use the tool."))
+
+    assert summary.status is TurnStatus.FAILED
+    assert summary.stop_reason == "context_limit"
+    assert summary.error == {
+        "code": "CONTEXT_LIMIT",
+        "message": "conversation exceeds the model context budget",
+    }
+    assert len(provider.requests) == 1
+    assert len(runtime.get_snapshot(thread.thread_id).messages) == 3
+
+
+def test_completed_idempotent_submission_returns_the_original_summary(tmp_path) -> None:
+    provider = ScriptedProvider([final_response("Only once.")])
+    runtime = runtime_for_provider(provider)
+    thread = runtime.create_thread(tmp_path)
+
+    first = asyncio.run(
+        runtime.run_turn(
+            thread.thread_id,
+            "Do this once.",
+            idempotency_key="request-1",
+        )
+    )
+    duplicate = asyncio.run(
+        runtime.run_turn(
+            thread.thread_id,
+            "Do this once.",
+            idempotency_key="request-1",
+        )
+    )
+
+    snapshot = runtime.get_snapshot(thread.thread_id)
+    assert duplicate == first
+    assert duplicate is not first
+    assert len(provider.requests) == 1
+    assert snapshot.completed_turns == 1
+    assert len(snapshot.messages) == 2
+
+
+def test_concurrent_idempotent_submission_joins_the_active_turn(tmp_path) -> None:
+    async def scenario() -> tuple[TurnSummary, TurnSummary, int]:
+        provider = PausingProvider()
+        runtime = runtime_for_provider(provider)
+        thread = runtime.create_thread(tmp_path)
+        first = asyncio.create_task(
+            runtime.run_turn(
+                thread.thread_id,
+                "Do this once.",
+                idempotency_key="request-1",
+            )
+        )
+        await provider.started.wait()
+        duplicate = asyncio.create_task(
+            runtime.run_turn(
+                thread.thread_id,
+                "Do this once.",
+                idempotency_key="request-1",
+            )
+        )
+        await asyncio.sleep(0)
+        provider.release.set()
+        first_summary, duplicate_summary = await asyncio.gather(first, duplicate)
+        return (
+            first_summary,
+            duplicate_summary,
+            runtime.get_snapshot(thread.thread_id).completed_turns,
+        )
+
+    first, duplicate, completed_turns = asyncio.run(scenario())
+
+    assert duplicate == first
+    assert duplicate.turn_id == first.turn_id
+    assert completed_turns == 1
+
+
+def test_reusing_an_idempotency_key_for_different_input_is_rejected(tmp_path) -> None:
+    runtime = runtime_for_provider(ScriptedProvider([final_response()]))
+    thread = runtime.create_thread(tmp_path)
+    asyncio.run(
+        runtime.run_turn(
+            thread.thread_id,
+            "Original input.",
+            idempotency_key="request-1",
+        )
+    )
+
+    with pytest.raises(IdempotencyConflictError) as captured:
+        asyncio.run(
+            runtime.run_turn(
+                thread.thread_id,
+                "Different input.",
+                idempotency_key="request-1",
+            )
+        )
+
+    assert captured.value.code == "IDEMPOTENCY_CONFLICT"
+
+
+@pytest.mark.parametrize("key", ["", "   ", "x" * 201, 1])
+def test_invalid_idempotency_keys_fail_before_starting_a_turn(tmp_path, key) -> None:
+    provider = ScriptedProvider([final_response()])
+    runtime = runtime_for_provider(provider)
+    thread = runtime.create_thread(tmp_path)
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        asyncio.run(
+            runtime.run_turn(
+                thread.thread_id,
+                "Do work.",
+                idempotency_key=key,
+            )
+        )
+
+    assert provider.requests == []
 
 
 def test_multiple_tools_and_a_recoverable_error_preserve_result_order(

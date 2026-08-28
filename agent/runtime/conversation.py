@@ -29,6 +29,14 @@ class Conversation:
     def request_messages(self) -> list[Message]:
         return list(self._messages)
 
+    def prospective_request_messages(self, user_text: str) -> list[Message]:
+        """Return the first request for a possible Turn without mutating history."""
+
+        return [
+            *self._messages,
+            Message(role="user", content=[TextBlock(text=user_text)]),
+        ]
+
     def public_messages(self) -> list[dict[str, object]]:
         """Return a detached transcript without system prompts or reasoning."""
 

@@ -66,6 +66,7 @@ class ProviderCapabilities:
     reasoning_output_fields: tuple[str, ...] = ("reasoning_content", "thinking")
     requires_assistant_content_for_tool_calls: bool = False
     thinking: ThinkingCapabilities = field(default_factory=ThinkingCapabilities)
+    context_window_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reasoning_retention, ReasoningRetention):
@@ -85,6 +86,14 @@ class ProviderCapabilities:
             )
         if not isinstance(self.thinking, ThinkingCapabilities):
             raise LLMConfigurationError("thinking must be ThinkingCapabilities")
+        if self.context_window_tokens is not None and (
+            isinstance(self.context_window_tokens, bool)
+            or not isinstance(self.context_window_tokens, int)
+            or self.context_window_tokens <= 0
+        ):
+            raise LLMConfigurationError(
+                "context_window_tokens must be a positive integer or None"
+            )
         if not isinstance(self.reasoning_output_fields, tuple) or any(
             not isinstance(field_name, str) or not field_name
             for field_name in self.reasoning_output_fields
@@ -103,6 +112,7 @@ class ModelProfile:
     reasoning_output_fields: tuple[str, ...] | _Unset = _UNSET
     requires_assistant_content_for_tool_calls: bool | None = None
     thinking: ThinkingCapabilities | None = None
+    context_window_tokens: int | None | _Unset = _UNSET
 
     def apply(self, defaults: ProviderCapabilities) -> ProviderCapabilities:
         return ProviderCapabilities(
@@ -128,6 +138,11 @@ class ModelProfile:
             ),
             thinking=(
                 self.thinking if self.thinking is not None else defaults.thinking
+            ),
+            context_window_tokens=(
+                defaults.context_window_tokens
+                if self.context_window_tokens is _UNSET
+                else self.context_window_tokens
             ),
         )
 

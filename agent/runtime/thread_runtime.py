@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
@@ -17,6 +17,8 @@ from .conversation import Conversation
 from .change_tracker import ChangeTracker
 from .errors import (
     ApprovalTimeoutError,
+    ContextLimitError,
+    IdempotencyConflictError,
     SettingsConflictError,
     ThreadBusyError,
     TurnLimitReached,
@@ -54,6 +56,14 @@ class _ActiveTurn:
 
 
 @dataclass(slots=True)
+class _IdempotentSubmission:
+    user_text: str
+    settings_override: TurnSettingsOverride | None
+    future: asyncio.Future[TurnSummary] | None
+    summary: TurnSummary | None = None
+
+
+@dataclass(slots=True)
 class _ThreadRecord:
     thread_id: str
     workspace: Path
@@ -67,6 +77,9 @@ class _ThreadRecord:
     updated_at: str = ""
     latest_turn: TurnSummary | None = None
     events: EventBuffer | None = None
+    idempotent_submissions: dict[str, _IdempotentSubmission] = field(
+        default_factory=dict
+    )
 
 
 class ThreadRuntime:
@@ -89,6 +102,7 @@ class ThreadRuntime:
         workspace_validation_max_entries: int = 100_000,
         workspace_validation_max_seconds: float = 10,
         workspace_validation_clock: Callable[[], float] | None = None,
+        default_context_window_tokens: int = 32_000,
     ) -> None:
         if reasoning_visibility not in {"hidden", "debug"}:
             raise ValueError("reasoning_visibility must be 'hidden' or 'debug'")
@@ -117,6 +131,14 @@ class ThreadRuntime:
             getattr(tool_policy, "decide", None)
         ):
             raise ValueError("tool_policy must provide decide(call)")
+        if (
+            isinstance(default_context_window_tokens, bool)
+            or not isinstance(default_context_window_tokens, int)
+            or not 1 <= default_context_window_tokens <= 10_000_000
+        ):
+            raise ValueError(
+                "default_context_window_tokens must be between 1 and 10000000"
+            )
         self._tool_registry_factory = tool_registry_factory
         self._provider_resolver = provider_resolver
         self._default_settings = default_settings
@@ -131,6 +153,7 @@ class ThreadRuntime:
         self._workspace_leases = WorkspaceLeaseManager(max_active_turns)
         self._tool_policy = tool_policy or AllowAllPolicy()
         self._approval_timeout_seconds = approval_timeout_seconds
+        self._default_context_window_tokens = default_context_window_tokens
         validator_options: dict[str, object] = {
             "max_entries": workspace_validation_max_entries,
             "max_seconds": workspace_validation_max_seconds,
@@ -165,8 +188,26 @@ class ThreadRuntime:
         user_text: str,
         *,
         settings_override: TurnSettingsOverride | None = None,
+        idempotency_key: str | None = None,
     ) -> TurnSummary:
+        if not isinstance(user_text, str):
+            raise ValueError("user_text must be a string")
+        self._validate_idempotency_key(idempotency_key)
         record = self._threads[thread_id]
+        if idempotency_key is not None:
+            existing = record.idempotent_submissions.get(idempotency_key)
+            if existing is not None:
+                if (
+                    existing.user_text != user_text
+                    or existing.settings_override != settings_override
+                ):
+                    raise IdempotencyConflictError(
+                        "idempotency key was already used for another Turn"
+                    )
+                if existing.summary is not None:
+                    return deepcopy(existing.summary)
+                assert existing.future is not None
+                return deepcopy(await asyncio.shield(existing.future))
         if record.status is not ThreadStatus.IDLE:
             raise ThreadBusyError(f"thread already has an active turn: {thread_id}")
         turn_id = str(uuid4())
@@ -190,6 +231,11 @@ class ThreadRuntime:
             provider,
             turn_config,
             retry_delays=self._model_retry_delays,
+            default_context_window_tokens=self._default_context_window_tokens,
+        )
+        model.ensure_context(
+            record.conversation.prospective_request_messages(user_text),
+            record.tools.definitions(),
         )
         workspace_lease = self._workspace_leases.acquire(record.workspace)
         try:
@@ -198,6 +244,7 @@ class ThreadRuntime:
             self._workspace_leases.release(workspace_lease)
             raise
         record.status = ThreadStatus.RUNNING
+        submission: _IdempotentSubmission | None = None
         try:
             record.conversation.append_user(user_text)
             record.updated_at = utc_now()
@@ -232,6 +279,13 @@ class ThreadRuntime:
                 started_at=utc_now(),
             )
             record.active_turn = active_turn
+            if idempotency_key is not None:
+                submission = _IdempotentSubmission(
+                    user_text=user_text,
+                    settings_override=settings_override,
+                    future=asyncio.get_running_loop().create_future(),
+                )
+                record.idempotent_submissions[idempotency_key] = submission
             events.emit(
                 "turn_started",
                 {
@@ -248,7 +302,19 @@ class ThreadRuntime:
                     },
                 },
             )
-            return await self._execute_active_turn(record, active_turn, model)
+            summary = await self._execute_active_turn(record, active_turn, model)
+            if submission is not None:
+                submission.summary = deepcopy(summary)
+                assert submission.future is not None
+                submission.future.set_result(deepcopy(summary))
+                submission.future = None
+            return summary
+        except BaseException:
+            if idempotency_key is not None and submission is not None:
+                record.idempotent_submissions.pop(idempotency_key, None)
+                if submission.future is not None and not submission.future.done():
+                    submission.future.cancel()
+            raise
         finally:
             record.status = ThreadStatus.IDLE
             record.active_turn = None
@@ -307,6 +373,19 @@ class ThreadRuntime:
                 error={
                     "code": "APPROVAL_TIMEOUT",
                     "message": "tool approval timed out",
+                },
+            )
+        except ContextLimitError:
+            return self._finish_turn(
+                record,
+                active_turn,
+                status=TurnStatus.FAILED,
+                stop_reason="context_limit",
+                final_text=controller.last_assistant_text,
+                event_type="turn_failed",
+                error={
+                    "code": "CONTEXT_LIMIT",
+                    "message": "conversation exceeds the model context budget",
                 },
             )
         except Exception as error:
@@ -390,6 +469,19 @@ class ThreadRuntime:
         record.settings = updated
         record.updated_at = utc_now()
         return updated
+
+    @staticmethod
+    def _validate_idempotency_key(idempotency_key: str | None) -> None:
+        if idempotency_key is None:
+            return
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key.strip()
+            or len(idempotency_key) > 200
+        ):
+            raise ValueError(
+                "idempotency_key must be a non-empty string of at most 200 characters"
+            )
 
     @staticmethod
     def _set_waiting(record: _ThreadRecord, waiting: bool) -> None:

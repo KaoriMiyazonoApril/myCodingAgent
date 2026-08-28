@@ -40,7 +40,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   提交一个 Turn，并让完整模型响应与现有工具注册表顺序循环，直至模型返回最终文本。
 - 当前公开结果已覆盖完整 Thread 生命周期、版本化安全设置、阶段事件、运行预算、跨
   workspace 并发、Policy 与审批、文件 diff，以及严格 workspace 链接和挂载安全；
-  保守的上下文容量预检与提交幂等仍由后续 ticket 实现。
+  同时具备保守的上下文容量预检与 Turn 提交幂等。
 - `PromptBuilder` 已提供供应商无关的默认 coding-agent 约束，并把 Runtime 附加指令置于
   默认约束之后，避免调用方定制时覆盖 workspace 路径、文件工具、错误处理和验证要求。
 - Runtime 集成测试通过临时 workspace 中的真实 `read_file` 工具验证闭环；更完整的
@@ -104,6 +104,13 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   `symlink`、`symlinkat`、`link` 和 `linkat`，并在组合时运行真实 link probe；libseccomp、
   内核过滤或 link-blocking 能力不足均提前报告 sandbox unavailable，绝不降级。过滤只阻止
   新建链接，可信只读系统树中的既有链接仍可供普通 Linux 命令解析。
+- Ticket 10 已实现上下文容量预检与 Turn 提交幂等：`ModelInvoker` 在首次和每次后续模型
+  请求前，按完整消息、content block、工具 schema 与输出 token 预留执行 tokenizer-free
+  保守估算；模型 capability 可声明精确 context window，未声明时使用后端保守默认值。首个
+  请求超限以 `CONTEXT_LIMIT` 拒绝且不写入用户历史，工具结果使后续请求超限时则返回带相同
+  error code 的失败 Summary，历史从不被静默删除或总结。`run_turn()` 接受有界
+  `idempotency_key`；同 key、同 payload 的进行中重试等待原 Turn，完成后重试返回原 Summary，
+  不同 payload 复用同 key 明确返回 `IDEMPOTENCY_CONFLICT`，不会创建第二个 Turn。
 
 ## User Stories
 
@@ -221,7 +228,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Diff completeness is explicit. File-tool changes are tracked completely. Arbitrary source changes made inside `run_command` are not guaranteed to have a recoverable pre-command snapshot, so a Turn that may contain such changes reports `diff_complete = false`. The default prompt instructs the model to prefer file tools for source edits.
 - `PromptBuilder` supplies a provider-independent default system prompt and permits Runtime-provided additional system instructions. It does not automatically read `AGENTS.md` in this version. Loop enforcement remains code-owned rather than encoded only in prose.
 - The default prompt tells the model that it is a local coding agent, paths are workspace-relative, relevant files should be inspected before modification, source changes should prefer file tools, suitable validation should run before completion, tool errors must be handled honestly, and the final answer should summarize work and validation.
-- Conversation history is not compressed, summarized, or silently truncated. A conservative history message/token budget rejects a new Turn with `CONTEXT_LIMIT` when the Thread cannot safely fit another request. The user must create a new Thread.
+- Conversation history is not compressed, summarized, or silently truncated. `ContextBudget` estimates a provider-independent upper bound from serialized UTF-8 request bytes plus framing allowance and reserves the configured maximum output tokens. `ProviderCapabilities.context_window_tokens` overrides the Runtime's conservative 32,000-token fallback. An oversized first request is rejected with `CONTEXT_LIMIT` before history mutation; an oversized later tool-chain request terminates with a safe `CONTEXT_LIMIT` Summary. The user must create a new Thread.
 - `ThreadSnapshot` is a JSON-compatible public view containing Thread ID, normalized public workspace identifier, Thread status, public messages, active Turn ID, sanitized settings and version, timestamps, and the latest Turn summary where applicable. It never serializes internal Python objects directly.
 - Public messages contain user and assistant text plus structured tool calls and safe tool results. System prompts, credentials, internal tracebacks, and raw reasoning are excluded from the ordinary message list.
 - `TurnSummary` contains Turn ID, status, stop reason, final assistant text, modified files, file diffs, diff completeness, iteration/tool-call counters, accumulated usage, start/end timestamps, and an optional safe error summary. It is the final result of one Turn, not the mutable state of the whole Agent.
@@ -229,7 +236,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Reasoning transmission is backend-controlled by `reasoning_visibility`. The default `hidden` value emits no reasoning. Explicit `debug` emits a separate complete reasoning event after a model response; reasoning does not enter ordinary messages, summaries, or logs. The frontend may decide whether to render a reasoning event it has received.
 - Events are kept in a bounded in-memory ring buffer and must never block Agent execution because a consumer is slow or absent. Each event sequence allows gap detection; a consumer whose cursor expired retrieves a fresh Snapshot.
 - The future transport mapping uses REST-like commands for Thread creation, versioned settings updates, Turn submission, cancellation, approval, Snapshot retrieval, and Thread closure, with SSE for events. An HTTP adapter is not part of this implementation and the core Runtime must not depend on a Web framework.
-- Future Turn submission accepts an idempotency key and atomically requires the Thread to be `IDLE`. This behavior is represented in the core interface even before an HTTP adapter exists.
+- Turn submission accepts a non-empty, at-most-200-character idempotency key and atomically requires the Thread to be `IDLE` for a new key. A matching retry joins the in-flight result or returns a detached completed Summary; reuse with different user text or settings override fails with `IDEMPOTENCY_CONFLICT`. This core behavior is available before an HTTP adapter exists.
 - All external data has an explicit schema version. Compatibility is defined by JSON field semantics, not by importing Python dataclasses into a frontend.
 - The existing non-streaming model call remains sufficient for the first version. Agent events describe complete model stages; LLM token deltas and live command stdout/stderr are not required.
 

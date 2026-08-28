@@ -1,6 +1,8 @@
 """Public interface for the in-memory ReAct Agent Runtime."""
 
 from .errors import (
+    ContextLimitError,
+    IdempotencyConflictError,
     SettingsConflictError,
     ThreadBusyError,
     UnsafeWorkspaceError,
@@ -30,6 +32,8 @@ __all__ = [
     "SCHEMA_VERSION",
     "AgentLimits",
     "AllowAllPolicy",
+    "ContextLimitError",
+    "IdempotencyConflictError",
     "ThreadBusyError",
     "UnsafeWorkspaceError",
     "PromptBuilder",
