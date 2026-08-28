@@ -17,6 +17,7 @@ from agent.tools.types import (
 
 ToolExecutor = Callable[[dict[str, object]], ToolResult]
 AsyncToolExecutor = Callable[[dict[str, object]], Awaitable[ToolResult]]
+CloseCallback = Callable[[], None]
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +25,22 @@ logger = logging.getLogger(__name__)
 class ToolRegistry:
     """A workspace-independent registry of model-visible local tools."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, on_close: CloseCallback | None = None) -> None:
         self._tools: dict[
             str, tuple[ToolDefinition, ToolExecutor, AsyncToolExecutor | None]
         ] = {}
+        self._on_close = on_close
+        self._closed = False
+
+    def close(self) -> bool:
+        """Close owned resources once and report whether this call did so."""
+
+        if self._closed:
+            return False
+        self._closed = True
+        if self._on_close is not None:
+            self._on_close()
+        return True
 
     def register(
         self,
@@ -36,6 +49,8 @@ class ToolRegistry:
         *,
         async_executor: AsyncToolExecutor | None = None,
     ) -> None:
+        if self._closed:
+            raise RuntimeError("tool registry is closed")
         if definition.name in self._tools:
             raise ValueError(f"tool already registered: {definition.name}")
         self._tools[definition.name] = (definition, executor, async_executor)
@@ -48,6 +63,8 @@ class ToolRegistry:
         return None if registered is None else registered[0]
 
     def execute(self, call: ToolCallBlock) -> ToolResult:
+        if self._closed:
+            return self._closed_result(call)
         registered = self._tools.get(call.name)
         if registered is None:
             return ToolResult(
@@ -80,6 +97,8 @@ class ToolRegistry:
 
     async def execute_async(self, call: ToolCallBlock) -> ToolResult:
         """Dispatch without blocking an async Agent Loop or UI event loop."""
+        if self._closed:
+            return self._closed_result(call)
         registered = self._tools.get(call.name)
         if registered is None or registered[2] is None:
             worker = asyncio.create_task(asyncio.to_thread(self.execute, call))
@@ -112,3 +131,11 @@ class ToolRegistry:
                 metadata={},
                 error_code="INTERNAL_ERROR",
             )
+
+    @staticmethod
+    def _closed_result(call: ToolCallBlock) -> ToolResult:
+        return ToolResult(
+            content="tool registry is closed",
+            metadata={"tool": call.name, "tool_call_id": call.id},
+            error_code="TOOL_REGISTRY_CLOSED",
+        )

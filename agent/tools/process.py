@@ -43,6 +43,9 @@ class SandboxExecution:
 class CommandSandboxBackend(ABC):
     """Capability-probed, cancellable command execution boundary."""
 
+    def close(self) -> None:
+        """Release adapter-owned resources; repeated calls are safe."""
+
     @abstractmethod
     def check_available(self, workspace_root: Path) -> None:
         """Raise when this backend cannot protect the selected workspace."""
@@ -306,6 +309,11 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
     def _pass_fds(self) -> tuple[int, ...]:
         return () if self._seccomp_fd is None else (self._seccomp_fd,)
 
+    def close(self) -> None:
+        """Release the capability-probe descriptor owned by this backend."""
+
+        self._reset_capability()
+
     @staticmethod
     def _command(
         *,
@@ -475,6 +483,11 @@ class CommandRunner:
             else BubblewrapSandboxBackend()
         )
         self._sandbox.check_available(self._filesystem.root)
+
+    def close(self) -> None:
+        """Release resources owned by the configured sandbox backend."""
+
+        self._sandbox.close()
 
     def run(self, command: str, cwd: str, timeout_ms: int) -> ToolResult:
         """Synchronous entry point for CLI code and synchronous tests."""

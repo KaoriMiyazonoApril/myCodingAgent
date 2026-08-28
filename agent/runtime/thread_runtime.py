@@ -326,6 +326,8 @@ class ThreadRuntime:
             record.active_turn = None
             record.updated_at = utc_now()
             self._workspace_leases.release(workspace_lease)
+            if record.closing:
+                record.tools.close()
 
     async def _execute_active_turn(
         self,
@@ -489,6 +491,7 @@ class ThreadRuntime:
         active_turn = record.active_turn
         if active_turn is None:
             record.status = ThreadStatus.CLOSED
+            record.tools.close()
             return True
         active_turn.events.emit("thread_close_requested", {})
         active_turn.controller.cancel()

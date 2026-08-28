@@ -53,6 +53,38 @@ def test_local_tools_accept_an_explicit_command_sandbox_backend(tmp_path) -> Non
     assert result.metadata["stdout"] == "deterministic"
 
 
+def test_closing_local_tool_registry_releases_sandbox_once(tmp_path) -> None:
+    backend = DeterministicSandboxBackend()
+    registry = create_local_tool_registry(tmp_path, sandbox_backend=backend)
+
+    assert registry.close() is True
+    assert registry.close() is False
+    result = registry.execute(
+        ToolCallBlock(
+            id="after-close",
+            name="run_command",
+            arguments={"command": "printf should-not-run"},
+        )
+    )
+
+    assert backend.close_calls == 1
+    assert result.error_code == "TOOL_REGISTRY_CLOSED"
+
+
+def test_bubblewrap_close_releases_seccomp_descriptor_idempotently() -> None:
+    backend = BubblewrapSandboxBackend()
+    read_descriptor, write_descriptor = os.pipe()
+    os.close(write_descriptor)
+    backend._seccomp_fd = read_descriptor
+
+    backend.close()
+    backend.close()
+
+    with pytest.raises(OSError):
+        os.fstat(read_descriptor)
+    assert backend._seccomp_fd is None
+
+
 def test_falsey_explicit_sandbox_backend_is_not_replaced(tmp_path) -> None:
     class FalseySandboxBackend(DeterministicSandboxBackend):
         def __bool__(self) -> bool:
@@ -195,6 +227,16 @@ def test_command_sandbox_backends_share_execution_contract(
     assert result.metadata["exit_code"] == 9
     assert result.metadata["stdout"] == "out"
     assert result.metadata["stderr"] == "err"
+
+
+def test_command_sandbox_backends_share_idempotent_close_contract(
+    command_sandbox_backend,
+) -> None:
+    command_sandbox_backend.close()
+    command_sandbox_backend.close()
+
+    if isinstance(command_sandbox_backend, DeterministicSandboxBackend):
+        assert command_sandbox_backend.close_calls == 1
 
 
 def test_command_sandbox_backends_share_timeout_contract(

@@ -123,6 +123,10 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Review Ticket 02 已将 no-follow 检查扩展到 workspace 绝对路径的每个既存组件，并由
   Runtime 根规范化与文件工具共同复用；最终 workspace 本身是普通目录但任意父组件为
   symbolic link 时同样 fail closed，不再由 `resolve()` 静默接受路径别名。
+- Review Ticket 03 已补齐命令 sandbox 的资源关闭链路：关闭空闲 Thread 时立即幂等关闭
+  工具 registry；关闭活跃 Thread 时先完成 Turn 取消和 workspace lease 释放，再沿
+  `ToolRegistry`、`CommandRunner`、`CommandSandboxBackend` 释放 seccomp descriptor，
+  避免提前关闭与反复创建 Thread 时的文件描述符泄漏。
 
 ## User Stories
 
@@ -215,7 +219,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 
 - `Thread` is the long-lived conversation concept. It owns one immutable, normalized workspace reference, ordered conversation history, mutable default settings, a current status, an optional active Turn ID, and timestamps. Thread data is in-memory in the first version.
 - `Turn` is one user message plus one complete ReAct execution. A Thread may have many sequential Turns. A new Turn may be submitted only while its Thread is `IDLE`; submission changes the state atomically so two callers cannot both start.
-- Thread states are `IDLE`, `RUNNING`, `WAITING_APPROVAL`, and `CLOSED`. Turn states are `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, and `LIMIT_REACHED`. A completed, failed, cancelled, or limited Turn returns its Thread to `IDLE` unless the Thread is being closed. `close_thread()` is idempotent: it closes an idle Thread immediately, or marks an active Thread as closing, requests cancellation, and lets the existing terminal cleanup path release leases before publishing `CLOSED`. Snapshots and retained events remain readable after closure; commands that would mutate the Thread fail with `THREAD_CLOSED`.
+- Thread states are `IDLE`, `RUNNING`, `WAITING_APPROVAL`, and `CLOSED`. Turn states are `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, and `LIMIT_REACHED`. A completed, failed, cancelled, or limited Turn returns its Thread to `IDLE` unless the Thread is being closed. `close_thread()` is idempotent: it closes an idle Thread and its tool resources immediately, or marks an active Thread as closing, requests cancellation, and lets the existing terminal cleanup path release leases before closing the tool registry and publishing `CLOSED`. Snapshots and retained events remain readable after closure; commands that would mutate the Thread fail with `THREAD_CLOSED`.
 - `ThreadRuntime` is the highest external seam and the primary test surface. Its small interface covers Thread creation, settings updates, Turn submission, cancellation, approval resolution, event consumption, snapshot retrieval, and Thread closure. Transport adapters call this interface rather than reaching into Agent Loop modules.
 - The Agent Loop is deliberately narrow: request a model response, append the assistant message, finish if no tool calls exist, otherwise execute all calls in order and append all matching tool results. It does not implement retry, Policy, event serialization, file diffing, workspace locking, or provider-specific reasoning rules inline.
 - `Conversation` owns ordered internal `Message` values and constructs each model request history. It preserves valid tool-call/tool-result pairings and delegates provider-specific reasoning encoding to existing model capabilities. Switching models between Turns retains text and tool history while allowing the selected provider adapter to filter reasoning according to its capabilities.

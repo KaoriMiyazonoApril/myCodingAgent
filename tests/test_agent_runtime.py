@@ -1129,7 +1129,13 @@ def test_thread_rejects_a_second_turn_while_one_is_running(tmp_path) -> None:
 def test_closing_an_idle_thread_preserves_snapshot_and_rejects_mutation(
     tmp_path,
 ) -> None:
-    runtime = runtime_for_provider(ScriptedProvider([final_response("Finished.")]))
+    closed: list[str] = []
+    runtime = runtime_for_provider(
+        ScriptedProvider([final_response("Finished.")]),
+        tool_registry_factory=lambda _: ToolRegistry(
+            on_close=lambda: closed.append("closed")
+        ),
+    )
     thread = runtime.create_thread(tmp_path)
     summary = asyncio.run(runtime.run_turn(thread.thread_id, "Finish once."))
 
@@ -1139,7 +1145,9 @@ def test_closing_an_idle_thread_preserves_snapshot_and_rejects_mutation(
     assert snapshot.status is ThreadStatus.CLOSED
     assert snapshot.latest_turn == summary
     assert len(snapshot.messages) == 2
+    assert closed == ["closed"]
     assert runtime.close_thread(thread.thread_id) is False
+    assert closed == ["closed"]
     with pytest.raises(ThreadClosedError) as turn_error:
         asyncio.run(runtime.run_turn(thread.thread_id, "Too late."))
     with pytest.raises(ThreadClosedError) as settings_error:
@@ -1165,7 +1173,18 @@ def test_closing_an_active_thread_cancels_it_and_releases_workspace(
         list[str],
     ]:
         provider = PausingProvider()
-        runtime = runtime_for_provider(provider)
+        closed_registries: list[int] = []
+        registry_index = 0
+
+        def tools(_: Path) -> ToolRegistry:
+            nonlocal registry_index
+            current = registry_index
+            registry_index += 1
+            return ToolRegistry(
+                on_close=lambda: closed_registries.append(current)
+            )
+
+        runtime = runtime_for_provider(provider, tool_registry_factory=tools)
         closing_thread = runtime.create_thread(tmp_path)
         next_thread = runtime.create_thread(tmp_path)
         active = asyncio.create_task(
@@ -1173,7 +1192,9 @@ def test_closing_an_active_thread_cancels_it_and_releases_workspace(
         )
         await provider.started.wait()
         assert runtime.close_thread(closing_thread.thread_id) is True
+        assert closed_registries == []
         cancelled = await active
+        assert closed_registries == [0]
         closed_snapshot = runtime.get_snapshot(closing_thread.thread_id)
         event_types = [
             event.type
@@ -1181,6 +1202,7 @@ def test_closing_an_active_thread_cancels_it_and_releases_workspace(
         ]
         provider.release.set()
         next_summary = await runtime.run_turn(next_thread.thread_id, "Continue.")
+        assert closed_registries == [0]
         return cancelled, closed_snapshot, next_summary, event_types
 
     cancelled, closed_snapshot, next_summary, event_types = asyncio.run(scenario())

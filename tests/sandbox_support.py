@@ -14,6 +14,8 @@ class DeterministicSandboxBackend(CommandSandboxBackend):
 
     def __init__(self) -> None:
         self.checked_workspaces: list[Path] = []
+        self.close_calls = 0
+        self._closed = False
 
     def check_available(self, workspace_root: Path) -> None:
         self.checked_workspaces.append(workspace_root)
@@ -26,6 +28,12 @@ class DeterministicSandboxBackend(CommandSandboxBackend):
         relative_cwd: str,
     ) -> list[str]:
         return ["/usr/bin/bash", "--noprofile", "--norc", "-c", command]
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.close_calls += 1
 
 
 def create_test_tool_registry(workspace_root: Path) -> ToolRegistry:

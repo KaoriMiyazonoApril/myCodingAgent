@@ -252,7 +252,7 @@ def create_local_tool_registry(
 
     filesystem = WorkspaceFilesystem(workspace_root)
     runner = CommandRunner(filesystem, sandbox_backend=sandbox_backend)
-    registry = ToolRegistry()
+    registry = ToolRegistry(on_close=runner.close)
     registry.register(
         ToolDefinition(
             name="read_file",

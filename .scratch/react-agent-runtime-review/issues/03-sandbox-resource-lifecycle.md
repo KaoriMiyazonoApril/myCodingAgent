@@ -4,9 +4,9 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] `CommandSandboxBackend` adapter contract 提供幂等资源关闭语义。
-- [ ] 关闭空闲 Thread 会关闭其工具 registry 持有的 sandbox 资源。
-- [ ] 关闭活跃 Thread 时先完成取消与 lease 清理，再关闭 sandbox，不发生 use-after-close。
-- [ ] 生产 Bubblewrap 与确定性测试 adapter 均通过资源生命周期 contract 测试。
+- [x] `CommandSandboxBackend` adapter contract 提供幂等资源关闭语义。
+- [x] 关闭空闲 Thread 会关闭其工具 registry 持有的 sandbox 资源。
+- [x] 关闭活跃 Thread 时先完成取消与 lease 清理，再关闭 sandbox，不发生 use-after-close。
+- [x] 生产 Bubblewrap 与确定性测试 adapter 均通过资源生命周期 contract 测试。

@@ -55,6 +55,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 30. As an application author, I want command-sandbox capability checked during local-tool composition, so that an unsupported host fails before the first model command.
 31. As a model, I want a selected search path to remain a hard boundary even when it contains symlinks, so that a subtree search cannot read a sibling file.
 32. As a runtime author, I want file reads and searches to have byte, file-count, line-length, duration, and regex-time limits, so that model-controlled inputs cannot exhaust memory or monopolize a worker.
+33. As an application author, I want closing a tool registry to release its command-sandbox resources exactly once, so that repeatedly creating and closing Threads does not leak capability descriptors.
 
 ## Implementation Decisions
 
@@ -62,7 +63,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 - A new execution-domain result carries model-readable content, JSON-compatible metadata, and an optional stable error code. `ok` and `is_error` are derived exclusively from the presence of that code; no independently mutable error boolean exists.
 - `ToolResult.to_message_block` binds an execution result to a tool call. The model adapter serializes `ok`, content, metadata, and error code together as a JSON tool-message envelope.
 - The common executable-tool interface accepts an existing, already accepted tool call and returns an execution result. Individual tools contain capability behavior only: they do not perform approval, permission-policy, UI, agent-loop, or conversation-history work.
-- The registry is a deep module with a small interface: registration, lookup, definition enumeration, and consistent execution dispatch. It owns no workspace configuration, file system, process service, policy, or runtime state.
+- The registry is a deep module with a small interface: registration, lookup, definition enumeration, consistent execution dispatch, and idempotent closure. It owns no workspace configuration, file system, process service, policy, or runtime state; composition may attach one opaque cleanup callback for services captured by registered executors.
 - The registry offers synchronous `execute` for CLI/tests and `execute_async` for Agent Loop/UI callers. Ordinary synchronous tools use a worker thread; cancellation waits for that worker to become quiescent and marks its returned result for Runtime reconciliation before the Turn may release shared state. Tools with an async executor, notably `run_command`, remain natively async and cancellable.
 - Runtime composition is explicit: it constructs shared filesystem and process modules from the configured workspace, injects those modules into tools, then registers tools. No global workspace configuration is introduced.
 - A filesystem module centralizes relative-path normalization, absolute-path rejection, workspace containment, final symlink containment, UTF-8 validation, regular-file validation, atomic text replacement, and controlled traversal. It accepts `/` path separators at the tool interface and returns workspace-relative POSIX paths.
@@ -74,7 +75,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 - `glob` and `grep` use a single platform-neutral Python traversal implementation rather than selecting between ripgrep and a fallback. They return only regular files, use stable workspace-relative POSIX ordering, retain at most 200 matches, stop as soon as a 201st match proves truncation, scan at most 10,000 files, and expose truncation.
 - Default traversal excludes `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `build`, and `dist`. The exclusion is overridden only when the caller explicitly chooses such a directory as `path`; a matching-looking pattern does not override it.
 - `glob` treats its pattern as a relative pathlib-style glob below the selected path. `grep` treats `pattern` as a timeout-capable regular expression and optional `include` as a glob against workspace-relative POSIX paths. Invalid regexes produce `INVALID_REGEX`; a match exceeding 50 ms produces `REGEX_TIMEOUT`. `grep` additionally limits each file to 5 MiB, cumulative selected content to 50 MiB, each line to 100,000 characters, and the search to 5 seconds. Reaching a non-fatal scan boundary sets `truncated = true`.
-- The process module resolves `cwd` through the filesystem module. Its public `CommandSandboxBackend` seam owns capability probing and cancellable command execution. The default `BubblewrapSandboxBackend` requires Linux or WSL2 plus `bwrap`, and runs `bash --noprofile --norc -c` in a new namespace with only `/usr`, process/device support, an ephemeral `/tmp`, and the workspace mounted read-write. Host environment variables, host paths, capabilities, and network namespaces are not inherited. Runtime composition executes a minimal command through the real sandbox configuration, not merely `which bwrap`, and raises `CommandSandboxUnavailableError` immediately if installation, user namespaces, mounts, or container policy make the backend unusable; it never silently falls back to a host shell. Explicit backend injection exists for controlled application composition and deterministic contract tests.
+- The process module resolves `cwd` through the filesystem module. Its public `CommandSandboxBackend` seam owns capability probing, cancellable command execution, and idempotent resource closure. The default `BubblewrapSandboxBackend` requires Linux or WSL2 plus `bwrap`, and runs `bash --noprofile --norc -c` in a new namespace with only `/usr`, process/device support, an ephemeral `/tmp`, and the workspace mounted read-write. Host environment variables, host paths, capabilities, and network namespaces are not inherited. Runtime composition executes a minimal command through the real sandbox configuration, not merely `which bwrap`, and raises `CommandSandboxUnavailableError` immediately if installation, user namespaces, mounts, or container policy make the backend unusable; it never silently falls back to a host shell. Explicit backend injection exists for controlled application composition and deterministic contract tests. Closing the composed registry delegates through `CommandRunner.close()` and releases Bubblewrap's retained seccomp descriptor exactly once; later execution fails closed.
 - Command timeout defaults to 60,000 ms and is constrained to 1 through 300,000 ms. The process module captures stdout and stderr independently, preserving bounded head and tail portions of each 100 KiB stream. It reports duration, exit code, timeout, and truncation. Exit zero is success, non-zero is `COMMAND_FAILED`, and timeout is `TIMEOUT`.
 - `CommandRunner` uses `asyncio.create_subprocess_exec()` and async stream readers. Timeout and coroutine cancellation terminate the owned process group and bound cleanup waits; pending reads are cancelled rather than closing a stream beneath a reader thread. This prevents pipe-lock deadlocks and commands surviving an Agent/UI stop.
 - Error codes include at least invalid arguments, unknown tool, workspace escape, not found, not a file, not text, file too large, invalid regex, regex timeout, missing edit match, ambiguous edit, I/O failure, process start failure, command failure, timeout, and unexpected internal failure. Expected operational failures are converted into execution results at the registry/tool seam; unexpected exceptions are logged with traceback while only a safe message reaches the model.
@@ -87,7 +88,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 - The main execution seam is the registry executing an existing parsed tool call and returning an execution result. This reuses the project’s existing tool-call domain model and avoids introducing a parallel call representation.
 - Filesystem tests use temporary workspaces and cover normal read, read pagination and missing files; write create, overwrite and parent creation; edit success, zero-match immutability, multiple-match immutability, global replacement, and empty old-string rejection.
 - Search tests use temporary workspace trees and cover regular-file glob results, workspace-relative path normalization, selected-subtree symlink containment, regex line matches, line numbers, include filtering, default ignores, explicit ignored-directory paths, early result limits, file/byte bounds, invalid regex errors, and regex timeouts.
-- Process tests cover stdout/stderr separation, zero and non-zero exit codes, workspace-relative cwd, timeout behavior, partial output retention where deterministic, output truncation, and command-start failures.
+- Process tests cover stdout/stderr separation, zero and non-zero exit codes, workspace-relative cwd, timeout behavior, partial output retention where deterministic, output truncation, command-start failures, and idempotent sandbox resource closure.
 - Cross-cutting tests cover absolute paths, traversal attempts, external symlink targets, non-text files, strict validation, all six registry definitions, duplicate registration behavior, unknown tools, and the absence of uncaught expected operational exceptions.
 - Existing pytest tests for the OpenAI-compatible provider demonstrate the repository’s style: direct construction of local dataclasses, dependency injection where an external client would otherwise be required, and assertions on stable local domain types. The new tests follow that style.
 
@@ -119,14 +120,16 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
   symbolic link 不会先被 `resolve` 跟随。`ToolOperationError` 将预期的本地操作失败编码为
   稳定错误码。
 - `process.py` 的 `CommandSandboxBackend` 统一能力探测、异步输出采集、超时与进程组取消
-  生命周期；生产 `BubblewrapSandboxBackend` 负责构造隔离命令，测试 adapter 通过同一
+  及幂等资源关闭生命周期；生产 `BubblewrapSandboxBackend` 负责构造隔离命令并在关闭时
+  释放 seccomp descriptor，测试 adapter 通过同一
   contract 提供确定性执行。`CommandRunner` 通过受验证的初始目录运行一次 shell 命令，并分别在
   metadata 中返回 stdout、stderr、持续时间、退出码、`command_succeeded`、sandbox、
   超时和截断状态。非零退出返回 `COMMAND_FAILED`，超时返回 `TIMEOUT`。
 - `registry.py` 的 `ToolRegistry` 提供注册、查找、定义列举及对既有
   `ToolCallBlock` 的统一分派；它不保存任何工作区配置。同步工具在 worker thread 中执行，
   取消或 deadline 到达时会先等待 worker 静止，再把实际结果交还 Runtime 记录，避免后台
-  文件修改越过 workspace lease 生命周期。
+  文件修改越过 workspace lease 生命周期。其 `close()` 幂等调用组合层注入的资源清理回调，
+  关闭后所有执行请求均 fail closed。
 - `local.py` 显式组合共享的文件系统与进程服务，并注册
   `read_file`、`write_file`、`edit_file`、`glob`、`grep`、`run_command` 六个工具。
   组合函数可显式接收一个 `CommandSandboxBackend`；未提供时只使用生产 Bubblewrap，
