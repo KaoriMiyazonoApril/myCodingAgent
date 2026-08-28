@@ -3,3 +3,6 @@
 __pycache__/
 *.py[cod]
 .worktrees/
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
