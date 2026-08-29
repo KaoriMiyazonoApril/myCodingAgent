@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 import logging
+from pathlib import Path
 from typing import Protocol
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.runtime import (
@@ -130,10 +133,41 @@ def create_app(
     runtime_factory: RuntimeFactory | None = None,
     event_stream_adapter: EventStreamAdapter | None = None,
     dev_mode: bool = False,
+    static_dir: Path | None = None,
+    shutdown_timeout_seconds: float = 10.0,
 ) -> FastAPI:
     """Compose the local Host at its highest HTTP test seam."""
 
-    app = FastAPI(title="Local Agent Host")
+    browser = workspace_browser or WorkspaceBrowser()
+    runtime_builder = runtime_factory or production_runtime_factory(provider_store)
+    threads = ThreadHost(
+        provider_store=provider_store,
+        workspace_browser=browser,
+        runtime_factory=runtime_builder,
+    )
+    turn_tasks = TurnTaskManager(threads)
+    event_stream = event_stream_adapter or EventStreamAdapter(threads, turn_tasks)
+
+    async def shutdown_resources() -> None:
+        await turn_tasks.shutdown()
+        await threads.shutdown()
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        yield
+        try:
+            await asyncio.wait_for(
+                shutdown_resources(),
+                timeout=shutdown_timeout_seconds,
+            )
+        except TimeoutError as error:
+            logger.critical(
+                "Agent Host shutdown exceeded %.1f seconds",
+                shutdown_timeout_seconds,
+            )
+            raise RuntimeError("Agent Host shutdown timed out") from error
+
+    app = FastAPI(title="Local Agent Host", lifespan=lifespan)
     if dev_mode:
         app.add_middleware(
             CORSMiddleware,
@@ -141,20 +175,13 @@ def create_app(
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
             allow_headers=["Content-Type", "Last-Event-ID"],
         )
-    browser = workspace_browser or WorkspaceBrowser()
-    threads = ThreadHost(
-        provider_store=provider_store,
-        workspace_browser=browser,
-        runtime_factory=runtime_factory or production_runtime_factory(provider_store),
-    )
-    turn_tasks = TurnTaskManager(threads)
-    event_stream = event_stream_adapter or EventStreamAdapter(threads, turn_tasks)
     app.state.provider_store = provider_store
     app.state.model_catalog = model_catalog
     app.state.workspace_browser = browser
     app.state.thread_host = threads
     app.state.turn_tasks = turn_tasks
     app.state.event_stream = event_stream
+    app.state.shutdown_resources = shutdown_resources
 
     def with_submission(view: dict[str, object]) -> dict[str, object]:
         snapshot = view["snapshot"]
@@ -497,6 +524,31 @@ def create_app(
             model=request.model,
         )
         return {"schema_version": SCHEMA_VERSION, "provider": provider}
+
+    @app.api_route(
+        "/api/{path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        include_in_schema=False,
+    )
+    async def unknown_api(path: str) -> JSONResponse:
+        return _error_response(404, "NOT_FOUND", "API route does not exist")
+
+    if static_dir is not None:
+        index_path = static_dir / "index.html"
+        assets_path = static_dir / "assets"
+        app.mount(
+            "/assets",
+            StaticFiles(directory=assets_path, check_dir=True),
+            name="assets",
+        )
+
+        @app.get("/", include_in_schema=False)
+        async def web_index() -> FileResponse:
+            return FileResponse(index_path)
+
+        @app.get("/{path:path}", include_in_schema=False)
+        async def web_fallback(path: str) -> FileResponse:
+            return FileResponse(index_path)
 
     return app
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import inspect
 from pathlib import Path
 from typing import Protocol
 
@@ -137,6 +138,18 @@ class ThreadHost:
     def runtime(self) -> RuntimeView | None:
         return self._runtime
 
+    async def shutdown(self) -> None:
+        """Close Runtime Threads and Host-owned Provider resources."""
+
+        if self._runtime is not None:
+            for thread_id in self._thread_ids:
+                self._runtime.close_thread(thread_id)
+        close = getattr(self._runtime_factory, "close", None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
     def _view(self, thread_id: str) -> dict[str, object]:
         runtime = self._require_thread(thread_id)
         snapshot = runtime.get_snapshot(thread_id)
@@ -180,18 +193,24 @@ class ThreadHost:
             ) from error
 
 
-def production_runtime_factory(store: ProviderStore) -> RuntimeFactory:
-    """Build the Runtime lazily while resolving credentials only for model calls."""
+class ProductionRuntimeFactory:
+    """Build one Runtime and retain its low-level clients for Host shutdown."""
 
-    def create(default_settings: ModelSettings) -> ThreadRuntime:
+    def __init__(self, store: ProviderStore) -> None:
+        self._store = store
+        self._providers: list[OpenAICompatibleProvider] = []
+
+    def __call__(self, default_settings: ModelSettings) -> ThreadRuntime:
         def resolve(provider_config_id: str, model: str) -> OpenAICompatibleProvider:
-            credential = store.get_credential(provider_config_id)
+            credential = self._store.get_credential(provider_config_id)
             config = create_provider_config(
                 provider_config_id,
                 api_key=credential,
                 model=model,
             )
-            return OpenAICompatibleProvider(config)
+            provider = OpenAICompatibleProvider(config)
+            self._providers.append(provider)
+            return provider
 
         return ThreadRuntime(
             tool_registry_factory=create_local_tool_registry,
@@ -199,4 +218,13 @@ def production_runtime_factory(store: ProviderStore) -> RuntimeFactory:
             default_settings=default_settings,
         )
 
-    return create
+    async def close(self) -> None:
+        providers, self._providers = self._providers, []
+        for provider in providers:
+            await provider.close()
+
+
+def production_runtime_factory(store: ProviderStore) -> RuntimeFactory:
+    """Build the Runtime lazily while resolving credentials only for model calls."""
+
+    return ProductionRuntimeFactory(store)

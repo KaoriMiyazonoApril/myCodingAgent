@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import fields
 import sys
@@ -46,6 +47,30 @@ def provider() -> OpenAICompatibleProvider:
         ),
         client=object(),
     )
+
+
+def test_provider_close_releases_async_sdk_client() -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    client = Client()
+    configured = OpenAICompatibleProvider(
+        ProviderConfig(
+            provider="deepseek",
+            base_url="https://example.invalid/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        client=client,
+    )
+
+    asyncio.run(configured.close())
+
+    assert client.closed is True
 
 
 def response(*, content: str | None, tool_calls=None, usage=None):

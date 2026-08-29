@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+import inspect
 from typing import Any
 
 from agent.core.messages import (
@@ -78,6 +79,16 @@ class OpenAICompatibleProvider(LLMProvider):
             raise self._translate_sdk_error(error) from error
 
         return self._parse_response(raw_response)
+
+    async def close(self) -> None:
+        """Release the owned SDK client when a Host lifecycle ends."""
+
+        close = getattr(self._client, "close", None)
+        if not callable(close):
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMEvent]:
         """Reserve the public interface without exposing SDK stream chunks."""
