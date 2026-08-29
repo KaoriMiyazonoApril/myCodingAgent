@@ -17,6 +17,8 @@ import {
   type ThreadView,
   type WorkspaceListing,
 } from "./api";
+import { ThreadEventClient } from "./eventClient";
+import { applyAgentEvent, hydrateThread } from "./events";
 import "./styles.css";
 
 export function App() {
@@ -278,7 +280,6 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
   const active = threads.find(
     (thread) => thread.snapshot.thread_id === activeId,
   ) ?? null;
-  const activeSubmission = active?.submission ?? null;
 
   useEffect(() => {
     let mounted = true;
@@ -305,42 +306,7 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
     };
   }, []);
 
-  useEffect(() => {
-    if (activeId === null || activeSubmission === null) {
-      return;
-    }
-    let mounted = true;
-    let timer: number | undefined;
-    const poll = async () => {
-      try {
-        const next = await getThread(activeId);
-        if (!mounted) {
-          return;
-        }
-        setThreads((current) =>
-          current.map((thread) =>
-            thread.snapshot.thread_id === activeId ? next : thread,
-          ),
-        );
-        if (next.submission !== null) {
-          timer = window.setTimeout(() => void poll(), 250);
-        }
-      } catch (reason: unknown) {
-        if (mounted) {
-          setError(reason instanceof Error ? reason.message : "Thread refresh failed");
-        }
-      }
-    };
-    timer = window.setTimeout(() => void poll(), 250);
-    return () => {
-      mounted = false;
-      if (timer !== undefined) {
-        window.clearTimeout(timer);
-      }
-    };
-  }, [activeId, activeSubmission]);
-
-  const replaceThread = (next: ThreadView) => {
+  const replaceThread = useCallback((next: ThreadView) => {
     setThreads((current) =>
       current.some(
         (thread) => thread.snapshot.thread_id === next.snapshot.thread_id,
@@ -351,7 +317,7 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
         : [...current, next],
     );
     setActiveId(next.snapshot.thread_id);
-  };
+  }, []);
 
   const run = async (operation: () => Promise<void>) => {
     setBusy(true);
@@ -487,6 +453,11 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
                     : "Cancelling…"}
               </p>
             ) : null}
+            <ThreadConversation
+              key={active.snapshot.thread_id}
+              thread={active}
+              onThread={replaceThread}
+            />
             <div className="composer">
               <label htmlFor="agent-composer">Ask Agent</label>
               <textarea
@@ -532,6 +503,103 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
           </p>
         )}
       </div>
+    </section>
+  );
+}
+
+function ThreadConversation({
+  thread,
+  onThread,
+}: {
+  thread: ThreadView;
+  onThread: (thread: ThreadView) => void;
+}) {
+  const [state, setState] = useState(() => hydrateThread(thread));
+  const [connection, setConnection] = useState<
+    "connecting" | "connected" | "disconnected"
+  >("connecting");
+  const [streamError, setStreamError] = useState<string | null>(null);
+  const [initialCursor] = useState(thread.event_cursor);
+  const threadId = thread.snapshot.thread_id;
+
+  useEffect(() => {
+    if (typeof EventSource === "undefined") {
+      return;
+    }
+    const client = new ThreadEventClient(
+      threadId,
+      initialCursor,
+      {
+        onEvent: (event) => {
+          setState((current) => applyAgentEvent(current, event));
+          setStreamError(null);
+        },
+        onSnapshot: (next) => {
+          onThread(next);
+          setState(hydrateThread(next));
+          setStreamError(null);
+        },
+        onConnection: setConnection,
+        recover: () => getThread(threadId),
+        onError: setStreamError,
+      },
+    );
+    client.start();
+    return () => client.stop();
+  }, [initialCursor, onThread, threadId]);
+
+  return (
+    <section className="conversation" aria-label="Conversation and activity">
+      <div className="conversation-heading">
+        <h4>Conversation</h4>
+        <span className={`connection-state ${connection}`}>{connection}</span>
+      </div>
+      {connection === "disconnected" ? (
+        <p className="inline-error" role="status">
+          Host event connection lost. Reconnecting without clearing this view…
+        </p>
+      ) : null}
+      {streamError ? (
+        <p className="inline-error" role="alert">
+          {streamError}
+        </p>
+      ) : null}
+      <div className="message-list">
+        {state.messages.map((message) => (
+          <article className={`message ${message.role}`} key={message.id}>
+            <p className="step-label">{message.role}</p>
+            <p>{message.text}</p>
+          </article>
+        ))}
+        {state.messages.length === 0 ? (
+          <p className="thread-empty">No messages yet.</p>
+        ) : null}
+      </div>
+      <div className="tool-list" aria-label="Tool activity">
+        {state.tools.map((tool) => (
+          <article className={`tool-card ${tool.status}`} key={tool.id}>
+            <div>
+              <strong>{tool.name}</strong>
+              <span>{tool.status}</span>
+            </div>
+            {tool.arguments !== null ? (
+              <pre>{JSON.stringify(tool.arguments, null, 2)}</pre>
+            ) : null}
+            {tool.result ? <pre>{tool.result}</pre> : null}
+            {tool.error_code ? <p>{tool.error_code}</p> : null}
+          </article>
+        ))}
+      </div>
+      {state.error ? (
+        <div className="inline-error" role="alert">
+          <strong>{state.error.code}</strong> · {state.error.message}
+        </div>
+      ) : null}
+      {state.terminal ? (
+        <p className="terminal-state">
+          Turn · {String(state.terminal.status ?? "finished")}
+        </p>
+      ) : null}
     </section>
   );
 }

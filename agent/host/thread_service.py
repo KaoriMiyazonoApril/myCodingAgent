@@ -103,6 +103,15 @@ class ThreadHost:
         self._require_thread(thread_id)
         return self._view(thread_id)
 
+    def get_events(
+        self,
+        thread_id: str,
+        *,
+        after_event_id: str | None = None,
+    ):
+        runtime = self._require_thread(thread_id)
+        return runtime.get_events(thread_id, after_event_id=after_event_id)
+
     def update_settings(
         self,
         thread_id: str,

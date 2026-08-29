@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.runtime import (
@@ -27,6 +28,7 @@ from .model_catalog import (
     ProviderAuthenticationError,
     ProviderResponseError,
 )
+from .event_stream import EventStreamAdapter, select_event_cursor
 from .provider_config import (
     ProviderConfigurationError,
     ProviderNotConfiguredError,
@@ -122,6 +124,7 @@ def create_app(
     model_catalog: ModelCatalog,
     workspace_browser: WorkspaceBrowser | None = None,
     runtime_factory: RuntimeFactory | None = None,
+    event_stream_adapter: EventStreamAdapter | None = None,
     dev_mode: bool = False,
 ) -> FastAPI:
     """Compose the local Host at its highest HTTP test seam."""
@@ -141,11 +144,13 @@ def create_app(
         runtime_factory=runtime_factory or production_runtime_factory(provider_store),
     )
     turn_tasks = TurnTaskManager(threads)
+    event_stream = event_stream_adapter or EventStreamAdapter(threads, turn_tasks)
     app.state.provider_store = provider_store
     app.state.model_catalog = model_catalog
     app.state.workspace_browser = browser
     app.state.thread_host = threads
     app.state.turn_tasks = turn_tasks
+    app.state.event_stream = event_stream
 
     def with_submission(view: dict[str, object]) -> dict[str, object]:
         snapshot = view["snapshot"]
@@ -354,6 +359,30 @@ def create_app(
             "schema_version": SCHEMA_VERSION,
             "thread": with_submission(threads.get_thread(thread_id)),
         }
+
+    @app.get("/api/threads/{thread_id}/events")
+    async def stream_thread_events(
+        thread_id: str,
+        request: Request,
+        after_event_id: str | None = None,
+    ) -> StreamingResponse:
+        threads.get_thread(thread_id)
+        cursor = select_event_cursor(
+            after_event_id,
+            request.headers.get("last-event-id"),
+        )
+        return StreamingResponse(
+            event_stream.stream(
+                thread_id,
+                after_event_id=cursor,
+                disconnected=request.is_disconnected,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.patch("/api/threads/{thread_id}/settings")
     async def update_thread_settings(

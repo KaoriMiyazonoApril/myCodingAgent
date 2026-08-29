@@ -9,9 +9,9 @@
 
 课程演示需要展示一次完整的 coding-agent 闭环：理解用户请求、检查文件、修改代码、运行
 验证、报告结果并提供本轮文件差异。Runtime 还需要允许多个不相交工作区并发执行，同时
-避免相同或相交工作区之间发生写入竞争。未来 React 前端会通过 HTTP 与后端交换配置、
-用户消息、状态和事件，因此核心领域模型必须可序列化且独立于具体 Web 框架，但本规格不
-实现 HTTP 或前端。
+避免相同或相交工作区之间发生写入竞争。独立 Agent Host/React 子系统现已通过 HTTP 与
+后端交换配置、用户消息和状态，并通过 SSE 读取 Runtime 事件；核心领域模型仍保持可序列化
+且独立于具体 Web 框架。Host/Web 的边界由 `docs/local-web-ui-host-spec.md` 约束。
 
 Agent Loop 必须保持短小、直接和易于阅读。重试、预算、取消、Policy、审批、工具分派、
 事件、文件版本跟踪、workspace lease 及完成状态等复杂规则不得堆积在主循环中，也不得
@@ -31,8 +31,9 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 调用方通过 Runtime 获取结构化 Snapshot、阶段级事件和 Turn Summary，无需理解这些内部
 实现。
 
-第一版状态全部保存在内存中。核心对象设计为 JSON 可序列化数据，未来可由 REST 接收命令、
-由 SSE 发送事件。HTTP adapter、React 前端、数据库和上下文压缩均留待后续实现。
+第一版状态全部保存在内存中。核心对象设计为 JSON 可序列化数据，现由独立 Host 通过 REST
+接收命令、由 SSE 转发事件。HTTP adapter 与 React 前端不进入 Runtime 模块；数据库和上下文
+压缩仍留待后续实现。
 
 ## Implementation Status
 
@@ -268,8 +269,8 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Every `AgentEvent` has schema version, event ID, Thread ID, nullable Turn ID, monotonically increasing sequence within its lifecycle scope, type, timestamp, and JSON-compatible payload. Turn stage events carry a Turn ID and per-Turn sequence. Thread-scoped events such as `settings_updated` use a null Turn ID and a separate per-Thread sequence. The shared bounded buffer and event-ID cursor preserve their total append order. Stage-level types cover Turn lifecycle, complete model response, tool request/start/finish, approval request/resolution, file changes, settings updates, cancellation, completion, failure, and limit termination.
 - Reasoning transmission is backend-controlled by `reasoning_visibility`. The default `hidden` value emits no reasoning. Explicit `debug` emits a separate complete reasoning event after a model response; reasoning does not enter ordinary messages, summaries, or logs. The frontend may decide whether to render a reasoning event it has received.
 - Events are kept in a bounded in-memory ring buffer and must never block Agent execution because a consumer is slow or absent. Each event sequence allows gap detection; a consumer whose cursor expired retrieves a fresh Snapshot.
-- The future transport mapping uses REST-like commands for Thread creation, versioned settings updates, Turn submission, cancellation, approval, Snapshot retrieval, and Thread closure, with SSE for events. An HTTP adapter is not part of this implementation and the core Runtime must not depend on a Web framework.
-- Turn submission accepts a non-empty, at-most-200-character idempotency key and atomically requires the Thread to be `IDLE` for a new key. A matching retry joins the in-flight result or returns a detached completed Summary; reuse with different user text or settings override fails with `IDEMPOTENCY_CONFLICT`. This core behavior is available before an HTTP adapter exists.
+- The separate Host transport maps Thread creation, versioned settings updates, Turn submission, cancellation, Snapshot retrieval, and Thread closure to HTTP commands and forwards Runtime events with SSE. Approval remains excluded from Web V1. The core Runtime still has no dependency on the Web framework.
+- Turn submission accepts a non-empty, at-most-200-character idempotency key and atomically requires the Thread to be `IDLE` for a new key. A matching retry joins the in-flight result or returns a detached completed Summary; reuse with different user text or settings override fails with `IDEMPOTENCY_CONFLICT`. The Host adapter consumes this behavior without moving it into transport code.
 - All external data has an explicit schema version. Compatibility is defined by JSON field semantics, not by importing Python dataclasses into a frontend.
 - The existing non-streaming model call remains sufficient for the first version. Agent events describe complete model stages; LLM token deltas and live command stdout/stderr are not required.
 
@@ -294,7 +295,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 
 ## Out of Scope
 
-- React UI, HTTP server, REST endpoint implementation, SSE server, WebSocket support, or frontend-generated types.
+- React UI, HTTP routes, and SSE framing remain outside the Runtime module and are specified in `docs/local-web-ui-host-spec.md`; WebSocket and frontend-generated Runtime types remain out of scope.
 - Database persistence, process-restart recovery, distributed locks, multi-process Runtime coordination, or durable event storage.
 - Mid-Turn user steering, concurrent Turns within one Thread, implicit Turn queues, or automatic cancellation of an older Turn.
 - Automatic context compression, summarization, silent history deletion, or provider-specific tokenizers.

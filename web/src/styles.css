@@ -471,6 +471,105 @@ button:disabled {
   font-weight: 650;
 }
 
+.conversation {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+.conversation-heading,
+.tool-card > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.conversation-heading h4 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.connection-state {
+  color: var(--muted);
+  font: 600 11px/1 "JetBrains Mono", ui-monospace, monospace;
+  text-transform: uppercase;
+}
+
+.connection-state.connected {
+  color: var(--accent);
+}
+
+.message-list,
+.tool-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.message {
+  max-width: 88%;
+  padding: 13px 15px;
+  border: 1px solid #40506b;
+  border-radius: 10px;
+  background: #141b2d;
+}
+
+.message.user {
+  margin-left: auto;
+  border-color: #527064;
+  background: #172823;
+}
+
+.message p {
+  margin: 7px 0 0;
+  white-space: pre-wrap;
+}
+
+.message .step-label {
+  margin: 0;
+}
+
+.tool-card {
+  padding: 13px;
+  border: 1px solid #40506b;
+  border-left: 3px solid #71809a;
+  border-radius: 8px;
+  background: #0d1424;
+}
+
+.tool-card.running {
+  border-left-color: #f7c45b;
+}
+
+.tool-card.success {
+  border-left-color: var(--accent);
+}
+
+.tool-card.error {
+  border-left-color: var(--danger);
+}
+
+.tool-card span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.tool-card pre {
+  max-height: 180px;
+  margin: 10px 0 0;
+  padding: 10px;
+  overflow: auto;
+  color: #cbd7e7;
+  background: #090f1c;
+  white-space: pre-wrap;
+}
+
+.terminal-state {
+  color: var(--accent);
+  font-weight: 650;
+}
+
 .composer {
   display: grid;
   gap: 9px;
