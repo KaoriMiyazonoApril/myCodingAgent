@@ -490,6 +490,48 @@ button:disabled {
   background: var(--border);
 }
 
+.new-thread-settings,
+.thread-settings-editor {
+  display: grid;
+  gap: 7px;
+}
+
+.new-thread-settings {
+  margin-bottom: 16px;
+}
+
+.new-thread-settings label,
+.thread-settings-editor label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.new-thread-settings input,
+.new-thread-settings select,
+.thread-settings-editor input,
+.thread-settings-editor select {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 10px;
+  border: 1px solid #52627c;
+  border-radius: 7px;
+  color: #f8fafc;
+  background: #0d1424;
+}
+
+.thread-settings-editor {
+  margin-top: 18px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.thread-settings-editor .primary-button {
+  margin-top: 5px;
+}
+
 .thread-sidebar-heading,
 .thread-detail-heading,
 .thread-controls {
@@ -552,6 +594,10 @@ button:disabled {
 .submission-status {
   color: var(--accent);
   font-weight: 650;
+}
+
+.cancel-requested {
+  color: #f7c45b;
 }
 
 .conversation {
@@ -824,10 +870,79 @@ button:disabled {
   text-transform: uppercase;
 }
 
-.changed-files-placeholder {
+.activity-timestamps {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.activity-timestamps div {
+  display: grid;
+  gap: 4px;
+}
+
+.activity-timestamps dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #dce5f2;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+}
+
+.changed-files {
   margin-top: 28px;
   padding-top: 18px;
   border-top: 1px solid var(--border);
+}
+
+.file-change {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.file-change summary {
+  padding: 10px;
+  overflow-wrap: anywhere;
+  font: 600 12px/1.4 "JetBrains Mono", ui-monospace, monospace;
+  cursor: pointer;
+}
+
+.file-change summary span {
+  margin-right: 5px;
+  color: var(--accent);
+  text-transform: uppercase;
+}
+
+.file-change pre {
+  max-height: 320px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+  color: #cbd7e7;
+  background: #090f1c;
+  font-size: 11px;
+  white-space: pre;
+}
+
+.file-change p,
+.diff-incomplete {
+  margin: 0;
+  padding: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.diff-incomplete {
+  margin-top: 10px;
+  border-left: 3px solid #f7c45b;
+  color: #ffe7af;
+  background: rgb(88 64 16 / 35%);
 }
 
 .console-error {

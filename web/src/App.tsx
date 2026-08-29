@@ -13,6 +13,7 @@ import {
   saveProvider,
   selectProviderDefault,
   startTurn,
+  updateThreadSettings,
   type ProviderView,
   type ThreadView,
   type WorkspaceListing,
@@ -20,6 +21,13 @@ import {
 import { ThreadEventClient } from "./eventClient";
 import { applyAgentEvent, hydrateThread } from "./events";
 import "./styles.css";
+
+const TERMINAL_EVENT_TYPES = new Set([
+  "turn_completed",
+  "turn_cancelled",
+  "turn_failed",
+  "turn_limit_reached",
+]);
 
 export function App() {
   const [providers, setProviders] = useState<ProviderView[]>([]);
@@ -296,6 +304,8 @@ function ThreadPanel({ providers, providerReady }: ThreadPanelProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [composer, setComposer] = useState("");
+  const [newProviderId, setNewProviderId] = useState<string | null>(null);
+  const [newModel, setNewModel] = useState<string | null>(null);
   const [mobileView, setMobileView] = useState<
     "navigation" | "conversation" | "activity"
   >("conversation");
@@ -303,6 +313,13 @@ function ThreadPanel({ providers, providerReady }: ThreadPanelProps) {
   const active = threads.find(
     (thread) => thread.snapshot.thread_id === activeId,
   ) ?? null;
+  const configuredProviders = providers.filter((provider) => provider.configured);
+  const defaultProvider =
+    providers.find((provider) => provider.is_default) ?? configuredProviders[0] ?? null;
+  const creationProvider =
+    providers.find((provider) => provider.provider_id === newProviderId) ??
+    defaultProvider;
+  const creationModel = newModel ?? creationProvider?.selected_model ?? "";
 
   useEffect(() => {
     let mounted = true;
@@ -342,45 +359,54 @@ function ThreadPanel({ providers, providerReady }: ThreadPanelProps) {
     setActiveId(next.snapshot.thread_id);
   }, []);
 
-  const run = async (operation: () => Promise<void>) => {
+  const run = async (failureLabel: string, operation: () => Promise<void>) => {
     setBusy(true);
     setError(null);
     try {
       await operation();
     } catch (reason: unknown) {
-      setError(reason instanceof Error ? reason.message : "Thread request failed");
+      const message = reason instanceof Error ? reason.message : "Host request failed";
+      setError(`${failureLabel} · ${message}`);
     } finally {
       setBusy(false);
     }
   };
 
   const create = () =>
-    run(async () => {
+    run("Thread creation failed", async () => {
       if (workspace === null) {
         throw new Error("Select a workspace before creating a Thread");
       }
       if (!providerReady) {
         throw new Error("Configure a default Provider and model first");
       }
-      replaceThread(await createThread(workspace));
+      if (creationProvider === null || !creationModel.trim()) {
+        throw new Error("Choose a configured Provider and model");
+      }
+      replaceThread(
+        await createThread(workspace, {
+          provider_config_id: creationProvider.provider_id,
+          model: creationModel.trim(),
+        }),
+      );
     });
 
   const refresh = () =>
-    run(async () => {
+    run("Thread refresh failed", async () => {
       if (activeId !== null) {
         replaceThread(await getThread(activeId));
       }
     });
 
   const close = () =>
-    run(async () => {
+    run("Thread close failed", async () => {
       if (activeId !== null) {
         replaceThread(await closeThread(activeId));
       }
     });
 
   const submit = () =>
-    run(async () => {
+    run("Turn submission failed", async () => {
       if (active === null) {
         throw new Error("Create or select a Thread first");
       }
@@ -393,12 +419,26 @@ function ThreadPanel({ providers, providerReady }: ThreadPanelProps) {
     });
 
   const stop = () =>
-    run(async () => {
+    run("Cancel failed", async () => {
       if (active === null) {
         throw new Error("No active Thread");
       }
       const submission = await cancelTurn(active.snapshot.thread_id);
       replaceThread({ ...active, submission });
+    });
+
+  const saveSettings = (providerId: string, model: string) =>
+    run("Settings update failed", async () => {
+      if (active === null) {
+        throw new Error("No active Thread");
+      }
+      replaceThread(
+        await updateThreadSettings(active.snapshot.thread_id, {
+          ...active.snapshot.settings,
+          provider_config_id: providerId,
+          model,
+        }),
+      );
     });
 
   const providerName = active
@@ -442,6 +482,34 @@ function ThreadPanel({ providers, providerReady }: ThreadPanelProps) {
       >
         <WorkspacePicker onSelect={setWorkspace} />
         <div className="sidebar-divider" />
+        <div className="new-thread-settings">
+          <label htmlFor="new-thread-provider">Provider</label>
+          <select
+            id="new-thread-provider"
+            value={creationProvider?.provider_id ?? ""}
+            disabled={configuredProviders.length === 0}
+            onChange={(event) => {
+              const selected = providers.find(
+                (provider) => provider.provider_id === event.target.value,
+              );
+              setNewProviderId(event.target.value);
+              setNewModel(selected?.selected_model ?? "");
+            }}
+          >
+            {configuredProviders.map((provider) => (
+              <option key={provider.provider_id} value={provider.provider_id}>
+                {provider.display_name}
+              </option>
+            ))}
+          </select>
+          <label htmlFor="new-thread-model">Model</label>
+          <input
+            id="new-thread-model"
+            value={creationModel}
+            disabled={creationProvider === null}
+            onChange={(event) => setNewModel(event.target.value)}
+          />
+        </div>
         <div className="thread-sidebar-heading">
           <div>
             <p className="step-label">SESSIONS</p>
@@ -450,7 +518,13 @@ function ThreadPanel({ providers, providerReady }: ThreadPanelProps) {
           <button
             type="button"
             className="primary-button"
-            disabled={busy || workspace === null || !providerReady}
+            disabled={
+              busy ||
+              workspace === null ||
+              !providerReady ||
+              creationProvider === null ||
+              !creationModel.trim()
+            }
             onClick={() => void create()}
           >
             New thread
@@ -480,7 +554,7 @@ function ThreadPanel({ providers, providerReady }: ThreadPanelProps) {
       ) : null}
       {active ? (
         <ActiveThreadView
-          key={active.snapshot.thread_id}
+          key={`${active.snapshot.thread_id}:${active.snapshot.updated_at}:${active.submission?.accepted_at ?? "idle"}`}
           thread={active}
           providerName={providerName}
           busy={busy}
@@ -491,7 +565,11 @@ function ThreadPanel({ providers, providerReady }: ThreadPanelProps) {
           onClose={() => void close()}
           onSubmit={() => void submit()}
           onStop={() => void stop()}
+          onSaveSettings={(providerId, model) =>
+            void saveSettings(providerId, model)
+          }
           onThread={replaceThread}
+          providers={configuredProviders}
         />
       ) : (
         <>
@@ -535,7 +613,9 @@ function ActiveThreadView({
   onClose,
   onSubmit,
   onStop,
+  onSaveSettings,
   onThread,
+  providers,
 }: {
   thread: ThreadView;
   providerName: string | null;
@@ -547,13 +627,22 @@ function ActiveThreadView({
   onClose: () => void;
   onSubmit: () => void;
   onStop: () => void;
+  onSaveSettings: (providerId: string, model: string) => void;
   onThread: (thread: ThreadView) => void;
+  providers: ProviderView[];
 }) {
-  const [state, setState] = useState(() => hydrateThread(thread));
+  const [state, setState] = useState(() => initialThreadState(thread));
   const [connection, setConnection] = useState<
     "connecting" | "connected" | "disconnected"
   >("connecting");
   const [streamError, setStreamError] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settingsProvider, setSettingsProvider] = useState(
+    thread.snapshot.settings.provider_config_id,
+  );
+  const [settingsModel, setSettingsModel] = useState(
+    thread.snapshot.settings.model,
+  );
   const [initialCursor] = useState(thread.event_cursor);
   const threadId = thread.snapshot.thread_id;
 
@@ -568,6 +657,15 @@ function ActiveThreadView({
         onEvent: (event) => {
           setState((current) => applyAgentEvent(current, event));
           setStreamError(null);
+          if (TERMINAL_EVENT_TYPES.has(event.type)) {
+            void getThread(threadId).then(onThread).catch((reason: unknown) => {
+              setStreamError(
+                reason instanceof Error
+                  ? `Snapshot recovery failed · ${reason.message}`
+                  : "Snapshot recovery failed",
+              );
+            });
+          }
         },
         onSnapshot: (next) => {
           onThread(next);
@@ -583,6 +681,10 @@ function ActiveThreadView({
     return () => client.stop();
   }, [initialCursor, onThread, threadId]);
 
+  const turnActive = thread.submission !== null && state.terminal === null;
+  const turnStatus = summaryText(state.terminal, "status") ?? "idle";
+  const usage = isRecord(state.terminal?.usage) ? state.terminal.usage : null;
+
   return (
     <>
       <section
@@ -595,6 +697,13 @@ function ActiveThreadView({
                 <h3>{thread.snapshot.thread_id}</h3>
               </div>
               <div className="thread-controls">
+                <button
+                  type="button"
+                  aria-expanded={showSettings}
+                  onClick={() => setShowSettings((current) => !current)}
+                >
+                  Thread settings
+                </button>
                 <button type="button" disabled={busy} onClick={onRefresh}>
                   Refresh active thread
                 </button>
@@ -603,17 +712,66 @@ function ActiveThreadView({
                 </button>
               </div>
         </div>
+            {showSettings ? (
+              <div className="thread-settings-editor" aria-label="Thread settings">
+                <label htmlFor="thread-settings-provider">Thread Provider</label>
+                <select
+                  id="thread-settings-provider"
+                  value={settingsProvider}
+                  disabled={busy || thread.snapshot.status === "closed"}
+                  onChange={(event) => {
+                    const next = providers.find(
+                      (provider) => provider.provider_id === event.target.value,
+                    );
+                    setSettingsProvider(event.target.value);
+                    setSettingsModel(next?.selected_model ?? "");
+                  }}
+                >
+                  {providers.map((provider) => (
+                    <option key={provider.provider_id} value={provider.provider_id}>
+                      {provider.display_name}
+                    </option>
+                  ))}
+                </select>
+                <label htmlFor="thread-settings-model">Thread model</label>
+                <input
+                  id="thread-settings-model"
+                  value={settingsModel}
+                  disabled={busy || thread.snapshot.status === "closed"}
+                  onChange={(event) => setSettingsModel(event.target.value)}
+                />
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={
+                    busy ||
+                    thread.snapshot.status === "closed" ||
+                    !settingsModel.trim()
+                  }
+                  onClick={() => onSaveSettings(settingsProvider, settingsModel.trim())}
+                >
+                  Save thread settings
+                </button>
+                <p className="field-help">
+                  Version {thread.snapshot.settings.version}; changes apply to the next model request.
+                </p>
+              </div>
+            ) : null}
             <p className="thread-workspace">{thread.snapshot.workspace}</p>
             <p className="thread-model">
               {providerName} · {thread.snapshot.settings.model} · settings v
               {thread.snapshot.settings.version}
             </p>
             <p className="thread-status">Status · {thread.snapshot.status}</p>
-            {thread.submission ? (
+            {state.cancel_requested ? (
+              <p className="submission-status cancel-requested" aria-live="polite">
+                Cancel requested…
+              </p>
+            ) : turnActive ? (
               <p className="submission-status" aria-live="polite">
-                {thread.submission.status === "starting"
+                {thread.submission?.status === "starting"
                   ? "Starting…"
-                  : thread.submission.status === "running"
+                  : thread.submission?.status === "running"
                     ? "Running…"
                     : "Cancelling…"}
               </p>
@@ -639,7 +797,7 @@ function ActiveThreadView({
                   className="primary-button"
                   disabled={
                     busy ||
-                    thread.submission !== null ||
+                    turnActive ||
                     thread.snapshot.status === "closed" ||
                     !composer.trim()
                   }
@@ -647,11 +805,11 @@ function ActiveThreadView({
                 >
                   Send
                 </button>
-                {thread.submission !== null ? (
+                {turnActive ? (
                   <button
                     type="button"
                     className="danger-button"
-                    disabled={busy || thread.submission.status === "cancelling"}
+                    disabled={busy || thread.submission?.status === "cancelling"}
                     onClick={onStop}
                   >
                     Stop
@@ -673,9 +831,17 @@ function ActiveThreadView({
         </div>
         <dl className="activity-summary">
           <div><dt>Thread</dt><dd>{thread.snapshot.status}</dd></div>
-          <div><dt>Turn</dt><dd>{thread.submission?.status ?? "idle"}</dd></div>
-          <div><dt>Tools</dt><dd>{state.tools.length}</dd></div>
+          <div><dt>Turn</dt><dd>{state.cancel_requested ? "cancel requested" : turnStatus}</dd></div>
+          <div><dt>Iterations</dt><dd>{summaryText(state.terminal, "iterations") ?? "—"}</dd></div>
+          <div><dt>Tool calls</dt><dd>{summaryText(state.terminal, "tool_calls") ?? state.tools.length}</dd></div>
+          <div><dt>Input tokens</dt><dd>{summaryText(usage, "input_tokens") ?? "—"}</dd></div>
+          <div><dt>Output tokens</dt><dd>{summaryText(usage, "output_tokens") ?? "—"}</dd></div>
+          <div><dt>Stop reason</dt><dd>{summaryText(state.terminal, "stop_reason") ?? "—"}</dd></div>
           <div><dt>Completed</dt><dd>{thread.snapshot.completed_turns}</dd></div>
+        </dl>
+        <dl className="activity-timestamps">
+          <div><dt>Started</dt><dd>{summaryText(state.terminal, "started_at") ?? "—"}</dd></div>
+          <div><dt>Ended</dt><dd>{summaryText(state.terminal, "ended_at") ?? "—"}</dd></div>
         </dl>
         <div className="activity-tool-list" aria-label="Tool activity summary">
           {state.tools.map((tool) => (
@@ -688,9 +854,22 @@ function ActiveThreadView({
           ))}
           {state.tools.length === 0 ? <p className="thread-empty">No tool calls yet.</p> : null}
         </div>
-        <div className="changed-files-placeholder">
+        <div className="changed-files">
           <p className="step-label">CHANGED FILES</p>
-          <p className="thread-empty">File changes will appear when reported by Runtime events.</p>
+          {state.files.map((file) => (
+            <details className="file-change" key={file.path}>
+              <summary><span>{file.change_type}</span> {file.path}</summary>
+              {file.diff ? <pre>{file.diff}</pre> : <p>No text diff available.</p>}
+            </details>
+          ))}
+          {state.files.length === 0 ? (
+            <p className="thread-empty">No reported file changes.</p>
+          ) : null}
+          {state.terminal?.diff_complete === false ? (
+            <p className="diff-incomplete" role="status">
+              Diff may be incomplete because a command could have changed files outside tracked file tools.
+            </p>
+          ) : null}
         </div>
         {state.terminal ? (
           <p className="terminal-state">Turn · {String(state.terminal.status ?? "finished")}</p>
@@ -753,6 +932,12 @@ function ConversationFeed({
               <details open={tool.status === "error"}>
                 <summary>Result</summary>
                 <pre>{tool.result}</pre>
+              </details>
+            ) : null}
+            {tool.metadata ? (
+              <details>
+                <summary>Metadata</summary>
+                <pre>{JSON.stringify(tool.metadata, null, 2)}</pre>
               </details>
             ) : null}
             {tool.error_code ? <p>{tool.error_code}</p> : null}
@@ -906,7 +1091,7 @@ function ProviderEditor({ provider, onClose, onChange }: ProviderEditorProps) {
       </button>
 
       <div className="field-group">
-        <label htmlFor="provider-model">Model</label>
+        <label htmlFor="provider-model">Provider model</label>
         {models.length > 0 ? (
           <select
             id="provider-model"
@@ -964,4 +1149,29 @@ function ProviderEditor({ provider, onClose, onChange }: ProviderEditorProps) {
       </div>
     </aside>
   );
+}
+
+function summaryText(
+  record: Record<string, unknown> | null,
+  key: string,
+): string | null {
+  const value = record?.[key];
+  return typeof value === "string" || typeof value === "number"
+    ? String(value)
+    : null;
+}
+
+function initialThreadState(thread: ThreadView) {
+  const state = hydrateThread(thread);
+  if (thread.submission !== null) {
+    state.terminal = null;
+    state.error = null;
+    state.files = [];
+    state.cancel_requested = false;
+  }
+  return state;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

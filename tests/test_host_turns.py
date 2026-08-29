@@ -7,7 +7,7 @@ import time
 
 from fastapi.testclient import TestClient
 
-from agent.core.messages import Message, TextBlock
+from agent.core.messages import Message, TextBlock, ToolCallBlock
 from agent.host.app import create_app
 from agent.host.model_catalog import ModelDiscovery
 from agent.host.provider_config import ProviderStore
@@ -16,6 +16,7 @@ from agent.model.provider import LLMProvider
 from agent.model.types import LLMRequest, LLMResponse, Usage
 from agent.runtime import ModelSettings, ThreadRuntime
 from agent.tools.registry import ToolRegistry
+from tests.sandbox_support import create_test_tool_registry
 
 
 class _Catalog:
@@ -40,6 +41,22 @@ class _PausingProvider(LLMProvider):
             finish_reason="stop",
             usage=Usage(),
         )
+
+
+class _ScriptedProvider(LLMProvider):
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        self._responses = iter(responses)
+
+    async def chat(self, request: LLMRequest) -> LLMResponse:
+        return next(self._responses)
+
+
+def _tool_response(call: ToolCallBlock) -> LLMResponse:
+    return LLMResponse(
+        message=Message(role="assistant", content=[call]),
+        finish_reason="tool_calls",
+        usage=Usage(input_tokens=2, output_tokens=1, total_tokens=3),
+    )
 
 
 def _app(tmp_path: Path, provider: LLMProvider):
@@ -182,3 +199,91 @@ def test_closing_an_active_host_thread_cancels_and_reaches_closed(tmp_path) -> N
         assert closing.status_code == 200
         assert terminal["snapshot"]["status"] == "closed"
         assert terminal["snapshot"]["latest_turn"]["status"] == "cancelled"
+
+
+def test_host_runs_real_runtime_local_tools_and_returns_recoverable_diff(
+    tmp_path,
+) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("def answer():\n    return 1\n", encoding="utf-8")
+    provider = _ScriptedProvider(
+        [
+            _tool_response(
+                ToolCallBlock(
+                    id="host-read",
+                    name="read_file",
+                    arguments={"path": "app.py"},
+                )
+            ),
+            _tool_response(
+                ToolCallBlock(
+                    id="host-edit",
+                    name="edit_file",
+                    arguments={
+                        "path": "app.py",
+                        "old_string": "return 1",
+                        "new_string": "return 2",
+                    },
+                )
+            ),
+            _tool_response(
+                ToolCallBlock(
+                    id="host-test",
+                    name="run_command",
+                    arguments={
+                        "command": (
+                            "python3 -c \"import app; "
+                            "assert app.answer() == 2; print('passed')\""
+                        )
+                    },
+                )
+            ),
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[TextBlock(text="Updated and tested app.py.")],
+                ),
+                finish_reason="stop",
+                usage=Usage(input_tokens=4, output_tokens=2, total_tokens=6),
+            ),
+        ]
+    )
+    store = ProviderStore(tmp_path / "providers.json")
+    store.save_provider(
+        "deepseek",
+        api_key="test-key",
+        selected_model="deepseek-chat",
+    )
+    store.set_default("deepseek", model="deepseek-chat")
+
+    def runtime_factory(default_settings: ModelSettings) -> ThreadRuntime:
+        return ThreadRuntime(
+            tool_registry_factory=create_test_tool_registry,
+            provider_resolver=lambda provider_id, model: provider,
+            default_settings=default_settings,
+        )
+
+    app = create_app(
+        provider_store=store,
+        model_catalog=_Catalog(),
+        workspace_browser=WorkspaceBrowser([tmp_path]),
+        runtime_factory=runtime_factory,
+    )
+    with TestClient(app) as client:
+        thread_id = _create_thread(client, tmp_path)
+        accepted = client.post(
+            f"/api/threads/{thread_id}/turns",
+            json={"message": "Change and test the answer."},
+        )
+        terminal = _wait_for_idle(client, thread_id)
+
+    summary = terminal["snapshot"]["latest_turn"]
+    assert accepted.status_code == 202
+    assert source.read_text(encoding="utf-8") == "def answer():\n    return 2\n"
+    assert summary["status"] == "completed"
+    assert summary["iterations"] == 4
+    assert summary["tool_calls"] == 3
+    assert summary["modified_files"] == ["app.py"]
+    assert "-    return 1" in summary["file_diffs"][0]["diff"]
+    assert "+    return 2" in summary["file_diffs"][0]["diff"]
+    assert summary["diff_complete"] is False

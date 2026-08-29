@@ -28,6 +28,11 @@ class _RejectedCatalog:
         raise ProviderAuthenticationError("rejected upstream")
 
 
+class _UnexpectedCatalog:
+    async def discover(self, provider_id: str, api_key: str) -> ModelDiscovery:
+        raise RuntimeError(f"unexpected failure for {api_key} at /private/config")
+
+
 def test_provider_configuration_persists_without_exposing_secret(tmp_path) -> None:
     config_path = tmp_path / "config" / "providers.json"
     store = ProviderStore(config_path)
@@ -256,3 +261,26 @@ def test_provider_api_returns_stable_safe_errors(tmp_path) -> None:
         }
     }
     assert "secret" not in rejected.text
+
+
+def test_unknown_host_error_is_stable_and_redacts_internal_details(tmp_path) -> None:
+    store = ProviderStore(tmp_path / "providers.json")
+    store.save_provider("deepseek", api_key="never-return-this-secret")
+    client = TestClient(
+        create_app(provider_store=store, model_catalog=_UnexpectedCatalog()),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post("/api/providers/deepseek/models/discover")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "INTERNAL_ERROR",
+            "message": "Agent Host request failed",
+            "details": {},
+        }
+    }
+    assert "never-return-this-secret" not in response.text
+    assert "/private/config" not in response.text
+    assert "traceback" not in response.text.casefold()

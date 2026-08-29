@@ -176,3 +176,74 @@ test("applies live messages and safe rejection errors", () => {
     message: "Turn could not start",
   });
 });
+
+test("preserves terminal tools and reconstructs cancellation and file activity", () => {
+  let state = hydrateThread({
+    ...view(),
+    snapshot: { ...view().snapshot, messages: [], latest_turn: null },
+  });
+  state = applyAgentEvent(
+    state,
+    event("tool_finished", {
+      name: "edit_file",
+      result: {
+        tool_call_id: "call-edit",
+        ok: true,
+        content: "edited src/app.py",
+        metadata: { path: "src/app.py", replacements: 1 },
+        error_code: null,
+      },
+    }),
+  );
+  state = applyAgentEvent(
+    state,
+    event("tool_started", { tool_call_id: "call-edit", name: "edit_file" }),
+  );
+  state = applyAgentEvent(
+    state,
+    event("file_changed", {
+      path: "src/app.py",
+      change_type: "modified",
+      diff: "--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-old\n+new\n",
+    }),
+  );
+  state = applyAgentEvent(state, event("turn_cancel_requested", {}));
+  state = applyAgentEvent(
+    state,
+    event("turn_cancelled", {
+      summary: {
+        status: "cancelled",
+        stop_reason: "cancelled",
+        iterations: 2,
+        tool_calls: 1,
+        usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+        modified_files: ["src/app.py"],
+        file_diffs: [
+          {
+            path: "src/app.py",
+            change_type: "modified",
+            diff: "--- a/src/app.py\n+++ b/src/app.py\n",
+          },
+        ],
+        diff_complete: false,
+        started_at: "2026-08-29T00:00:00Z",
+        ended_at: "2026-08-29T00:00:03Z",
+      },
+    }),
+  );
+
+  expect(state.tools[0]).toMatchObject({
+    status: "success",
+    metadata: { path: "src/app.py", replacements: 1 },
+  });
+  expect(state.files).toEqual([
+    expect.objectContaining({ path: "src/app.py", change_type: "modified" }),
+  ]);
+  expect(state.cancel_requested).toBe(false);
+  expect(state.terminal).toMatchObject({
+    status: "cancelled",
+    iterations: 2,
+    tool_calls: 1,
+    diff_complete: false,
+  });
+});

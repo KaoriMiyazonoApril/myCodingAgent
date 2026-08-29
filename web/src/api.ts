@@ -120,12 +120,36 @@ export async function getThread(threadId: string): Promise<ThreadView> {
   return (await requestJson<ThreadResponse>(`/api/threads/${threadId}`)).thread;
 }
 
-export async function createThread(workspace: string): Promise<ThreadView> {
+export async function createThread(
+  workspace: string,
+  selection?: { provider_config_id: string; model: string },
+): Promise<ThreadView> {
   return (
     await requestJson<ThreadResponse>("/api/threads", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workspace }),
+      body: JSON.stringify({ workspace, ...selection }),
+    })
+  ).thread;
+}
+
+export async function updateThreadSettings(
+  threadId: string,
+  settings: ThreadSettings,
+): Promise<ThreadView> {
+  return (
+    await requestJson<ThreadResponse>(`/api/threads/${threadId}/settings`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_version: settings.version,
+        provider_config_id: settings.provider_config_id,
+        model: settings.model,
+        temperature: settings.temperature,
+        max_tokens: settings.max_tokens,
+        thinking: settings.thinking,
+        limits: settings.limits,
+      }),
     })
   ).thread;
 }

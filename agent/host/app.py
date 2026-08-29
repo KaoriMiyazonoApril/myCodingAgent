@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Protocol
 
 from fastapi import FastAPI, Request
@@ -54,6 +55,9 @@ from .workspace import (
     WorkspaceNotAccessibleError,
     WorkspaceNotFoundError,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class ModelCatalog(Protocol):
@@ -295,6 +299,17 @@ def create_app(
         error: ValueError,
     ) -> JSONResponse:
         return _error_response(400, "INVALID_ARGUMENT", "Request is invalid")
+
+    @app.exception_handler(Exception)
+    async def internal_error(
+        request: Request,
+        error: Exception,
+    ) -> JSONResponse:
+        logger.error(
+            "Unhandled Agent Host request failure; error_type=%s",
+            type(error).__name__,
+        )
+        return _error_response(500, "INTERNAL_ERROR", "Agent Host request failed")
 
     @app.get("/api/health")
     async def health() -> dict[str, object]:

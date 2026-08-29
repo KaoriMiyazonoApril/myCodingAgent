@@ -172,7 +172,7 @@ test("saves a key, discovers models, and selects a default", async () => {
   expect(key).toHaveValue("");
   expect(screen.getByText("Key saved · ••••cret")).toBeInTheDocument();
 
-  fireEvent.change(screen.getByLabelText("Model"), {
+  fireEvent.change(screen.getByLabelText("Provider model"), {
     target: { value: "deepseek-reasoner" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Use as default" }));
@@ -367,6 +367,7 @@ test("keeps workspace errors visible with a reload action", async () => {
 
 test("creates switches refreshes and closes Host threads", async () => {
   const requests: Array<{ path: string; method: string; body?: string }> = [];
+  let settingsUpdates = 0;
   const threadView = (id: string, workspace: string, status = "idle") => ({
     schema_version: 1,
     snapshot: {
@@ -392,7 +393,28 @@ test("creates switches refreshes and closes Host threads", async () => {
       messages: [],
       created_at: "2026-08-29T00:00:00Z",
       updated_at: "2026-08-29T00:00:00Z",
-      latest_turn: null,
+      latest_turn:
+        id === "thread-existing"
+          ? {
+              status: "completed",
+              stop_reason: "completed",
+              iterations: 2,
+              tool_calls: 1,
+              usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+              modified_files: ["src/example.py"],
+              file_diffs: [
+                {
+                  path: "src/example.py",
+                  change_type: "modified",
+                  diff: "--- a/src/example.py\n+++ b/src/example.py\n",
+                },
+              ],
+              diff_complete: false,
+              started_at: "2026-08-29T00:00:00Z",
+              ended_at: "2026-08-29T00:00:01Z",
+              error: null,
+            }
+          : null,
     },
     event_cursor: null,
     submission: null,
@@ -462,6 +484,30 @@ test("creates switches refreshes and closes Host threads", async () => {
           }),
         } as Response;
       }
+      if (path === "/api/threads/thread-new/settings" && method === "PATCH") {
+        settingsUpdates += 1;
+        if (settingsUpdates > 1) {
+          return {
+            ok: false,
+            status: 409,
+            json: async () => ({
+              error: {
+                code: "SETTINGS_CONFLICT",
+                message: "Thread settings changed",
+                details: {},
+              },
+            }),
+          } as Response;
+        }
+        const updated = threadView("thread-new", "/home/student/project");
+        updated.snapshot.settings.model = "deepseek-reasoner";
+        updated.snapshot.settings.version = 1;
+        updated.snapshot.updated_at = "2026-08-29T00:00:02Z";
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, thread: updated }),
+        } as Response;
+      }
       if (path.endsWith("/close")) {
         return {
           ok: true,
@@ -483,6 +529,21 @@ test("creates switches refreshes and closes Host threads", async () => {
     screen.getByRole("region", { name: "Agent conversation" }),
   ).toBeInTheDocument();
   expect(screen.getByRole("complementary", { name: "Activity" })).toBeInTheDocument();
+  expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
+    "Iterations2",
+  );
+  expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
+    "Input tokens8",
+  );
+  expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
+    "Stop reasoncompleted",
+  );
+  expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
+    "src/example.py",
+  );
+  expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
+    "Diff may be incomplete",
+  );
   expect(screen.getByRole("button", { name: "Show navigation" })).toHaveAttribute(
     "aria-pressed",
     "false",
@@ -504,6 +565,22 @@ test("creates switches refreshes and closes Host threads", async () => {
   ).toBeInTheDocument();
   expect(screen.getAllByText("/home/student/project").length).toBeGreaterThan(0);
   expect(screen.getByText("DeepSeek · deepseek-chat · settings v0")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Thread settings" }));
+  fireEvent.change(screen.getByLabelText("Thread model"), {
+    target: { value: "deepseek-reasoner" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save thread settings" }));
+  expect(
+    await screen.findByText("DeepSeek · deepseek-reasoner · settings v1"),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Thread settings" }));
+  fireEvent.change(screen.getByLabelText("Thread model"), {
+    target: { value: "stale-model" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save thread settings" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Settings update failed · Thread settings changed",
+  );
   fireEvent.click(screen.getByRole("button", { name: "Refresh active thread" }));
   await waitFor(() =>
     expect(requests.some(({ path }) => path === "/api/threads/thread-new")).toBe(true),
@@ -521,7 +598,28 @@ test("creates switches refreshes and closes Host threads", async () => {
       {
         path: "/api/threads",
         method: "POST",
-        body: JSON.stringify({ workspace: "/home/student/project" }),
+        body: JSON.stringify({
+          workspace: "/home/student/project",
+          provider_config_id: "deepseek",
+          model: "deepseek-chat",
+        }),
+      },
+      {
+        path: "/api/threads/thread-new/settings",
+        method: "PATCH",
+        body: JSON.stringify({
+          expected_version: 0,
+          provider_config_id: "deepseek",
+          model: "deepseek-reasoner",
+          temperature: null,
+          max_tokens: null,
+          thinking: null,
+          limits: {
+            max_iterations: 20,
+            max_tool_calls: 50,
+            max_execution_seconds: 900,
+          },
+        }),
       },
       { path: "/api/threads/thread-new", method: "GET", body: undefined },
       {
@@ -560,7 +658,19 @@ test("submits multiline work and stops through Host commands", async () => {
       messages: [],
       created_at: "2026-08-29T00:00:00Z",
       updated_at: "2026-08-29T00:00:00Z",
-      latest_turn: null,
+      latest_turn: {
+        status: "completed",
+        stop_reason: "completed",
+        iterations: 1,
+        tool_calls: 0,
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        modified_files: [],
+        file_diffs: [],
+        diff_complete: true,
+        started_at: "2026-08-28T00:00:00Z",
+        ended_at: "2026-08-28T00:00:01Z",
+        error: null,
+      },
     },
     event_cursor: null,
     submission: null,
