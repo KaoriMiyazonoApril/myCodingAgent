@@ -509,3 +509,151 @@ test("creates switches refreshes and closes Host threads", async () => {
     ]),
   );
 });
+
+test("submits multiline work and stops through Host commands", async () => {
+  const requests: Array<{ path: string; method: string; body?: string }> = [];
+  const thread = {
+    schema_version: 1,
+    snapshot: {
+      schema_version: 1,
+      thread_id: "thread-1",
+      workspace: "/workspace",
+      status: "idle" as const,
+      active_turn_id: null,
+      completed_turns: 0,
+      settings: {
+        provider_config_id: "deepseek",
+        model: "deepseek-chat",
+        temperature: null,
+        max_tokens: null,
+        thinking: null,
+        limits: {
+          max_iterations: 20,
+          max_tool_calls: 50,
+          max_execution_seconds: 900,
+        },
+        version: 0,
+      },
+      messages: [],
+      created_at: "2026-08-29T00:00:00Z",
+      updated_at: "2026-08-29T00:00:00Z",
+      latest_turn: null,
+    },
+    event_cursor: null,
+    submission: null,
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ path, method, body: init?.body as string | undefined });
+      if (path === "/api/providers") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            default_provider_id: "deepseek",
+            providers: [
+              {
+                provider_id: "deepseek",
+                display_name: "DeepSeek",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "deepseek-chat",
+                is_default: true,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (path.startsWith("/api/workspaces")) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            path: "/workspace",
+            parent: null,
+            roots: ["/workspace"],
+            entries: [],
+            truncated: false,
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads" && method === "GET") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [thread] }),
+        } as Response;
+      }
+      if (path.endsWith("/turns")) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread_id: "thread-1",
+            submission: {
+              thread_id: "thread-1",
+              status: "starting",
+              accepted_at: "2026-08-29T00:00:01Z",
+            },
+          }),
+        } as Response;
+      }
+      if (path.endsWith("/cancel")) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread_id: "thread-1",
+            submission: {
+              thread_id: "thread-1",
+              status: "cancelling",
+              accepted_at: "2026-08-29T00:00:01Z",
+            },
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads/thread-1") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread: {
+              ...thread,
+              submission: {
+                thread_id: "thread-1",
+                status: "starting",
+                accepted_at: "2026-08-29T00:00:01Z",
+              },
+            },
+          }),
+        } as Response;
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    }),
+  );
+
+  render(<App />);
+  const composer = await screen.findByLabelText("Ask Agent");
+  fireEvent.change(composer, { target: { value: "First line\nSecond line" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+  expect(await screen.findByText("Starting…")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+  expect(await screen.findByText("Cancelling…")).toBeInTheDocument();
+  expect(requests).toEqual(
+    expect.arrayContaining([
+      {
+        path: "/api/threads/thread-1/turns",
+        method: "POST",
+        body: JSON.stringify({ message: "First line\nSecond line" }),
+      },
+      {
+        path: "/api/threads/thread-1/cancel",
+        method: "POST",
+        body: undefined,
+      },
+    ]),
+  );
+});

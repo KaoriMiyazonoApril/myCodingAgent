@@ -38,7 +38,7 @@ from .settings import (
 )
 from .types import SCHEMA_VERSION, ThreadSnapshot, ThreadStatus, TurnStatus, TurnSummary
 from .tool_coordinator import ToolCoordinator
-from .workspace_lease import WorkspaceLeaseManager
+from .workspace_lease import WorkspaceLease, WorkspaceLeaseManager
 from .workspace_validator import WorkspaceValidator
 
 
@@ -220,52 +220,60 @@ class ThreadRuntime:
                 raise ThreadClosedError(f"thread is closed: {thread_id}")
             raise ThreadBusyError(f"thread already has an active turn: {thread_id}")
         turn_id = str(uuid4())
-        turn_config = (
-            TurnConfig.from_thread_settings(
-                record.settings,
-                system_prompt=self._system_prompt,
-                reasoning_visibility=self._reasoning_visibility,
-            )
-            if settings_override is None
-            else TurnConfig.from_model_settings(
-                settings_override.apply(record.settings),
-                settings_version=record.settings.version,
-                system_prompt=self._system_prompt,
-                reasoning_visibility=self._reasoning_visibility,
-            )
+        assert record.events is not None
+        events = TurnEventEmitter(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            buffer=record.events,
+            reasoning_visibility=self._reasoning_visibility,
         )
-        provider = self._provider_resolver(
-            turn_config.provider_config_id,
-            turn_config.model,
-        )
-        model = ModelInvoker(
-            provider,
-            turn_config,
-            retry_delays=self._model_retry_delays,
-            default_context_window_tokens=self._default_context_window_tokens,
-        )
-        model.ensure_context(
-            record.conversation.prospective_request_messages(user_text),
-            record.tools.definitions(),
-        )
-        workspace_lease = self._workspace_leases.acquire(record.workspace)
+        workspace_lease: WorkspaceLease | None = None
         try:
-            self._workspace_validator.validate(record.workspace)
-        except Exception:
-            self._workspace_leases.release(workspace_lease)
+            turn_config = (
+                TurnConfig.from_thread_settings(
+                    record.settings,
+                    system_prompt=self._system_prompt,
+                    reasoning_visibility=self._reasoning_visibility,
+                )
+                if settings_override is None
+                else TurnConfig.from_model_settings(
+                    settings_override.apply(record.settings),
+                    settings_version=record.settings.version,
+                    system_prompt=self._system_prompt,
+                    reasoning_visibility=self._reasoning_visibility,
+                )
+            )
+            provider = self._provider_resolver(
+                turn_config.provider_config_id,
+                turn_config.model,
+            )
+            model = ModelInvoker(
+                provider,
+                turn_config,
+                retry_delays=self._model_retry_delays,
+                default_context_window_tokens=self._default_context_window_tokens,
+            )
+            model.ensure_context(
+                record.conversation.prospective_request_messages(user_text),
+                record.tools.definitions(),
+            )
+            workspace_lease = self._workspace_leases.acquire(record.workspace)
+            await asyncio.to_thread(
+                self._workspace_validator.validate,
+                record.workspace,
+            )
+            if record.status is ThreadStatus.CLOSED or record.closing:
+                raise ThreadClosedError(f"thread is closed: {thread_id}")
+        except BaseException as error:
+            events.emit("turn_rejected", self._preflight_rejection(error))
+            if workspace_lease is not None:
+                self._workspace_leases.release(workspace_lease)
             raise
         record.status = ThreadStatus.RUNNING
         submission: _IdempotentSubmission | None = None
         try:
             record.conversation.append_user(user_text)
             record.updated_at = utc_now()
-            assert record.events is not None
-            events = TurnEventEmitter(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                buffer=record.events,
-                reasoning_visibility=turn_config.reasoning_visibility,
-            )
             controller = RunController(turn_config.limits)
             current_task = asyncio.current_task()
             assert current_task is not None
@@ -332,6 +340,7 @@ class ThreadRuntime:
             )
             record.active_turn = None
             record.updated_at = utc_now()
+            assert workspace_lease is not None
             self._workspace_leases.release(workspace_lease)
             if record.closing:
                 record.tools.close()
@@ -526,6 +535,17 @@ class ThreadRuntime:
             raise ValueError(
                 "idempotency_key must be a non-empty string of at most 200 characters"
             )
+
+    @staticmethod
+    def _preflight_rejection(error: BaseException) -> dict[str, object]:
+        if isinstance(error, asyncio.CancelledError):
+            code = "TURN_CANCELLED_BEFORE_START"
+            message = "Turn was cancelled before it started"
+        else:
+            public_code = getattr(error, "code", None)
+            code = public_code if isinstance(public_code, str) else "PREFLIGHT_FAILED"
+            message = "Turn could not start"
+        return {"error": {"code": code, "message": message}}
 
     @staticmethod
     def _set_waiting(record: _ThreadRecord, waiting: bool) -> None:

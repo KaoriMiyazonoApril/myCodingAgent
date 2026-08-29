@@ -466,6 +466,43 @@ button:disabled {
   color: var(--muted);
 }
 
+.submission-status {
+  color: var(--accent);
+  font-weight: 650;
+}
+
+.composer {
+  display: grid;
+  gap: 9px;
+  margin-top: 34px;
+}
+
+.composer label {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.composer textarea {
+  width: 100%;
+  padding: 12px;
+  resize: vertical;
+  border: 1px solid #52627c;
+  border-radius: 8px;
+  color: #f8fafc;
+  background: #0d1424;
+  line-height: 1.5;
+}
+
+.composer-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.composer-actions .primary-button,
+.composer-actions .danger-button {
+  margin-top: 0;
+}
+
 .thread-detail {
   padding: 24px;
 }

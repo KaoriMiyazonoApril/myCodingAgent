@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
+  cancelTurn,
   closeThread,
   createThread,
   clearProviderCredential,
@@ -11,6 +12,7 @@ import {
   getWorkspaces,
   saveProvider,
   selectProviderDefault,
+  startTurn,
   type ProviderView,
   type ThreadView,
   type WorkspaceListing,
@@ -271,10 +273,12 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [composer, setComposer] = useState("");
 
   const active = threads.find(
     (thread) => thread.snapshot.thread_id === activeId,
   ) ?? null;
+  const activeSubmission = active?.submission ?? null;
 
   useEffect(() => {
     let mounted = true;
@@ -300,6 +304,41 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
       mounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (activeId === null || activeSubmission === null) {
+      return;
+    }
+    let mounted = true;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const next = await getThread(activeId);
+        if (!mounted) {
+          return;
+        }
+        setThreads((current) =>
+          current.map((thread) =>
+            thread.snapshot.thread_id === activeId ? next : thread,
+          ),
+        );
+        if (next.submission !== null) {
+          timer = window.setTimeout(() => void poll(), 250);
+        }
+      } catch (reason: unknown) {
+        if (mounted) {
+          setError(reason instanceof Error ? reason.message : "Thread refresh failed");
+        }
+      }
+    };
+    timer = window.setTimeout(() => void poll(), 250);
+    return () => {
+      mounted = false;
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [activeId, activeSubmission]);
 
   const replaceThread = (next: ThreadView) => {
     setThreads((current) =>
@@ -346,6 +385,28 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
       if (activeId !== null) {
         replaceThread(await closeThread(activeId));
       }
+    });
+
+  const submit = () =>
+    run(async () => {
+      if (active === null) {
+        throw new Error("Create or select a Thread first");
+      }
+      if (!composer.trim()) {
+        throw new Error("Enter a task for the Agent");
+      }
+      const submission = await startTurn(active.snapshot.thread_id, composer);
+      replaceThread({ ...active, submission });
+      setComposer("");
+    });
+
+  const stop = () =>
+    run(async () => {
+      if (active === null) {
+        throw new Error("No active Thread");
+      }
+      const submission = await cancelTurn(active.snapshot.thread_id);
+      replaceThread({ ...active, submission });
     });
 
   const providerName = active
@@ -417,6 +478,51 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
               {active.snapshot.settings.version}
             </p>
             <p className="thread-status">Status · {active.snapshot.status}</p>
+            {active.submission ? (
+              <p className="submission-status" aria-live="polite">
+                {active.submission.status === "starting"
+                  ? "Starting…"
+                  : active.submission.status === "running"
+                    ? "Running…"
+                    : "Cancelling…"}
+              </p>
+            ) : null}
+            <div className="composer">
+              <label htmlFor="agent-composer">Ask Agent</label>
+              <textarea
+                id="agent-composer"
+                rows={4}
+                value={composer}
+                disabled={active.snapshot.status === "closed"}
+                onChange={(event) => setComposer(event.target.value)}
+                placeholder="Describe the coding task…"
+              />
+              <div className="composer-actions">
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={
+                    busy ||
+                    active.submission !== null ||
+                    active.snapshot.status === "closed" ||
+                    !composer.trim()
+                  }
+                  onClick={() => void submit()}
+                >
+                  Send
+                </button>
+                {active.submission !== null ? (
+                  <button
+                    type="button"
+                    className="danger-button"
+                    disabled={busy || active.submission.status === "cancelling"}
+                    onClick={() => void stop()}
+                  >
+                    Stop
+                  </button>
+                ) : null}
+              </div>
+            </div>
           </>
         ) : (
           <p className="thread-empty">

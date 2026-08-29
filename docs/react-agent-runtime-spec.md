@@ -59,6 +59,9 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   `extra_body` 均不属于公开设置。
 - Web Host 可在 `create_thread(..., settings=...)` 中冻结创建时选择的公开模型设置；省略
   参数时仍使用 Runtime 默认设置并保持 version 0，因此既有调用方语义不变。
+- Web Host 提交的 Turn 在同步状态写入前先建立 Turn emitter，并通过 worker thread 等待
+  workspace 完整验证。启动前的 context、lease、workspace、关闭或取消失败统一产生脱敏
+  `turn_rejected`，且不写入 Conversation；已取得的 workspace lease 在所有拒绝路径释放。
 - Ticket 04 已实现版本化公开状态与阶段事件：`ThreadSnapshot` 现在包含脱敏后的完整公开
   对话、时间戳和最近一次 `TurnSummary`，两者均通过 `to_dict()` 产生可直接 JSON 编码的
   独立数据。公开消息保留用户/助手文本、工具调用与安全工具结果，但排除 system prompt、
@@ -249,6 +252,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - The workspace reference is immutable after Thread creation. Selecting another folder requires another Thread so old message paths and diffs never change meaning.
 - `WorkspaceLeaseManager` normalizes real workspace roots and treats equal paths or ancestor/descendant relationships as overlapping. Multiple Threads may refer to overlapping roots, but only one overlapping Turn may hold a lease. A conflict fails immediately with `WORKSPACE_BUSY`; there is no implicit queue. A lease is held during `RUNNING` and `WAITING_APPROVAL` and released on every terminal path.
 - Before a Turn enters the loop, workspace validation rejects a symlink in any existing component of the selected root path, any symlink path entry, regular files whose hard-link count exceeds one, and nested mount or bind-mount points. Validation is complete within configured entry and time budgets; reaching either budget fails closed with `WORKSPACE_VALIDATION_LIMIT`.
+- Workspace validation is awaited through a worker thread so a large read-only scan does not block an async Host. A Turn emitter and ID exist before this preflight; any failure after allocation emits one sanitized `turn_rejected` event and leaves Conversation unchanged. Cancellation may stop awaiting the read-only validation worker, releases the lease, and does not authorize that worker to perform Agent writes.
 - File operations inspect path components without following links. The earlier behavior that allowed internal file symlinks is intentionally replaced by a strict workspace prohibition.
 - `CommandSandboxBackend` becomes a real seam because the strict production bubblewrap adapter and a deterministic test adapter both need to satisfy it. Its interface includes a capability probe and cancellable command execution. The production adapter must prevent workspace `symlink`, `symlinkat`, `link`, and `linkat` operations or report itself unavailable before the Turn starts.
 - The strict link prohibition applies to the persistent workspace. Trusted read-only links in the sandbox system runtime remain allowed so standard Linux executables work. Hostile external processes replacing workspace entries during a Turn are not claimed to be fully preventable by the application.

@@ -41,6 +41,11 @@ from .thread_service import (
     ThreadNotFoundError,
     production_runtime_factory,
 )
+from .turn_tasks import (
+    DuplicateTurnSubmissionError,
+    NoActiveTurnError,
+    TurnTaskManager,
+)
 from .workspace import (
     WorkspaceBrowser,
     WorkspaceBrowseError,
@@ -104,6 +109,13 @@ class ThreadSettingsUpdate(BaseModel):
     limits: LimitsUpdate = Field(default_factory=LimitsUpdate)
 
 
+class TurnCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str
+    idempotency_key: str | None = None
+
+
 def create_app(
     *,
     provider_store: ProviderStore,
@@ -128,10 +140,19 @@ def create_app(
         workspace_browser=browser,
         runtime_factory=runtime_factory or production_runtime_factory(provider_store),
     )
+    turn_tasks = TurnTaskManager(threads)
     app.state.provider_store = provider_store
     app.state.model_catalog = model_catalog
     app.state.workspace_browser = browser
     app.state.thread_host = threads
+    app.state.turn_tasks = turn_tasks
+
+    def with_submission(view: dict[str, object]) -> dict[str, object]:
+        snapshot = view["snapshot"]
+        assert isinstance(snapshot, dict)
+        thread_id = snapshot["thread_id"]
+        assert isinstance(thread_id, str)
+        return {**view, "submission": turn_tasks.inspect(thread_id)}
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(
@@ -249,6 +270,20 @@ def create_app(
     ) -> JSONResponse:
         return _error_response(400, error.code, "Workspace validation limit reached")
 
+    @app.exception_handler(DuplicateTurnSubmissionError)
+    async def duplicate_turn(
+        request: Request,
+        error: DuplicateTurnSubmissionError,
+    ) -> JSONResponse:
+        return _error_response(409, error.code, "Thread already has a Turn")
+
+    @app.exception_handler(NoActiveTurnError)
+    async def no_active_turn(
+        request: Request,
+        error: NoActiveTurnError,
+    ) -> JSONResponse:
+        return _error_response(409, error.code, "Thread has no active Turn")
+
     @app.exception_handler(ValueError)
     async def invalid_argument(
         request: Request,
@@ -298,7 +333,7 @@ def create_app(
     async def list_threads() -> dict[str, object]:
         return {
             "schema_version": SCHEMA_VERSION,
-            "threads": threads.list_threads(),
+            "threads": [with_submission(view) for view in threads.list_threads()],
         }
 
     @app.post("/api/threads", status_code=201)
@@ -308,13 +343,16 @@ def create_app(
             provider_config_id=request.provider_config_id,
             model=request.model,
         )
-        return {"schema_version": SCHEMA_VERSION, "thread": thread}
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "thread": with_submission(thread),
+        }
 
     @app.get("/api/threads/{thread_id}")
     async def get_thread(thread_id: str) -> dict[str, object]:
         return {
             "schema_version": SCHEMA_VERSION,
-            "thread": threads.get_thread(thread_id),
+            "thread": with_submission(threads.get_thread(thread_id)),
         }
 
     @app.patch("/api/threads/{thread_id}/settings")
@@ -340,13 +378,42 @@ def create_app(
             expected_version=request.expected_version,
             settings=settings,
         )
-        return {"schema_version": SCHEMA_VERSION, "thread": thread}
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "thread": with_submission(thread),
+        }
+
+    @app.post("/api/threads/{thread_id}/turns", status_code=202)
+    async def start_turn(
+        thread_id: str,
+        request: TurnCreate,
+    ) -> dict[str, object]:
+        submission = await turn_tasks.start(
+            thread_id,
+            request.message,
+            idempotency_key=request.idempotency_key,
+        )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "thread_id": thread_id,
+            "submission": submission,
+        }
+
+    @app.post("/api/threads/{thread_id}/cancel", status_code=202)
+    async def cancel_turn(thread_id: str) -> dict[str, object]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "thread_id": thread_id,
+            "submission": turn_tasks.cancel(thread_id),
+        }
 
     @app.post("/api/threads/{thread_id}/close")
     async def close_thread(thread_id: str) -> dict[str, object]:
+        if turn_tasks.inspect(thread_id) is not None:
+            turn_tasks.cancel(thread_id)
         return {
             "schema_version": SCHEMA_VERSION,
-            "thread": threads.close_thread(thread_id),
+            "thread": with_submission(threads.close_thread(thread_id)),
         }
 
     @app.put("/api/providers/{provider_id}")

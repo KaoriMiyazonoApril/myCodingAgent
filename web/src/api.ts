@@ -62,6 +62,12 @@ export type ThreadSettings = {
   version: number;
 };
 
+export type TurnSubmission = {
+  thread_id: string;
+  status: "starting" | "running" | "cancelling";
+  accepted_at: string;
+};
+
 export type ThreadView = {
   schema_version: number;
   snapshot: {
@@ -78,7 +84,7 @@ export type ThreadView = {
     latest_turn: Record<string, unknown> | null;
   };
   event_cursor: string | null;
-  submission: null | Record<string, unknown>;
+  submission: TurnSubmission | null;
 };
 
 type ThreadsResponse = {
@@ -89,6 +95,12 @@ type ThreadsResponse = {
 type ThreadResponse = {
   schema_version: number;
   thread: ThreadView;
+};
+
+type SubmissionResponse = {
+  schema_version: number;
+  thread_id: string;
+  submission: TurnSubmission;
 };
 
 export async function getProviders(): Promise<ProvidersResponse> {
@@ -124,6 +136,27 @@ export async function closeThread(threadId: string): Promise<ThreadView> {
       method: "POST",
     })
   ).thread;
+}
+
+export async function startTurn(
+  threadId: string,
+  message: string,
+): Promise<TurnSubmission> {
+  return (
+    await requestJson<SubmissionResponse>(`/api/threads/${threadId}/turns`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+    })
+  ).submission;
+}
+
+export async function cancelTurn(threadId: string): Promise<TurnSubmission> {
+  return (
+    await requestJson<SubmissionResponse>(`/api/threads/${threadId}/cancel`, {
+      method: "POST",
+    })
+  ).submission;
 }
 
 export async function saveProvider(

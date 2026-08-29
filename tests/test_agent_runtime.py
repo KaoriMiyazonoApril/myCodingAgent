@@ -1408,6 +1408,68 @@ def test_oversized_first_request_is_rejected_without_mutating_history(tmp_path) 
     assert snapshot.status is ThreadStatus.IDLE
     assert snapshot.completed_turns == 0
     assert snapshot.messages == []
+    rejected = runtime.get_events(thread.thread_id).events
+    assert len(rejected) == 1
+    assert rejected[0].type == "turn_rejected"
+    assert rejected[0].payload == {
+        "error": {
+            "code": "CONTEXT_LIMIT",
+            "message": "Turn could not start",
+        }
+    }
+
+
+def test_preflight_validation_is_async_and_cancellation_releases_lease(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def scenario() -> tuple[list[str], list[dict[str, object]]]:
+        started = threading.Event()
+        release = threading.Event()
+        provider = ScriptedProvider([final_response("Recovered.")])
+        runtime = runtime_for_provider(provider)
+        thread = runtime.create_thread(tmp_path)
+
+        def blocking_validation(workspace: Path) -> None:
+            started.set()
+            release.wait(timeout=2)
+
+        monkeypatch.setattr(
+            runtime._workspace_validator,
+            "validate",
+            blocking_validation,
+        )
+        active = asyncio.create_task(runtime.run_turn(thread.thread_id, "Wait."))
+        assert await asyncio.to_thread(started.wait, 1)
+        await asyncio.sleep(0)
+        before_cancel = runtime.get_snapshot(thread.thread_id)
+        assert before_cancel.status is ThreadStatus.IDLE
+        assert before_cancel.messages == []
+
+        active.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+
+        rejected = runtime.get_events(thread.thread_id).events
+        completed = await runtime.run_turn(thread.thread_id, "Try again.")
+        assert completed.status is TurnStatus.COMPLETED
+        return (
+            [event.type for event in rejected],
+            [event.payload for event in rejected],
+        )
+
+    event_types, payloads = asyncio.run(scenario())
+
+    assert event_types == ["turn_rejected"]
+    assert payloads == [
+        {
+            "error": {
+                "code": "TURN_CANCELLED_BEFORE_START",
+                "message": "Turn was cancelled before it started",
+            }
+        }
+    ]
 
 
 def test_context_is_checked_again_after_a_large_tool_result(tmp_path) -> None:

@@ -44,6 +44,16 @@ class RuntimeView(Protocol):
 
     def close_thread(self, thread_id: str) -> bool: ...
 
+    async def run_turn(
+        self,
+        thread_id: str,
+        user_text: str,
+        *,
+        idempotency_key: str | None = None,
+    ): ...
+
+    def cancel_turn(self, thread_id: str) -> bool: ...
+
 
 RuntimeFactory = Callable[[ModelSettings], RuntimeView]
 
