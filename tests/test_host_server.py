@@ -112,6 +112,35 @@ def test_web_server_always_passes_loopback_to_uvicorn(monkeypatch) -> None:
     assert calls == [{"app": fake_app, "host": "127.0.0.1", "port": 4090}]
 
 
+def test_web_server_returns_nonzero_after_failed_lifespan_shutdown(
+    monkeypatch,
+) -> None:
+    fake_app = SimpleNamespace(
+        state=SimpleNamespace(
+            workspace_browser=SimpleNamespace(roots=("/workspace",)),
+        )
+    )
+    monkeypatch.setattr(server, "build_web_app", lambda **kwargs: fake_app)
+
+    class Config:
+        def __init__(self, app, **kwargs) -> None:
+            self.app = app
+
+    class Server:
+        lifespan = SimpleNamespace(shutdown_failed=True)
+
+        def __init__(self, config) -> None:
+            self.config = config
+
+        def run(self) -> None:
+            pass
+
+    monkeypatch.setattr(server.uvicorn, "Config", Config)
+    monkeypatch.setattr(server.uvicorn, "Server", Server)
+
+    assert server.run_web(workspace_roots=["/workspace"]) == 1
+
+
 def test_lifespan_shuts_down_tasks_before_thread_resources(tmp_path: Path) -> None:
     calls: list[str] = []
     app = create_app(

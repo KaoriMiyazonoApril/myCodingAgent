@@ -705,6 +705,57 @@ button:disabled {
   white-space: pre-wrap;
 }
 
+.conversation-files {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.conversation-file-card {
+  padding: 12px;
+  border: 1px solid #527064;
+  border-radius: 8px;
+  background: #101d1b;
+}
+
+.conversation-file-card > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.conversation-file-card strong {
+  overflow-wrap: anywhere;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+}
+
+.conversation-file-card span,
+.conversation-file-card summary {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.conversation-file-card details {
+  margin-top: 10px;
+}
+
+.conversation-file-card summary {
+  cursor: pointer;
+}
+
+.conversation-file-card pre {
+  max-height: 240px;
+  margin: 10px 0 0;
+  padding: 10px;
+  overflow: auto;
+  color: #cbd7e7;
+  background: #090f1c;
+  font-size: 11px;
+  white-space: pre;
+}
+
 .terminal-state {
   color: var(--accent);
   font-weight: 650;

@@ -541,6 +541,9 @@ test("creates switches refreshes and closes Host threads", async () => {
   expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
     "src/example.py",
   );
+  expect(
+    screen.getByLabelText("Conversation file changes"),
+  ).toHaveTextContent("src/example.py");
   expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
     "Diff may be incomplete",
   );
@@ -769,10 +772,22 @@ test("submits multiline work and stops through Host commands", async () => {
 
   render(<App />);
   const composer = await screen.findByLabelText("Ask Agent");
+  const threadReadsBeforeSubmit = requests.filter(
+    ({ path, method }) =>
+      path === "/api/threads/thread-1" && method === "GET",
+  ).length;
   fireEvent.change(composer, { target: { value: "First line\nSecond line" } });
   fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
   expect(await screen.findByText("Starting…")).toBeInTheDocument();
+  await waitFor(() =>
+    expect(
+      requests.filter(
+        ({ path, method }) =>
+          path === "/api/threads/thread-1" && method === "GET",
+      ).length,
+    ).toBeGreaterThan(threadReadsBeforeSubmit),
+  );
   fireEvent.click(screen.getByRole("button", { name: "Stop" }));
   expect(await screen.findByText("Cancelling…")).toBeInTheDocument();
   expect(requests).toEqual(

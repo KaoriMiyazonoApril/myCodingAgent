@@ -58,6 +58,7 @@ class TurnTaskManager:
     def __init__(self, threads: ThreadCatalog) -> None:
         self._threads = threads
         self._submissions: dict[str, _Submission] = {}
+        self._failures: dict[str, dict[str, str]] = {}
         self._accepting = True
 
     async def start(
@@ -87,6 +88,7 @@ class TurnTaskManager:
         if runtime is None:
             raise RuntimeError("Thread Runtime is unavailable")
 
+        self._failures.pop(thread_id, None)
         submission = _Submission(
             thread_id=thread_id,
             accepted_at=_utc_now(),
@@ -116,6 +118,10 @@ class TurnTaskManager:
             "running" if snapshot.get("active_turn_id") else "starting"
         )
         return submission.public(status)
+
+    def inspect_failure(self, thread_id: str) -> dict[str, object] | None:
+        failure = self._failures.get(thread_id)
+        return None if failure is None else dict(failure)
 
     def cancel(self, thread_id: str) -> dict[str, object]:
         submission = self._submissions.get(thread_id)
@@ -163,13 +169,54 @@ class TurnTaskManager:
                 user_text,
                 idempotency_key=idempotency_key,
             )
-        except (asyncio.CancelledError, Exception):
-            # Runtime events/Snapshot own expected Agent outcomes. The task is
-            # deliberately consumed here so no detached exception leaks.
-            pass
+        except asyncio.CancelledError:
+            self._record_failure(
+                submission.thread_id,
+                fallback_code="TURN_CANCELLED_BEFORE_START",
+                fallback_message="Turn was cancelled before it started",
+            )
+        except Exception:
+            self._record_failure(
+                submission.thread_id,
+                fallback_code="TURN_TASK_FAILED",
+                fallback_message="Agent Turn task failed",
+            )
         finally:
             if self._submissions.get(submission.thread_id) is submission:
                 del self._submissions[submission.thread_id]
+
+    def _record_failure(
+        self,
+        thread_id: str,
+        *,
+        fallback_code: str,
+        fallback_message: str,
+    ) -> None:
+        failure = self._latest_rejection(thread_id)
+        self._failures[thread_id] = failure or {
+            "code": fallback_code,
+            "message": fallback_message,
+        }
+
+    def _latest_rejection(self, thread_id: str) -> dict[str, str] | None:
+        read_events = getattr(self._threads, "get_events", None)
+        if not callable(read_events):
+            return None
+        try:
+            batch = read_events(thread_id)
+            event = batch.events[-1] if batch.events else None
+        except Exception:
+            return None
+        if event is None or event.type != "turn_rejected":
+            return None
+        error = event.payload.get("error")
+        if not isinstance(error, dict):
+            return None
+        code = error.get("code")
+        message = error.get("message")
+        if not isinstance(code, str) or not isinstance(message, str):
+            return None
+        return {"code": code, "message": message}
 
 
 def _utc_now() -> str:

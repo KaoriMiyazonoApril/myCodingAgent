@@ -76,11 +76,13 @@ class ProviderModelCatalog:
 
         if not isinstance(raw_models, list):
             raise ProviderResponseError("Provider returned an invalid model list")
+        if any(not isinstance(model, str) for model in raw_models):
+            raise ProviderResponseError("Provider returned an invalid model record")
         models = sorted(
             {
                 model.strip()
                 for model in raw_models
-                if isinstance(model, str) and model.strip()
+                if model.strip()
             }
         )
         self._cache[cache_key] = (now, models)
@@ -99,10 +101,14 @@ class ProviderModelCatalog:
             data = getattr(response, "data", None)
             if not isinstance(data, list):
                 raise ProviderResponseError("Provider returned an invalid model list")
-            return [
-                model_id
-                for item in data
-                if isinstance((model_id := getattr(item, "id", None)), str)
-            ]
+            models: list[str] = []
+            for item in data:
+                model_id = getattr(item, "id", None)
+                if not isinstance(model_id, str):
+                    raise ProviderResponseError(
+                        "Provider returned a model record without an ID"
+                    )
+                models.append(model_id)
+            return models
         finally:
             await client.close()

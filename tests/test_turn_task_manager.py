@@ -121,12 +121,18 @@ def test_task_manager_consumes_unexpected_task_failure_and_cleans_mapping() -> N
         async def run_turn(self, thread_id: str, user_text: str, **kwargs):
             raise RuntimeError("private infrastructure details")
 
-    async def scenario() -> dict[str, object]:
+    async def scenario() -> tuple[dict[str, object], dict[str, object] | None]:
         runtime = FailingRuntime()
         manager = TurnTaskManager(_Threads(runtime))  # type: ignore[arg-type]
 
         accepted = await manager.start("thread-1", "task")
         await _wait_until_clean(manager)
-        return accepted
+        return accepted, manager.inspect_failure("thread-1")
 
-    assert asyncio.run(scenario())["status"] == "starting"
+    accepted, failure = asyncio.run(scenario())
+    assert accepted["status"] == "starting"
+    assert failure == {
+        "code": "TURN_TASK_FAILED",
+        "message": "Agent Turn task failed",
+    }
+    assert "private infrastructure details" not in repr(failure)

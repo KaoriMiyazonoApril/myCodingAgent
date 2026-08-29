@@ -175,6 +175,26 @@ test("applies live messages and safe rejection errors", () => {
     code: "UNSAFE_WORKSPACE",
     message: "Turn could not start",
   });
+  expect(state.terminal).toEqual({
+    status: "rejected",
+    error: { code: "UNSAFE_WORKSPACE", message: "Turn could not start" },
+  });
+});
+
+test("hydrates a safe Host background failure as a terminal error", () => {
+  const state = hydrateThread({
+    ...view(),
+    host_error: {
+      code: "TURN_TASK_FAILED",
+      message: "Agent Turn task failed",
+    },
+  });
+
+  expect(state.error).toEqual({
+    code: "TURN_TASK_FAILED",
+    message: "Agent Turn task failed",
+  });
+  expect(state.terminal?.status).toBe("rejected");
 });
 
 test("preserves terminal tools and reconstructs cancellation and file activity", () => {

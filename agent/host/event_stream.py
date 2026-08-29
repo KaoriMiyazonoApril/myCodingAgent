@@ -27,6 +27,8 @@ class EventThreads(Protocol):
 class SubmissionInspector(Protocol):
     def inspect(self, thread_id: str) -> dict[str, object] | None: ...
 
+    def inspect_failure(self, thread_id: str) -> dict[str, object] | None: ...
+
 
 class EventStreamAdapter:
     """Poll Runtime events and expose transport-only SSE frames."""
@@ -59,6 +61,7 @@ class EventStreamAdapter:
     ) -> AsyncIterator[str]:
         cursor = after_event_id
         last_heartbeat = self._clock()
+        reported_host_failure: tuple[str, str] | None = None
         while not await disconnected():
             batch = self._threads.get_events(
                 thread_id,
@@ -78,6 +81,7 @@ class EventStreamAdapter:
                     },
                 )
                 cursor = fresh_cursor
+                reported_host_failure = _host_failure_key(view)
                 last_heartbeat = self._clock()
             else:
                 for event in batch.events:
@@ -89,12 +93,31 @@ class EventStreamAdapter:
                     cursor = event.event_id
                     last_heartbeat = self._clock()
 
+            view = self._thread_view(thread_id)
+            host_failure = _host_failure_key(view)
+            if host_failure is not None and host_failure != reported_host_failure:
+                fresh_cursor = view["event_cursor"]
+                assert fresh_cursor is None or isinstance(fresh_cursor, str)
+                yield sse_frame(
+                    event="snapshot",
+                    event_id=fresh_cursor or "",
+                    data={
+                        "schema_version": 1,
+                        "thread": view,
+                        "cursor": fresh_cursor,
+                    },
+                )
+                cursor = fresh_cursor
+                reported_host_failure = host_failure
+                last_heartbeat = self._clock()
+            elif host_failure is None:
+                reported_host_failure = None
+
             now = self._clock()
             if now - last_heartbeat >= self._heartbeat_interval:
                 yield ": heartbeat\n\n"
                 last_heartbeat = now
 
-            view = self._thread_view(thread_id)
             snapshot = view["snapshot"]
             assert isinstance(snapshot, dict)
             active = (
@@ -107,7 +130,24 @@ class EventStreamAdapter:
 
     def _thread_view(self, thread_id: str) -> dict[str, object]:
         view = self._threads.get_thread(thread_id)
-        return {**view, "submission": self._submissions.inspect(thread_id)}
+        inspect_failure = getattr(self._submissions, "inspect_failure", None)
+        host_error = inspect_failure(thread_id) if callable(inspect_failure) else None
+        return {
+            **view,
+            "submission": self._submissions.inspect(thread_id),
+            "host_error": host_error,
+        }
+
+
+def _host_failure_key(view: dict[str, object]) -> tuple[str, str] | None:
+    error = view.get("host_error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    message = error.get("message")
+    if not isinstance(code, str) or not isinstance(message, str):
+        return None
+    return code, message
 
 
 def select_event_cursor(

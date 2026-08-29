@@ -287,3 +287,47 @@ def test_host_runs_real_runtime_local_tools_and_returns_recoverable_diff(
     assert "-    return 1" in summary["file_diffs"][0]["diff"]
     assert "+    return 2" in summary["file_diffs"][0]["diff"]
     assert summary["diff_complete"] is False
+
+
+def test_unexpected_background_failure_remains_visible_in_thread_view(
+    tmp_path,
+) -> None:
+    class FailingRuntime(ThreadRuntime):
+        async def run_turn(self, thread_id: str, user_text: str, **kwargs):
+            raise RuntimeError("private background details")
+
+    store = ProviderStore(tmp_path / "providers.json")
+    store.save_provider(
+        "deepseek",
+        api_key="test-key",
+        selected_model="deepseek-chat",
+    )
+    store.set_default("deepseek", model="deepseek-chat")
+
+    def runtime_factory(default_settings: ModelSettings) -> ThreadRuntime:
+        return FailingRuntime(
+            tool_registry_factory=lambda workspace: ToolRegistry(),
+            provider_resolver=lambda provider_id, model: _PausingProvider(),
+            default_settings=default_settings,
+        )
+
+    app = create_app(
+        provider_store=store,
+        model_catalog=_Catalog(),
+        workspace_browser=WorkspaceBrowser([tmp_path]),
+        runtime_factory=runtime_factory,
+    )
+    with TestClient(app) as client:
+        thread_id = _create_thread(client, tmp_path)
+        accepted = client.post(
+            f"/api/threads/{thread_id}/turns",
+            json={"message": "fail outside Runtime reporting"},
+        )
+        terminal = _wait_for_idle(client, thread_id)
+
+    assert accepted.status_code == 202
+    assert terminal["host_error"] == {
+        "code": "TURN_TASK_FAILED",
+        "message": "Agent Turn task failed",
+    }
+    assert "private background details" not in repr(terminal)

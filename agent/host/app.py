@@ -188,7 +188,11 @@ def create_app(
         assert isinstance(snapshot, dict)
         thread_id = snapshot["thread_id"]
         assert isinstance(thread_id, str)
-        return {**view, "submission": turn_tasks.inspect(thread_id)}
+        return {
+            **view,
+            "submission": turn_tasks.inspect(thread_id),
+            "host_error": turn_tasks.inspect_failure(thread_id),
+        }
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(

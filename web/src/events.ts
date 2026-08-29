@@ -60,6 +60,10 @@ export function hydrateThread(view: ThreadView): EventState {
   if (isRecord(latestError)) {
     state.error = safeError(latestError);
   }
+  if (isRecord(view.host_error)) {
+    state.error = safeError(view.host_error);
+    state.terminal = { status: "rejected", error: state.error };
+  }
   hydrateSummaryFiles(state, view.snapshot.latest_turn);
   return state;
 }
@@ -157,6 +161,8 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     next.error = isRecord(error)
       ? safeError(error)
       : { code: "TURN_REJECTED", message: "Turn could not start" };
+    next.terminal = { status: "rejected", error: next.error };
+    next.cancel_requested = false;
   }
   return next;
 }

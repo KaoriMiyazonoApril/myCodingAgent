@@ -85,6 +85,7 @@ export type ThreadView = {
   };
   event_cursor: string | null;
   submission: TurnSubmission | null;
+  host_error?: { code: string; message: string } | null;
 };
 
 type ThreadsResponse = {

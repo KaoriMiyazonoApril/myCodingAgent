@@ -200,6 +200,9 @@ def test_model_discovery_distinguishes_empty_invalid_auth_and_unavailable() -> N
     async def invalid(base_url: str, api_key: str) -> list[str]:
         return {"unexpected": True}  # type: ignore[return-value]
 
+    async def malformed_record(base_url: str, api_key: str) -> list[str]:
+        return ["model-a", {"missing": "id"}]  # type: ignore[list-item]
+
     class UpstreamAuthenticationError(RuntimeError):
         status_code = 401
 
@@ -215,6 +218,10 @@ def test_model_discovery_distinguishes_empty_invalid_auth_and_unavailable() -> N
     with pytest.raises(ProviderResponseError):
         asyncio.run(
             ProviderModelCatalog(fetcher=invalid).discover("glm", "secret")
+        )
+    with pytest.raises(ProviderResponseError):
+        asyncio.run(
+            ProviderModelCatalog(fetcher=malformed_record).discover("glm", "secret")
         )
     with pytest.raises(ProviderAuthenticationError) as auth_error:
         asyncio.run(

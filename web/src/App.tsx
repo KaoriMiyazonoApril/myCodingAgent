@@ -645,10 +645,46 @@ function ActiveThreadView({
   );
   const [initialCursor] = useState(thread.event_cursor);
   const threadId = thread.snapshot.thread_id;
+  const submissionActive = thread.submission !== null;
 
   useEffect(() => {
     if (typeof EventSource === "undefined") {
-      return;
+      if (!submissionActive) {
+        return;
+      }
+      let stopped = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const poll = async () => {
+        try {
+          const next = await getThread(threadId);
+          if (stopped) {
+            return;
+          }
+          onThread(next);
+          setState(initialThreadState(next));
+          setStreamError(null);
+          if (next.submission !== null) {
+            timer = setTimeout(() => void poll(), 500);
+          }
+        } catch (reason: unknown) {
+          if (stopped) {
+            return;
+          }
+          setStreamError(
+            reason instanceof Error
+              ? `Thread refresh failed · ${reason.message}`
+              : "Thread refresh failed",
+          );
+          timer = setTimeout(() => void poll(), 1000);
+        }
+      };
+      void poll();
+      return () => {
+        stopped = true;
+        if (timer !== null) {
+          clearTimeout(timer);
+        }
+      };
     }
     const client = new ThreadEventClient(
       threadId,
@@ -669,7 +705,7 @@ function ActiveThreadView({
         },
         onSnapshot: (next) => {
           onThread(next);
-          setState(hydrateThread(next));
+          setState(initialThreadState(next));
           setStreamError(null);
         },
         onConnection: setConnection,
@@ -679,7 +715,7 @@ function ActiveThreadView({
     );
     client.start();
     return () => client.stop();
-  }, [initialCursor, onThread, threadId]);
+  }, [initialCursor, onThread, submissionActive, threadId]);
 
   const turnActive = thread.submission !== null && state.terminal === null;
   const turnStatus = summaryText(state.terminal, "status") ?? "idle";
@@ -944,6 +980,24 @@ function ConversationFeed({
           </article>
         ))}
       </div>
+      {state.files.length > 0 ? (
+        <div className="conversation-files" aria-label="Conversation file changes">
+          {state.files.map((file) => (
+            <article className="conversation-file-card" key={file.path}>
+              <div>
+                <strong>{file.path}</strong>
+                <span>{file.change_type}</span>
+              </div>
+              {file.diff ? (
+                <details>
+                  <summary>View diff</summary>
+                  <pre>{file.diff}</pre>
+                </details>
+              ) : null}
+            </article>
+          ))}
+        </div>
+      ) : null}
       {state.error ? (
         <div className="inline-error" role="alert">
           <strong>{state.error.code}</strong> · {state.error.message}

@@ -51,12 +51,16 @@ class _Threads:
 
 
 class _Submissions:
-    def __init__(self, value=None) -> None:
+    def __init__(self, value=None, failure=None) -> None:
         self.value = value
+        self.failure = failure
         self.cancel_calls = 0
 
     def inspect(self, thread_id: str):
         return self.value
+
+    def inspect_failure(self, thread_id: str):
+        return self.failure
 
 
 async def _never_disconnected() -> bool:
@@ -154,6 +158,36 @@ def test_expired_cursor_with_empty_buffer_explicitly_clears_sse_id() -> None:
 
     assert frame.startswith("event: snapshot\nid: \n")
     assert _data(frame)["cursor"] is None
+
+
+def test_background_host_failure_emits_one_recoverable_snapshot() -> None:
+    async def scenario() -> str:
+        threads = _Threads()
+        submissions = _Submissions(
+            failure={
+                "code": "TURN_TASK_FAILED",
+                "message": "Agent Turn task failed",
+            }
+        )
+        adapter = EventStreamAdapter(threads, submissions)
+        stream = adapter.stream(
+            threads.thread_id,
+            after_event_id=None,
+            disconnected=_never_disconnected,
+        )
+        frame = await anext(stream)
+        await stream.aclose()
+        return frame
+
+    frame = asyncio.run(scenario())
+    payload = _data(frame)
+
+    assert frame.startswith("event: snapshot\nid: \n")
+    assert payload["cursor"] is None
+    assert payload["thread"]["host_error"] == {
+        "code": "TURN_TASK_FAILED",
+        "message": "Agent Turn task failed",
+    }
 
 
 @pytest.mark.parametrize(
