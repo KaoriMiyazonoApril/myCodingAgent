@@ -49,6 +49,12 @@ textarea:focus-visible {
   padding: 24px 0 64px;
 }
 
+.app-shell {
+  width: min(1600px, calc(100% - 24px));
+  margin: 0 auto;
+  padding: 12px 0 24px;
+}
+
 .product-bar {
   display: flex;
   align-items: center;
@@ -91,12 +97,36 @@ textarea:focus-visible {
 }
 
 .host-badge {
-  margin-left: auto;
   padding: 6px 9px;
   border: 1px solid var(--border);
   border-radius: 999px;
   color: var(--muted);
   font: 500 12px/1 "JetBrains Mono", ui-monospace, monospace;
+}
+
+.product-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.provider-settings-toggle {
+  min-height: 36px;
+}
+
+.provider-drawer {
+  position: relative;
+  z-index: 4;
+  margin-top: 12px;
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #10182a;
+}
+
+.provider-drawer h1 {
+  font-size: clamp(28px, 4vw, 48px);
 }
 
 .setup-panel {
@@ -315,6 +345,45 @@ button:disabled {
   background: #10182a;
 }
 
+.thread-sidebar .workspace-panel h2 {
+  margin: 7px 0 4px;
+  font-size: 18px;
+  letter-spacing: -0.02em;
+}
+
+.thread-sidebar .workspace-browser {
+  width: 100%;
+  margin-top: 16px;
+  border-radius: 8px;
+}
+
+.thread-sidebar .workspace-roots {
+  max-height: 84px;
+  overflow: auto;
+}
+
+.thread-sidebar .path-bar {
+  align-items: stretch;
+  flex-direction: column;
+}
+
+.thread-sidebar .path-bar button {
+  align-self: flex-start;
+}
+
+.thread-sidebar .directory-list {
+  max-height: min(24vh, 260px);
+}
+
+.thread-sidebar .workspace-actions {
+  align-items: stretch;
+  flex-direction: column;
+}
+
+.thread-sidebar .workspace-actions .success-line {
+  overflow-wrap: anywhere;
+}
+
 .workspace-roots,
 .path-bar,
 .workspace-actions {
@@ -391,20 +460,34 @@ button:disabled {
   margin-top: 0;
 }
 
-.thread-panel {
+.agent-console {
+  position: relative;
   display: grid;
-  min-height: 390px;
-  grid-template-columns: minmax(240px, 0.34fr) minmax(0, 1fr);
+  min-height: calc(100vh - 112px);
+  margin-top: 12px;
+  grid-template-columns: minmax(250px, 0.24fr) minmax(440px, 1fr) minmax(250px, 0.28fr);
   border: 1px solid var(--border);
   border-radius: 12px;
   overflow: hidden;
   background: #10182a;
 }
 
+.mobile-view-switcher {
+  display: none;
+}
+
 .thread-sidebar {
-  padding: 18px;
+  min-width: 0;
+  padding: 16px;
+  overflow: auto;
   border-right: 1px solid var(--border);
   background: #0d1424;
+}
+
+.sidebar-divider {
+  height: 1px;
+  margin: 22px 0;
+  background: var(--border);
 }
 
 .thread-sidebar-heading,
@@ -555,6 +638,17 @@ button:disabled {
   font-size: 12px;
 }
 
+.tool-card details {
+  margin-top: 10px;
+}
+
+.tool-card summary {
+  color: var(--muted);
+  font: 600 11px/1.4 "JetBrains Mono", ui-monospace, monospace;
+  cursor: pointer;
+  text-transform: uppercase;
+}
+
 .tool-card pre {
   max-height: 180px;
   margin: 10px 0 0;
@@ -603,7 +697,11 @@ button:disabled {
 }
 
 .thread-detail {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
   padding: 24px;
+  overflow: auto;
 }
 
 .thread-detail h3,
@@ -623,7 +721,7 @@ button:disabled {
 }
 
 .thread-workspace {
-  margin-top: 44px;
+  margin: 20px 0 0;
   font-size: 15px;
 }
 
@@ -632,14 +730,186 @@ button:disabled {
   font-size: 13px;
 }
 
-@media (max-width: 900px) {
-  .thread-panel {
+.activity-panel {
+  min-width: 0;
+  padding: 20px;
+  overflow: auto;
+  border-left: 1px solid var(--border);
+  background: #0d1424;
+}
+
+.activity-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.activity-heading h4 {
+  margin: 7px 0 0;
+  font-size: 18px;
+}
+
+.activity-summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  margin: 22px 0 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--border);
+}
+
+.activity-summary div {
+  min-width: 0;
+  padding: 10px;
+  background: var(--surface);
+}
+
+.activity-summary dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.activity-summary dd {
+  margin: 5px 0 0;
+  overflow: hidden;
+  font: 600 12px/1.2 "JetBrains Mono", ui-monospace, monospace;
+  text-overflow: ellipsis;
+}
+
+.activity-tool-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 22px;
+}
+
+.activity-tool {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.activity-tool > span {
+  color: #f7c45b;
+}
+
+.activity-tool.success > span {
+  color: var(--accent);
+}
+
+.activity-tool.error > span {
+  color: var(--danger);
+}
+
+.activity-tool div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.activity-tool strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+}
+
+.activity-tool small {
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.changed-files-placeholder {
+  margin-top: 28px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.console-error {
+  position: absolute;
+  z-index: 3;
+  top: 12px;
+  right: 12px;
+  max-width: min(480px, calc(100% - 24px));
+  margin: 0;
+  border: 1px solid rgb(255 107 118 / 65%);
+  border-left-width: 3px;
+  border-radius: 7px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 1023px) {
+  .app-shell,
+  .setup-shell {
+    width: min(100% - 16px, 820px);
+  }
+
+  .agent-console {
+    min-height: calc(100vh - 118px);
     grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .mobile-view-switcher {
+    display: grid;
+    grid-column: 1;
+    grid-template-columns: repeat(3, 1fr);
+    padding: 8px;
+    border-bottom: 1px solid var(--border);
+    background: #0d1424;
+  }
+
+  .mobile-view-switcher button {
+    min-height: 40px;
+    border: 0;
+    border-radius: 6px;
+    color: var(--muted);
+    background: transparent;
+  }
+
+  .mobile-view-switcher button[aria-pressed="true"] {
+    color: #07140d;
+    background: var(--accent);
+  }
+
+  .thread-sidebar,
+  .thread-detail,
+  .activity-panel {
+    grid-column: 1;
+    grid-row: 2;
+    border: 0;
+  }
+
+  .mobile-view-inactive {
+    display: none;
+  }
+
+  .mobile-view-active {
+    display: flex;
   }
 
   .thread-sidebar {
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
+    flex-direction: column;
+  }
+
+  .activity-panel {
+    flex-direction: column;
   }
 }
 
@@ -650,6 +920,17 @@ button:disabled {
 
   .host-badge {
     display: none;
+  }
+
+  .thread-detail-heading,
+  .thread-controls,
+  .editor-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .thread-controls button {
+    width: 100%;
   }
 }
 

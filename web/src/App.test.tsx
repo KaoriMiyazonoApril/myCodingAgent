@@ -178,6 +178,12 @@ test("saves a key, discovers models, and selects a default", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Use as default" }));
 
   expect((await screen.findAllByText("Default provider")).length).toBeGreaterThan(0);
+  fireEvent.click(screen.getByRole("button", { name: "Refresh models" }));
+  await waitFor(() =>
+    expect(
+      requests.filter(({ path }) => path.endsWith("/models/discover")),
+    ).toHaveLength(2),
+  );
   expect(requests).toEqual(
     expect.arrayContaining([
       { method: "PUT", path: "/api/providers/deepseek" },
@@ -470,6 +476,23 @@ test("creates switches refreshes and closes Host threads", async () => {
   );
 
   render(<App />);
+  expect(
+    await screen.findByRole("navigation", { name: "Workspace and threads" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("region", { name: "Agent conversation" }),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("complementary", { name: "Activity" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Show navigation" })).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Show navigation" }));
+  expect(screen.getByRole("button", { name: "Show navigation" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Show conversation" }));
   expect(
     await screen.findByRole("heading", { name: "thread-existing" }),
   ).toBeInTheDocument();

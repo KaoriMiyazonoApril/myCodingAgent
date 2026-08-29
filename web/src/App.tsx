@@ -26,7 +26,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState<string | null>(null);
-  const [selectedWorkspace, setSelectedWorkspace] = useState<string | null>(null);
+  const [showProviderSettings, setShowProviderSettings] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -52,8 +52,14 @@ export function App() {
     };
   }, []);
 
+  const providerReady = providers.some(
+    (provider) =>
+      provider.is_default && provider.configured && provider.selected_model !== null,
+  );
+  const showSetup = !providerReady || showProviderSettings || editing !== null;
+
   return (
-    <main className="setup-shell">
+    <main className={providerReady ? "app-shell" : "setup-shell"}>
       <header className="product-bar">
         <span className="product-mark" aria-hidden="true">
           &gt;_
@@ -62,10 +68,29 @@ export function App() {
           <p className="eyebrow">LOCAL RUNTIME</p>
           <p className="product-name">Agent</p>
         </div>
-        <span className="host-badge">127.0.0.1</span>
+        <div className="product-actions">
+          {providerReady ? (
+            <button
+              type="button"
+              className="quiet-button provider-settings-toggle"
+              aria-expanded={showSetup}
+              onClick={() => {
+                setEditing(null);
+                setShowProviderSettings((current) => !current);
+              }}
+            >
+              Provider settings
+            </button>
+          ) : null}
+          <span className="host-badge">127.0.0.1</span>
+        </div>
       </header>
 
-      <section className="setup-panel" aria-labelledby="provider-heading">
+      {showSetup ? (
+      <section
+        className={providerReady ? "provider-drawer" : "setup-panel"}
+        aria-labelledby="provider-heading"
+      >
         <div className="setup-copy">
           <p className="step-label">STEP 01 · MODEL ACCESS</p>
           <h1 id="provider-heading">Connect a model provider</h1>
@@ -125,11 +150,8 @@ export function App() {
           />
         ) : null}
       </section>
-      <WorkspacePicker onSelect={setSelectedWorkspace} />
-      <ThreadPanel
-        workspace={selectedWorkspace}
-        providers={providers}
-      />
+      ) : null}
+      <ThreadPanel providers={providers} providerReady={providerReady} />
     </main>
   );
 }
@@ -179,14 +201,11 @@ function WorkspacePicker({ onSelect }: { onSelect: (path: string) => void }) {
   }, []);
 
   return (
-    <section className="setup-panel workspace-panel" aria-labelledby="workspace-heading">
+    <section className="workspace-panel" aria-labelledby="workspace-heading">
       <div className="setup-copy">
-        <p className="step-label">STEP 02 · EXECUTION ROOT</p>
+        <p className="step-label">EXECUTION ROOT</p>
         <h2 id="workspace-heading">Choose a workspace</h2>
-        <p className="lede">
-          Browse directories exposed by this Linux or WSL Host. Runtime validation
-          still applies when the Agent executes a task.
-        </p>
+        <p className="field-help">Linux or WSL Host directories only.</p>
       </div>
 
       {error ? (
@@ -265,17 +284,21 @@ function WorkspacePicker({ onSelect }: { onSelect: (path: string) => void }) {
 }
 
 type ThreadPanelProps = {
-  workspace: string | null;
   providers: ProviderView[];
+  providerReady: boolean;
 };
 
-function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
+function ThreadPanel({ providers, providerReady }: ThreadPanelProps) {
+  const [workspace, setWorkspace] = useState<string | null>(null);
   const [threads, setThreads] = useState<ThreadView[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [composer, setComposer] = useState("");
+  const [mobileView, setMobileView] = useState<
+    "navigation" | "conversation" | "activity"
+  >("conversation");
 
   const active = threads.find(
     (thread) => thread.snapshot.thread_id === activeId,
@@ -336,6 +359,9 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
       if (workspace === null) {
         throw new Error("Select a workspace before creating a Thread");
       }
+      if (!providerReady) {
+        throw new Error("Configure a default Provider and model first");
+      }
       replaceThread(await createThread(workspace));
     });
 
@@ -383,17 +409,48 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
     : null;
 
   return (
-    <section className="setup-panel thread-panel" aria-labelledby="threads-heading">
-      <div className="thread-sidebar">
+    <section className="agent-console" aria-label="Coding Agent console">
+      <div className="mobile-view-switcher" aria-label="Console views">
+        <button
+          type="button"
+          aria-label="Show navigation"
+          aria-pressed={mobileView === "navigation"}
+          onClick={() => setMobileView("navigation")}
+        >
+          Workspace
+        </button>
+        <button
+          type="button"
+          aria-label="Show conversation"
+          aria-pressed={mobileView === "conversation"}
+          onClick={() => setMobileView("conversation")}
+        >
+          Conversation
+        </button>
+        <button
+          type="button"
+          aria-label="Show activity"
+          aria-pressed={mobileView === "activity"}
+          onClick={() => setMobileView("activity")}
+        >
+          Activity
+        </button>
+      </div>
+      <nav
+        className={`thread-sidebar mobile-view-${mobileView === "navigation" ? "active" : "inactive"}`}
+        aria-label="Workspace and threads"
+      >
+        <WorkspacePicker onSelect={setWorkspace} />
+        <div className="sidebar-divider" />
         <div className="thread-sidebar-heading">
           <div>
-            <p className="step-label">STEP 03 · THREADS</p>
+            <p className="step-label">SESSIONS</p>
             <h2 id="threads-heading">Threads</h2>
           </div>
           <button
             type="button"
             className="primary-button"
-            disabled={busy || workspace === null}
+            disabled={busy || workspace === null || !providerReady}
             onClick={() => void create()}
           >
             New thread
@@ -415,103 +472,81 @@ function ThreadPanel({ workspace, providers }: ThreadPanelProps) {
             </button>
           ))}
         </div>
-      </div>
-      <div className="thread-detail">
-        {error ? (
-          <div className="inline-error" role="alert">
-            {error}
-          </div>
-        ) : null}
-        {active ? (
-          <>
-            <div className="thread-detail-heading">
-              <div>
-                <p className="step-label">ACTIVE THREAD</p>
-                <h3>{active.snapshot.thread_id}</h3>
-              </div>
-              <div className="thread-controls">
-                <button type="button" disabled={busy} onClick={() => void refresh()}>
-                  Refresh active thread
-                </button>
-                <button type="button" disabled={busy} onClick={() => void close()}>
-                  Close active thread
-                </button>
-              </div>
-            </div>
-            <p className="thread-workspace">{active.snapshot.workspace}</p>
-            <p className="thread-model">
-              {providerName} · {active.snapshot.settings.model} · settings v
-              {active.snapshot.settings.version}
+      </nav>
+      {error ? (
+        <div className="console-error inline-error" role="alert">
+          {error}
+        </div>
+      ) : null}
+      {active ? (
+        <ActiveThreadView
+          key={active.snapshot.thread_id}
+          thread={active}
+          providerName={providerName}
+          busy={busy}
+          composer={composer}
+          mobileView={mobileView}
+          onComposer={setComposer}
+          onRefresh={() => void refresh()}
+          onClose={() => void close()}
+          onSubmit={() => void submit()}
+          onStop={() => void stop()}
+          onThread={replaceThread}
+        />
+      ) : (
+        <>
+          <section
+            className={`thread-detail mobile-view-${mobileView === "conversation" ? "active" : "inactive"}`}
+            aria-label="Agent conversation"
+          >
+            <p className="thread-empty">
+              {workspace
+                ? providerReady
+                  ? "Create a Thread for the selected workspace."
+                  : "Configure a default Provider and model before creating a Thread."
+                : "Select a Host workspace to enable Thread creation."}
             </p>
-            <p className="thread-status">Status · {active.snapshot.status}</p>
-            {active.submission ? (
-              <p className="submission-status" aria-live="polite">
-                {active.submission.status === "starting"
-                  ? "Starting…"
-                  : active.submission.status === "running"
-                    ? "Running…"
-                    : "Cancelling…"}
-              </p>
-            ) : null}
-            <ThreadConversation
-              key={active.snapshot.thread_id}
-              thread={active}
-              onThread={replaceThread}
-            />
-            <div className="composer">
-              <label htmlFor="agent-composer">Ask Agent</label>
-              <textarea
-                id="agent-composer"
-                rows={4}
-                value={composer}
-                disabled={active.snapshot.status === "closed"}
-                onChange={(event) => setComposer(event.target.value)}
-                placeholder="Describe the coding task…"
-              />
-              <div className="composer-actions">
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={
-                    busy ||
-                    active.submission !== null ||
-                    active.snapshot.status === "closed" ||
-                    !composer.trim()
-                  }
-                  onClick={() => void submit()}
-                >
-                  Send
-                </button>
-                {active.submission !== null ? (
-                  <button
-                    type="button"
-                    className="danger-button"
-                    disabled={busy || active.submission.status === "cancelling"}
-                    onClick={() => void stop()}
-                  >
-                    Stop
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          </>
-        ) : (
-          <p className="thread-empty">
-            {workspace
-              ? "Create a Thread for the selected workspace."
-              : "Select a Host workspace to enable Thread creation."}
-          </p>
-        )}
+          </section>
+          <aside
+            className={`activity-panel mobile-view-${mobileView === "activity" ? "active" : "inactive"}`}
+            aria-label="Activity"
+          >
+            <p className="step-label">ACTIVITY</p>
+            <p className="thread-empty">No active Thread.</p>
+          </aside>
+        </>
+      )}
+      {/* Errors are kept outside switchable panes so narrow layouts never hide them. */}
+      <div className="visually-hidden" aria-live="polite">
+        {busy ? "Host request in progress" : ""}
       </div>
     </section>
   );
 }
 
-function ThreadConversation({
+function ActiveThreadView({
   thread,
+  providerName,
+  busy,
+  composer,
+  mobileView,
+  onComposer,
+  onRefresh,
+  onClose,
+  onSubmit,
+  onStop,
   onThread,
 }: {
   thread: ThreadView;
+  providerName: string | null;
+  busy: boolean;
+  composer: string;
+  mobileView: "navigation" | "conversation" | "activity";
+  onComposer: (value: string) => void;
+  onRefresh: () => void;
+  onClose: () => void;
+  onSubmit: () => void;
+  onStop: () => void;
   onThread: (thread: ThreadView) => void;
 }) {
   const [state, setState] = useState(() => hydrateThread(thread));
@@ -549,7 +584,133 @@ function ThreadConversation({
   }, [initialCursor, onThread, threadId]);
 
   return (
-    <section className="conversation" aria-label="Conversation and activity">
+    <>
+      <section
+        className={`thread-detail mobile-view-${mobileView === "conversation" ? "active" : "inactive"}`}
+        aria-label="Agent conversation"
+      >
+        <div className="thread-detail-heading">
+              <div>
+                <p className="step-label">ACTIVE THREAD</p>
+                <h3>{thread.snapshot.thread_id}</h3>
+              </div>
+              <div className="thread-controls">
+                <button type="button" disabled={busy} onClick={onRefresh}>
+                  Refresh active thread
+                </button>
+                <button type="button" disabled={busy} onClick={onClose}>
+                  Close active thread
+                </button>
+              </div>
+        </div>
+            <p className="thread-workspace">{thread.snapshot.workspace}</p>
+            <p className="thread-model">
+              {providerName} · {thread.snapshot.settings.model} · settings v
+              {thread.snapshot.settings.version}
+            </p>
+            <p className="thread-status">Status · {thread.snapshot.status}</p>
+            {thread.submission ? (
+              <p className="submission-status" aria-live="polite">
+                {thread.submission.status === "starting"
+                  ? "Starting…"
+                  : thread.submission.status === "running"
+                    ? "Running…"
+                    : "Cancelling…"}
+              </p>
+            ) : null}
+            <ConversationFeed
+              state={state}
+              connection={connection}
+              streamError={streamError}
+            />
+            <div className="composer">
+              <label htmlFor="agent-composer">Ask Agent</label>
+              <textarea
+                id="agent-composer"
+                rows={4}
+                value={composer}
+                disabled={thread.snapshot.status === "closed"}
+                onChange={(event) => onComposer(event.target.value)}
+                placeholder="Describe the coding task…"
+              />
+              <div className="composer-actions">
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={
+                    busy ||
+                    thread.submission !== null ||
+                    thread.snapshot.status === "closed" ||
+                    !composer.trim()
+                  }
+                  onClick={onSubmit}
+                >
+                  Send
+                </button>
+                {thread.submission !== null ? (
+                  <button
+                    type="button"
+                    className="danger-button"
+                    disabled={busy || thread.submission.status === "cancelling"}
+                    onClick={onStop}
+                  >
+                    Stop
+                  </button>
+                ) : null}
+              </div>
+            </div>
+      </section>
+      <aside
+        className={`activity-panel mobile-view-${mobileView === "activity" ? "active" : "inactive"}`}
+        aria-label="Activity"
+      >
+        <div className="activity-heading">
+          <div>
+            <p className="step-label">ACTIVITY</p>
+            <h4>Execution</h4>
+          </div>
+          <span className={`connection-state ${connection}`}>{connection}</span>
+        </div>
+        <dl className="activity-summary">
+          <div><dt>Thread</dt><dd>{thread.snapshot.status}</dd></div>
+          <div><dt>Turn</dt><dd>{thread.submission?.status ?? "idle"}</dd></div>
+          <div><dt>Tools</dt><dd>{state.tools.length}</dd></div>
+          <div><dt>Completed</dt><dd>{thread.snapshot.completed_turns}</dd></div>
+        </dl>
+        <div className="activity-tool-list" aria-label="Tool activity summary">
+          {state.tools.map((tool) => (
+            <article className={`activity-tool ${tool.status}`} key={tool.id}>
+              <span aria-hidden="true">
+                {tool.status === "success" ? "✓" : tool.status === "error" ? "×" : "○"}
+              </span>
+              <div><strong>{tool.name}</strong><small>{tool.status}</small></div>
+            </article>
+          ))}
+          {state.tools.length === 0 ? <p className="thread-empty">No tool calls yet.</p> : null}
+        </div>
+        <div className="changed-files-placeholder">
+          <p className="step-label">CHANGED FILES</p>
+          <p className="thread-empty">File changes will appear when reported by Runtime events.</p>
+        </div>
+        {state.terminal ? (
+          <p className="terminal-state">Turn · {String(state.terminal.status ?? "finished")}</p>
+        ) : null}
+      </aside>
+    </>
+  );
+}
+
+function ConversationFeed({
+  state,
+  connection,
+  streamError,
+}: {
+  state: ReturnType<typeof hydrateThread>;
+  connection: "connecting" | "connected" | "disconnected";
+  streamError: string | null;
+}) {
+  return (
+    <section className="conversation" aria-label="Conversation timeline">
       <div className="conversation-heading">
         <h4>Conversation</h4>
         <span className={`connection-state ${connection}`}>{connection}</span>
@@ -583,9 +744,17 @@ function ThreadConversation({
               <span>{tool.status}</span>
             </div>
             {tool.arguments !== null ? (
-              <pre>{JSON.stringify(tool.arguments, null, 2)}</pre>
+              <details>
+                <summary>Arguments</summary>
+                <pre>{JSON.stringify(tool.arguments, null, 2)}</pre>
+              </details>
             ) : null}
-            {tool.result ? <pre>{tool.result}</pre> : null}
+            {tool.result ? (
+              <details open={tool.status === "error"}>
+                <summary>Result</summary>
+                <pre>{tool.result}</pre>
+              </details>
+            ) : null}
             {tool.error_code ? <p>{tool.error_code}</p> : null}
           </article>
         ))}
@@ -594,11 +763,6 @@ function ThreadConversation({
         <div className="inline-error" role="alert">
           <strong>{state.error.code}</strong> · {state.error.message}
         </div>
-      ) : null}
-      {state.terminal ? (
-        <p className="terminal-state">
-          Turn · {String(state.terminal.status ?? "finished")}
-        </p>
       ) : null}
     </section>
   );
@@ -666,6 +830,20 @@ function ProviderEditor({ provider, onClose, onChange }: ProviderEditorProps) {
       const selected = await selectProviderDefault(provider.provider_id, model);
       onChange(selected);
       setMessage("Default provider");
+    });
+
+  const refreshModels = () =>
+    run(async () => {
+      const discovered = await discoverModels(provider.provider_id);
+      setModels(discovered.models);
+      if (!model && discovered.models[0]) {
+        setModel(discovered.models[0]);
+      }
+      setMessage(
+        discovered.models.length > 0
+          ? `${discovered.models.length} models available`
+          : "Provider returned no models; enter one manually",
+      );
     });
 
   const clear = () =>
@@ -755,6 +933,16 @@ function ProviderEditor({ provider, onClose, onChange }: ProviderEditorProps) {
       </div>
 
       <div className="editor-actions">
+        {provider.configured ? (
+          <button
+            type="button"
+            className="quiet-button"
+            disabled={busy}
+            onClick={() => void refreshModels()}
+          >
+            Refresh models
+          </button>
+        ) : null}
         <button
           type="button"
           className="primary-button"
