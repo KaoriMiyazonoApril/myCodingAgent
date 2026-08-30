@@ -963,6 +963,37 @@ textarea:disabled {
   line-height: 1.5;
 }
 
+.approval-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 14px;
+  padding: 13px 14px;
+  border: 1px solid rgb(255 184 77 / 55%);
+  border-radius: 8px;
+  color: #fff1d4;
+  background: rgb(93 58 19 / 42%);
+}
+
+.approval-card p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.approval-reason {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.approval-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
 .conversation-file-card {
   padding: 11px 12px;
   border-left: 2px solid var(--accent);

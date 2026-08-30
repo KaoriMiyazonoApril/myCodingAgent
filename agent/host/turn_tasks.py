@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
-from agent.runtime import ThreadClosedError
+from agent.runtime import ThreadClosedError, TurnSettingsOverride
 
 
 class DuplicateTurnSubmissionError(RuntimeError):
@@ -25,6 +25,7 @@ class RuntimeCommands(Protocol):
         user_text: str,
         *,
         idempotency_key: str | None = None,
+        settings_override: TurnSettingsOverride | None = None,
     ): ...
 
     def cancel_turn(self, thread_id: str) -> bool: ...
@@ -67,6 +68,7 @@ class TurnTaskManager:
         user_text: str,
         *,
         idempotency_key: str | None = None,
+        settings_override: TurnSettingsOverride | None = None,
     ) -> dict[str, object]:
         if not self._accepting:
             raise RuntimeError("TurnTaskManager is shutting down")
@@ -100,6 +102,7 @@ class TurnTaskManager:
                 runtime,
                 user_text,
                 idempotency_key=idempotency_key,
+                settings_override=settings_override,
             )
         )
         # Let run_turn reach its first asynchronous preflight boundary so an
@@ -162,13 +165,22 @@ class TurnTaskManager:
         user_text: str,
         *,
         idempotency_key: str | None,
+        settings_override: TurnSettingsOverride | None,
     ) -> None:
         try:
-            await runtime.run_turn(
-                submission.thread_id,
-                user_text,
-                idempotency_key=idempotency_key,
-            )
+            if settings_override is None:
+                await runtime.run_turn(
+                    submission.thread_id,
+                    user_text,
+                    idempotency_key=idempotency_key,
+                )
+            else:
+                await runtime.run_turn(
+                    submission.thread_id,
+                    user_text,
+                    idempotency_key=idempotency_key,
+                    settings_override=settings_override,
+                )
         except asyncio.CancelledError:
             self._record_failure(
                 submission.thread_id,

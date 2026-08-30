@@ -35,7 +35,19 @@ SCHEMA_VERSION = 1
 def _public_dict(value: object) -> dict[str, Any]:
     """Convert a public dataclass to a detached JSON-compatible dictionary."""
 
-    return asdict(value)  # str enums intentionally serialize as JSON strings.
+    return _json_safe(asdict(value))
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True, slots=True)

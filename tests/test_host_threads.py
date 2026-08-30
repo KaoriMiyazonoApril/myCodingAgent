@@ -8,7 +8,7 @@ from agent.host.app import create_app
 from agent.host.model_catalog import ModelDiscovery
 from agent.host.provider_config import ProviderStore
 from agent.host.workspace import WorkspaceBrowser
-from agent.runtime import ModelSettings, ThreadRuntime, UnsafeWorkspaceError
+from agent.runtime import ApprovalMode, ModelSettings, ThreadRuntime, UnsafeWorkspaceError
 from agent.tools.registry import ToolRegistry
 
 
@@ -204,6 +204,38 @@ def test_thread_api_maps_not_found_invalid_workspace_and_provider(tmp_path) -> N
     assert escaped.json()["error"]["code"] == "WORKSPACE_OUTSIDE_ROOT"
     assert invalid_provider.status_code == 409
     assert invalid_provider.json()["error"]["code"] == "CONFIGURATION_REQUIRED"
+
+
+def test_thread_creation_exposes_frozen_approval_mode(tmp_path) -> None:
+    calls: list[ModelSettings] = []
+    store = _configured_store(tmp_path / "providers.json")
+    client = _client(tmp_path, store, calls)
+
+    response = client.post(
+        "/api/threads",
+        json={"workspace": str(tmp_path), "approval_mode": "never"},
+    )
+
+    assert response.status_code == 201
+    settings = response.json()["thread"]["snapshot"]["settings"]
+    assert settings["approval_mode"] == ApprovalMode.NEVER.value
+    assert calls[0].approval_mode is ApprovalMode.NEVER
+
+
+def test_approval_resolution_uses_runtime_and_reports_stale_request(tmp_path) -> None:
+    calls: list[ModelSettings] = []
+    store = _configured_store(tmp_path / "providers.json")
+    client = _client(tmp_path, store, calls)
+    created = client.post("/api/threads", json={"workspace": str(tmp_path)})
+    thread_id = created.json()["thread"]["snapshot"]["thread_id"]
+
+    response = client.post(
+        f"/api/threads/{thread_id}/approvals/stale",
+        json={"approved": True},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "APPROVAL_NOT_FOUND"
 
 
 def test_runtime_workspace_safety_error_is_not_parsed_from_message(tmp_path) -> None:

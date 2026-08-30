@@ -15,6 +15,7 @@ import {
   selectProviderDefault,
   startTurn,
   selectNativeWorkspace,
+  resolveApproval,
   updateThreadSettings,
   type ProviderView,
   type NativePickerCapability,
@@ -22,7 +23,7 @@ import {
   type WorkspaceListing,
 } from "./api";
 import { ThreadEventClient } from "./eventClient";
-import { applyAgentEvent, hydrateThread } from "./events";
+import { applyAgentEvent, hydrateThread, type ApprovalRequest } from "./events";
 import "./styles.css";
 
 const TERMINAL_EVENT_TYPES = new Set([
@@ -1204,6 +1205,7 @@ function ActiveThreadView({
     thread.snapshot.settings.model,
   );
   const [initialCursor] = useState(thread.event_cursor);
+  const [approvalBusy, setApprovalBusy] = useState(false);
   const threadId = thread.snapshot.thread_id;
   const submissionActive = thread.submission !== null;
 
@@ -1503,6 +1505,22 @@ function ActiveThreadView({
             pendingUserMessage={pendingUserMessage}
             onStarter={onComposer}
           />
+          {state.approval ? (
+            <ApprovalCard
+              approval={state.approval}
+              busy={approvalBusy}
+              onResolve={(approved) => {
+                setApprovalBusy(true);
+                void resolveApproval(threadId, state.approval?.approval_id ?? "", approved)
+                  .catch((reason: unknown) => {
+                    setStreamError(
+                      reason instanceof Error ? reason.message : "确认请求失败",
+                    );
+                  })
+                  .finally(() => setApprovalBusy(false));
+              }}
+            />
+          ) : null}
         </div>
         <div className="composer">
           <div className="composer-heading">
@@ -1844,6 +1862,48 @@ function ConversationFeed({
   );
 }
 
+function ApprovalCard({
+  approval,
+  busy,
+  onResolve,
+}: {
+  approval: ApprovalRequest;
+  busy: boolean;
+  onResolve: (approved: boolean) => void;
+}) {
+  const target = toolTarget(approval.tool_call);
+  return (
+    <aside className="approval-card" role="alert" aria-label="等待确认">
+      <div>
+        <strong>需要确认后继续</strong>
+        <p>{approval.message}</p>
+        <p className="approval-reason">
+          <code>{approval.reason_code}</code>
+          {target ? <code title={target}>{target}</code> : null}
+        </p>
+      </div>
+      <div className="approval-actions">
+        <button
+          type="button"
+          className="primary-button"
+          disabled={busy}
+          onClick={() => onResolve(true)}
+        >
+          批准
+        </button>
+        <button
+          type="button"
+          className="quiet-button"
+          disabled={busy}
+          onClick={() => onResolve(false)}
+        >
+          拒绝
+        </button>
+      </div>
+    </aside>
+  );
+}
+
 type ProviderEditorProps = {
   provider: ProviderView | null;
   onClose: () => void;
@@ -2059,6 +2119,7 @@ function initialThreadState(thread: ThreadView) {
     state.error = null;
     state.files = [];
     state.cancel_requested = false;
+    state.approval = null;
   }
   return state;
 }

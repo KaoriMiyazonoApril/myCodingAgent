@@ -72,12 +72,20 @@ export type ThreadSettings = {
     max_execution_seconds: number;
   };
   version: number;
+  approval_mode?: "untrusted" | "on_request" | "never";
 };
 
 export type TurnSubmission = {
   thread_id: string;
   status: "starting" | "running" | "cancelling";
   accepted_at: string;
+};
+
+export type ApprovalResolutionResponse = {
+  schema_version: number;
+  thread_id: string;
+  approval_id: string;
+  approved: boolean;
 };
 
 export type ThreadView = {
@@ -172,6 +180,7 @@ export async function updateThreadSettings(
         max_tokens: settings.max_tokens,
         thinking: settings.thinking,
         limits: settings.limits,
+        approval_mode: settings.approval_mode,
       }),
     })
   ).thread;
@@ -204,6 +213,21 @@ export async function cancelTurn(threadId: string): Promise<TurnSubmission> {
       method: "POST",
     })
   ).submission;
+}
+
+export async function resolveApproval(
+  threadId: string,
+  approvalId: string,
+  approved: boolean,
+): Promise<ApprovalResolutionResponse> {
+  return requestJson<ApprovalResolutionResponse>(
+    `/api/threads/${threadId}/approvals/${encodeURIComponent(approvalId)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ approved }),
+    },
+  );
 }
 
 export async function saveProvider(

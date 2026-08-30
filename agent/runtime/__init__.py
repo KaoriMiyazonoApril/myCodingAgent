@@ -13,9 +13,23 @@ from .errors import (
 )
 from .events import AgentEvent, EventBatch
 from .prompt import PromptBuilder
-from .policy import AllowAllPolicy, PolicyDecision, ToolPolicy
+from .policy import (
+    AllowAllPolicy,
+    CommandAwarePolicy,
+    CommandClassification,
+    ExecPolicy,
+    ExecClassification,
+    PolicyContext,
+    PolicyDecision,
+    PolicyResult,
+    StructuredPolicyResult,
+    ToolPolicy,
+    classify_command,
+    classify_exec_command,
+)
 from .settings import (
     AgentLimits,
+    ApprovalMode,
     ModelSettings,
     ThinkingKeep,
     ThinkingSettings,
@@ -33,6 +47,10 @@ __all__ = [
     "SCHEMA_VERSION",
     "AgentLimits",
     "AllowAllPolicy",
+    "ApprovalMode",
+    "CommandAwarePolicy",
+    "ExecPolicy",
+    "CommandClassification",
     "ContextLimitError",
     "IdempotencyConflictError",
     "ThreadBusyError",
@@ -40,6 +58,12 @@ __all__ = [
     "UnsafeWorkspaceError",
     "PromptBuilder",
     "PolicyDecision",
+    "PolicyContext",
+    "PolicyResult",
+    "StructuredPolicyResult",
+    "ExecClassification",
+    "classify_command",
+    "classify_exec_command",
     "ModelSettings",
     "SettingsConflictError",
     "ThinkingKeep",

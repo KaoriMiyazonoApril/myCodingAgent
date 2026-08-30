@@ -42,8 +42,9 @@ Host 使用受信 Provider preset 的固定 endpoint 获取 Provider 返回的�
 
 React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 Conversation 和 Composer，
 右侧 Activity、工具状态、文件变化和简化 diff。完整模型响应一次性显示，不引入 token delta。
-运行时 Send 旁提供真正调用 Runtime cancellation 的 Stop。当前 Policy 尚未形成生产审批策略，
-因此本规格不实现 approval endpoint、Approval Card 或 approval 测试。
+运行时 Send 旁提供真正调用 Runtime cancellation 的 Stop。Workstream B Phase 1 已确定
+`ApprovalMode` 与 command-aware Policy，因此 Host 仅增加一个薄的 approval resolution command，
+前端展示 Runtime 提供的原因并允许 approve/deny；风险判断仍不进入 Web。
 
 ## User Stories
 
@@ -122,7 +123,9 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - V1 supports Linux Host and WSL2 Host accessed from a Windows browser. A native Windows Host is not an acceptance target.
 - The dependency direction is Web UI → Agent Host → `ThreadRuntime` → Agent Core. The Web UI knows only transport DTOs for Provider, Workspace, Thread, Turn, Message, AgentEvent, ToolCall, FileChange, Settings, submission state, and errors.
 - Host behavior stops at the `ThreadRuntime` interface. AgentLoop, ToolCoordinator, Conversation policy, concrete tools, and Provider request execution remain behind Runtime and model seams.
-- Approval is excluded because no production Policy has been agreed. Existing Runtime approval behavior remains intact, but the Web application exposes no approval command or UI in this version.
+- Workstream B Phase 1 已形成最小审批接线：Host 暴露 Runtime 的 approval resolution command，
+  前端只展示 `approval_requested` 的稳定 reason 与 approve/deny 操作；Policy 决策和风险判断
+  仍完全属于 Runtime，Web 不自行复算。
 - Thread and event persistence remain in memory. Provider credentials and default Provider/model selection are the only durable local application settings in V1.
 
 ### Deep modules and seams

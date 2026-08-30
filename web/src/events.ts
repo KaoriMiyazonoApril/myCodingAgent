@@ -40,7 +40,15 @@ export type EventState = {
   error: { code: string; message: string } | null;
   files: FileChange[];
   cancel_requested: boolean;
+  approval: ApprovalRequest | null;
   seen_event_ids: string[];
+};
+
+export type ApprovalRequest = {
+  approval_id: string;
+  tool_call: Record<string, unknown> | null;
+  reason_code: string;
+  message: string;
 };
 
 export function hydrateThread(view: ThreadView): EventState {
@@ -51,6 +59,7 @@ export function hydrateThread(view: ThreadView): EventState {
     error: null,
     files: [],
     cancel_requested: false,
+    approval: null,
     seen_event_ids: [],
   };
   view.snapshot.messages.forEach((message, index) => {
@@ -79,6 +88,7 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     error: state.error,
     files: state.files.map((file) => ({ ...file })),
     cancel_requested: state.cancel_requested,
+    approval: state.approval,
     seen_event_ids: [...state.seen_event_ids, event.event_id],
   };
 
@@ -141,6 +151,26 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     }
   } else if (event.type === "turn_cancel_requested") {
     next.cancel_requested = true;
+  } else if (event.type === "approval_requested") {
+    const approvalId = event.payload.approval_id;
+    if (typeof approvalId === "string") {
+      next.approval = {
+        approval_id: approvalId,
+        tool_call: isRecord(event.payload.tool_call)
+          ? event.payload.tool_call
+          : null,
+        reason_code:
+          typeof event.payload.reason_code === "string"
+            ? event.payload.reason_code
+            : "APPROVAL_REQUIRED",
+        message:
+          typeof event.payload.message === "string"
+            ? event.payload.message
+            : "该命令需要确认",
+      };
+    }
+  } else if (event.type === "approval_resolved") {
+    next.approval = null;
   } else if (
     event.type === "turn_completed" ||
     event.type === "turn_cancelled" ||
@@ -151,6 +181,7 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     if (isRecord(summary)) {
       next.terminal = summary;
       next.cancel_requested = false;
+      next.approval = null;
       hydrateSummaryFiles(next, summary);
       if (isRecord(summary.error)) {
         next.error = safeError(summary.error);
@@ -163,6 +194,7 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
       : { code: "TURN_REJECTED", message: "Turn could not start" };
     next.terminal = { status: "rejected", error: next.error };
     next.cancel_requested = false;
+    next.approval = null;
   }
   return next;
 }

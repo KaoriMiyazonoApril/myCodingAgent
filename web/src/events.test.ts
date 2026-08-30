@@ -267,3 +267,30 @@ test("preserves terminal tools and reconstructs cancellation and file activity",
     diff_complete: false,
   });
 });
+
+test("keeps policy reason in the approval state until runtime resolves it", () => {
+  let state = hydrateThread({
+    ...view(),
+    snapshot: { ...view().snapshot, messages: [], latest_turn: null },
+  });
+  state = applyAgentEvent(
+    state,
+    event("approval_requested", {
+      approval_id: "approval-1",
+      reason_code: "DESTRUCTIVE_COMMAND",
+      message: "command requires approval",
+      tool_call: { id: "call-rm", name: "exec_command", arguments: { command: "rm -rf build" } },
+    }),
+  );
+  expect(state.approval).toEqual({
+    approval_id: "approval-1",
+    reason_code: "DESTRUCTIVE_COMMAND",
+    message: "command requires approval",
+    tool_call: { id: "call-rm", name: "exec_command", arguments: { command: "rm -rf build" } },
+  });
+  state = applyAgentEvent(state, event("approval_resolved", {
+    approval_id: "approval-1",
+    resolution: "approved",
+  }));
+  expect(state.approval).toBeNull();
+});

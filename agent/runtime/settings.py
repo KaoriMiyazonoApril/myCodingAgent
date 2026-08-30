@@ -24,6 +24,14 @@ class ThinkingKeep(str, Enum):
     ALL = "all"
 
 
+class ApprovalMode(str, Enum):
+    """How a Turn authorizes commands that are not plainly read-only."""
+
+    UNTRUSTED = "untrusted"
+    ON_REQUEST = "on_request"
+    NEVER = "never"
+
+
 @dataclass(frozen=True, slots=True)
 class AgentLimits:
     """Public, bounded execution budgets frozen into one Turn."""
@@ -117,6 +125,7 @@ class ModelSettings:
     max_tokens: int | None = None
     thinking: ThinkingSettings | None = None
     limits: AgentLimits = field(default_factory=AgentLimits)
+    approval_mode: ApprovalMode = ApprovalMode.ON_REQUEST
 
     def __post_init__(self) -> None:
         if (
@@ -144,6 +153,13 @@ class ModelSettings:
             raise ValueError("thinking must be ThinkingSettings or None")
         if not isinstance(self.limits, AgentLimits):
             raise ValueError("limits must be AgentLimits")
+        if not isinstance(self.approval_mode, ApprovalMode):
+            try:
+                object.__setattr__(self, "approval_mode", ApprovalMode(self.approval_mode))
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "approval_mode must be an ApprovalMode value"
+                ) from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +179,7 @@ class ThreadSettings(ModelSettings):
             max_tokens=settings.max_tokens,
             thinking=settings.thinking,
             limits=settings.limits,
+            approval_mode=settings.approval_mode,
             version=version,
         )
 
@@ -177,6 +194,7 @@ class TurnSettingsOverride:
     max_tokens: int | None | _Unset = _UNSET
     thinking: ThinkingSettings | None | _Unset = _UNSET
     limits: AgentLimits | _Unset = _UNSET
+    approval_mode: ApprovalMode | _Unset = _UNSET
 
     def apply(self, defaults: ModelSettings) -> ModelSettings:
         return ModelSettings(
@@ -198,6 +216,11 @@ class TurnSettingsOverride:
                 defaults.thinking if self.thinking is _UNSET else self.thinking
             ),
             limits=defaults.limits if self.limits is _UNSET else self.limits,
+            approval_mode=(
+                defaults.approval_mode
+                if self.approval_mode is _UNSET
+                else self.approval_mode
+            ),
         )
 
 
@@ -245,6 +268,7 @@ class TurnConfig(ModelSettings):
             max_tokens=settings.max_tokens,
             thinking=settings.thinking,
             limits=settings.limits,
+            approval_mode=settings.approval_mode,
             settings_version=settings_version,
             system_prompt=system_prompt,
             reasoning_visibility=reasoning_visibility,

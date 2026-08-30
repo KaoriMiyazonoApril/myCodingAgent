@@ -28,7 +28,7 @@ from .events import EventBatch, EventBuffer, TurnEventEmitter, utc_now
 from .loop import AgentLoop
 from .model_invoker import ModelInvoker
 from .prompt import PromptBuilder
-from .policy import AllowAllPolicy, ToolPolicy
+from .policy import CommandAwarePolicy, ToolPolicy
 from .run_controller import RunController
 from .settings import (
     ModelSettings,
@@ -153,7 +153,7 @@ class ThreadRuntime:
         self._reasoning_visibility = reasoning_visibility
         self._model_retry_delays = model_retry_delays
         self._workspace_leases = WorkspaceLeaseManager(max_active_turns)
-        self._tool_policy = tool_policy or AllowAllPolicy()
+        self._tool_policy = tool_policy or CommandAwarePolicy()
         self._approval_timeout_seconds = approval_timeout_seconds
         self._default_context_window_tokens = default_context_window_tokens
         validator_options: dict[str, object] = {
@@ -288,6 +288,7 @@ class ThreadRuntime:
                 approval_timeout_seconds=self._approval_timeout_seconds,
                 set_waiting=lambda waiting: self._set_waiting(record, waiting),
                 change_tracker=changes,
+                approval_mode=turn_config.approval_mode,
             )
             active_turn = _ActiveTurn(
                 turn_id=turn_id,

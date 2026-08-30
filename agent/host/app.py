@@ -19,11 +19,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent.runtime import (
     AgentLimits,
+    ApprovalMode,
     ModelSettings,
     SettingsConflictError,
     ThinkingKeep,
     ThinkingSettings,
     ThreadClosedError,
+    TurnSettingsOverride,
     UnsafeWorkspaceError,
     WorkspaceValidationLimitError,
 )
@@ -57,6 +59,7 @@ from .provider_config import (
 )
 from .thread_service import (
     ConfigurationRequiredError,
+    ApprovalNotFoundError,
     RuntimeFactory,
     ThreadHost,
     ThreadNotFoundError,
@@ -103,6 +106,7 @@ class ThreadCreate(BaseModel):
     workspace: str
     provider_config_id: str | None = None
     model: str | None = None
+    approval_mode: ApprovalMode = ApprovalMode.ON_REQUEST
 
 
 class ThinkingUpdate(BaseModel):
@@ -131,6 +135,19 @@ class ThreadSettingsUpdate(BaseModel):
     max_tokens: int | None = None
     thinking: ThinkingUpdate | None = None
     limits: LimitsUpdate = Field(default_factory=LimitsUpdate)
+    approval_mode: ApprovalMode = ApprovalMode.ON_REQUEST
+
+
+class TurnSettingsOverrideUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_config_id: str | None = None
+    model: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    thinking: ThinkingUpdate | None = None
+    limits: LimitsUpdate | None = None
+    approval_mode: ApprovalMode | None = None
 
 
 class TurnCreate(BaseModel):
@@ -138,6 +155,17 @@ class TurnCreate(BaseModel):
 
     message: str
     idempotency_key: str | None = None
+    settings_override: TurnSettingsOverrideUpdate | None = None
+
+
+class ApprovalResolution(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approved: bool
+
+
+class ApprovalResolutionWithId(ApprovalResolution):
+    approval_id: str
 
 
 def create_app(
@@ -369,6 +397,13 @@ def create_app(
     ) -> JSONResponse:
         return _error_response(409, error.code, "Thread is closed")
 
+    @app.exception_handler(ApprovalNotFoundError)
+    async def approval_not_found(
+        request: Request,
+        error: ApprovalNotFoundError,
+    ) -> JSONResponse:
+        return _error_response(409, error.code, "Approval request is no longer active")
+
     @app.exception_handler(UnsafeWorkspaceError)
     async def unsafe_workspace(
         request: Request,
@@ -496,6 +531,7 @@ def create_app(
             request.workspace,
             provider_config_id=request.provider_config_id,
             model=request.model,
+            approval_mode=request.approval_mode,
         )
         return {
             "schema_version": SCHEMA_VERSION,
@@ -550,6 +586,7 @@ def create_app(
             max_tokens=request.max_tokens,
             thinking=thinking,
             limits=AgentLimits(**request.limits.model_dump()),
+            approval_mode=request.approval_mode,
         )
         thread = threads.update_settings(
             thread_id,
@@ -566,10 +603,12 @@ def create_app(
         thread_id: str,
         request: TurnCreate,
     ) -> dict[str, object]:
+        settings_override = _turn_settings_override(request.settings_override)
         submission = await turn_tasks.start(
             thread_id,
             request.message,
             idempotency_key=request.idempotency_key,
+            settings_override=settings_override,
         )
         return {
             "schema_version": SCHEMA_VERSION,
@@ -592,6 +631,41 @@ def create_app(
         return {
             "schema_version": SCHEMA_VERSION,
             "thread": with_submission(threads.close_thread(thread_id)),
+        }
+
+    @app.post("/api/threads/{thread_id}/approvals/{approval_id}")
+    async def resolve_approval(
+        thread_id: str,
+        approval_id: str,
+        request: ApprovalResolution,
+    ) -> dict[str, object]:
+        threads.resolve_approval(
+            thread_id,
+            approval_id=approval_id,
+            approved=request.approved,
+        )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "thread_id": thread_id,
+            "approval_id": approval_id,
+            "approved": request.approved,
+        }
+
+    @app.post("/api/threads/{thread_id}/approvals")
+    async def resolve_approval_from_body(
+        thread_id: str,
+        request: ApprovalResolutionWithId,
+    ) -> dict[str, object]:
+        threads.resolve_approval(
+            thread_id,
+            approval_id=request.approval_id,
+            approved=request.approved,
+        )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "thread_id": thread_id,
+            "approval_id": request.approval_id,
+            "approved": request.approved,
         }
 
     @app.put("/api/providers/{provider_id}")
@@ -669,6 +743,19 @@ def _configuration_required(store: ProviderStore) -> bool:
     except ProviderConfigurationError:
         return True
     return False
+
+
+def _turn_settings_override(
+    value: TurnSettingsOverrideUpdate | None,
+) -> TurnSettingsOverride | None:
+    if value is None:
+        return None
+    supplied = value.model_dump(exclude_unset=True)
+    if "thinking" in supplied and supplied["thinking"] is not None:
+        supplied["thinking"] = ThinkingSettings(**supplied["thinking"])
+    if "limits" in supplied and supplied["limits"] is not None:
+        supplied["limits"] = AgentLimits(**supplied["limits"])
+    return TurnSettingsOverride(**supplied)
 
 
 async def _maybe_await(value: Any) -> Any:

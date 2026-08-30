@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Protocol
 
 from agent.model import OpenAICompatibleProvider, create_provider_config
-from agent.runtime import ModelSettings, ThreadRuntime, ThreadSettings
+from agent.runtime import ApprovalMode, ModelSettings, ThreadRuntime, ThreadSettings
 from agent.tools import create_local_tool_registry
 
 from .provider_config import ProviderConfigurationError, ProviderStore
@@ -21,6 +21,10 @@ class ConfigurationRequiredError(RuntimeError):
 
 class ThreadNotFoundError(KeyError):
     code = "THREAD_NOT_FOUND"
+
+
+class ApprovalNotFoundError(RuntimeError):
+    code = "APPROVAL_NOT_FOUND"
 
 
 class RuntimeView(Protocol):
@@ -55,6 +59,14 @@ class RuntimeView(Protocol):
 
     def cancel_turn(self, thread_id: str) -> bool: ...
 
+    def resolve_approval(
+        self,
+        thread_id: str,
+        *,
+        approval_id: str,
+        approved: bool,
+    ) -> bool: ...
+
 
 RuntimeFactory = Callable[[ModelSettings], RuntimeView]
 
@@ -84,12 +96,14 @@ class ThreadHost:
         *,
         provider_config_id: str | None = None,
         model: str | None = None,
+        approval_mode: ApprovalMode = ApprovalMode.ON_REQUEST,
     ) -> dict[str, object]:
         selected = self._selection(provider_config_id, model)
         normalized_workspace = self._workspace_browser.validate(workspace)
         initial_settings = ModelSettings(
             provider_config_id=selected["provider_id"],
             model=selected["model"],
+            approval_mode=approval_mode,
         )
         if self._runtime is None:
             self._runtime = self._runtime_factory(initial_settings)
@@ -133,6 +147,23 @@ class ThreadHost:
         runtime = self._require_thread(thread_id)
         runtime.close_thread(thread_id)
         return self._view(thread_id)
+
+    def resolve_approval(
+        self,
+        thread_id: str,
+        *,
+        approval_id: str,
+        approved: bool,
+    ) -> bool:
+        runtime = self._require_thread(thread_id)
+        resolve = getattr(runtime, "resolve_approval", None)
+        if not callable(resolve) or not resolve(
+            thread_id,
+            approval_id=approval_id,
+            approved=approved,
+        ):
+            raise ApprovalNotFoundError("approval request does not exist")
+        return True
 
     @property
     def runtime(self) -> RuntimeView | None:

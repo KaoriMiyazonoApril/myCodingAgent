@@ -15,8 +15,9 @@ from .conversation import Conversation
 from .change_tracker import ChangeTracker
 from .errors import ApprovalTimeoutError, TurnLimitReached
 from .events import TurnEventEmitter, public_tool_call
-from .policy import PolicyDecision, ToolPolicy
+from .policy import PolicyDecision, PolicyResult, ToolPolicy
 from .run_controller import RunController
+from .settings import ApprovalMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +40,7 @@ class ToolCoordinator:
         approval_timeout_seconds: float,
         set_waiting: Callable[[bool], None],
         change_tracker: ChangeTracker,
+        approval_mode: ApprovalMode = ApprovalMode.ON_REQUEST,
     ) -> None:
         self._registry = registry
         self._conversation = conversation
@@ -48,6 +50,7 @@ class ToolCoordinator:
         self._approval_timeout_seconds = approval_timeout_seconds
         self._set_waiting = set_waiting
         self._change_tracker = change_tracker
+        self._approval_mode = approval_mode
         self._pending_approval: _PendingApproval | None = None
 
     def definitions(self) -> list[ToolDefinition]:
@@ -157,14 +160,12 @@ class ToolCoordinator:
         return True
 
     async def _execute_one(self, call: ToolCallBlock) -> ToolResult:
-        decision = self._policy.decide(call)
-        if not isinstance(decision, PolicyDecision):
-            raise ValueError("tool policy must return a PolicyDecision")
-        if decision is PolicyDecision.DENY:
-            return self._denied_result()
-        if decision is PolicyDecision.REQUIRE_APPROVAL:
-            if not await self._request_approval(call):
-                return self._denied_result()
+        policy_result = self._decide(call)
+        if policy_result.decision is PolicyDecision.DENY:
+            return self._denied_result(policy_result)
+        if policy_result.decision is PolicyDecision.REQUIRE_APPROVAL:
+            if not await self._request_approval(call, policy_result):
+                return self._denied_result(policy_result, approval_denied=True)
         self._events.tool_started(call)
         conflict = self._change_tracker.before_execution(call)
         if conflict is not None:
@@ -177,7 +178,11 @@ class ToolCoordinator:
         self._change_tracker.after_execution(call, result)
         return result
 
-    async def _request_approval(self, call: ToolCallBlock) -> bool:
+    async def _request_approval(
+        self,
+        call: ToolCallBlock,
+        policy_result: PolicyResult,
+    ) -> bool:
         loop = asyncio.get_running_loop()
         approval_id = str(uuid4())
         approval = loop.create_future()
@@ -190,6 +195,9 @@ class ToolCoordinator:
                 "approval_id": approval_id,
                 "tool_call": public_tool_call(call),
                 "timeout_seconds": self._approval_timeout_seconds,
+                "decision": policy_result.decision.value,
+                "reason_code": policy_result.reason_code,
+                "message": policy_result.message,
             },
         )
         resolution = "cancelled"
@@ -209,14 +217,49 @@ class ToolCoordinator:
             self._controller.resume_deadline()
             self._events.emit(
                 "approval_resolved",
-                {"approval_id": approval_id, "resolution": resolution},
+                {
+                    "approval_id": approval_id,
+                    "resolution": resolution,
+                    "reason_code": policy_result.reason_code,
+                },
             )
 
+    def _decide(self, call: ToolCallBlock) -> PolicyResult:
+        decide = self._policy.decide
+        try:
+            decision = decide(call, approval_mode=self._approval_mode)
+        except TypeError as error:
+            # Existing custom policies predate command-aware context. Keep the
+            # public seam source-compatible without hiding other exceptions.
+            try:
+                decision = decide(call)
+            except TypeError:
+                raise error
+        if isinstance(decision, PolicyResult):
+            return decision
+        if isinstance(decision, PolicyDecision):
+            return PolicyResult(
+                decision,
+                "POLICY_DECISION",
+                "tool decision returned by policy",
+            )
+        raise ValueError("tool policy must return a PolicyResult or PolicyDecision")
+
     @staticmethod
-    def _denied_result() -> ToolResult:
+    def _denied_result(
+        policy_result: PolicyResult,
+        *,
+        approval_denied: bool = False,
+    ) -> ToolResult:
+        reason_code = "APPROVAL_DENIED" if approval_denied else policy_result.reason_code
         return ToolResult(
             content="tool call denied by Policy",
-            metadata={"executed": False},
+            metadata={
+                "executed": False,
+                "reason_code": reason_code,
+                "policy_reason_code": policy_result.reason_code,
+                "policy_message": policy_result.message,
+            },
             error_code="POLICY_DENIED",
         )
 
