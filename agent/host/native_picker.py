@@ -11,6 +11,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 import contextlib
 from dataclasses import dataclass
+import errno
 import inspect
 import json
 import os
@@ -144,6 +145,8 @@ class NativeWindowsFolderPicker:
         which: WhichFunction = shutil.which,
         powershell_executable: str | None = None,
         wslpath_executable: str | None = None,
+        windows_launcher_executable: str | None = None,
+        direct_interop_available: Callable[[], bool] | None = None,
         subprocess_factory: SubprocessFactory = asyncio.create_subprocess_exec,
         dialog_script: str = WINDOWS_FOLDER_DIALOG_SCRIPT,
     ) -> None:
@@ -151,6 +154,10 @@ class NativeWindowsFolderPicker:
         self._which = which
         self._powershell_executable = powershell_executable
         self._wslpath_executable = wslpath_executable
+        self._windows_launcher_executable = windows_launcher_executable
+        self._direct_interop_available = (
+            direct_interop_available or self._system_direct_interop_available
+        )
         self._subprocess_factory = subprocess_factory
         self._dialog_script = dialog_script
         self._active_task: asyncio.Task[Any] | None = None
@@ -167,7 +174,11 @@ class NativeWindowsFolderPicker:
 
         powershell = self._find_powershell()
         wslpath = self._find_wslpath()
-        if powershell is None or wslpath is None:
+        can_launch_windows = (
+            self._find_windows_launcher() is not None
+            or self._direct_interop_available()
+        )
+        if powershell is None or wslpath is None or not can_launch_windows:
             return NativePickerCapability(
                 available=False,
                 reason_code="WINDOWS_INTEROP_UNAVAILABLE",
@@ -284,8 +295,9 @@ class NativeWindowsFolderPicker:
 
         process: Any | None = None
         try:
+            invocation = self._windows_invocation(executable)
             process = await self._subprocess_factory(
-                executable,
+                *invocation,
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
@@ -309,6 +321,10 @@ class NativeWindowsFolderPicker:
                 "PowerShell interop could not be started"
             ) from error
         except OSError as error:
+            if error.errno == errno.ENOEXEC:
+                raise WindowsInteropUnavailableError(
+                    "Windows executable interop is unavailable"
+                ) from error
             raise NativePickerProcessError("Native picker process could not start") from error
         finally:
             if self._active_process is process:
@@ -335,6 +351,27 @@ class NativeWindowsFolderPicker:
         if executable:
             self._wslpath_executable = executable
         return executable
+
+    def _find_windows_launcher(self) -> str | None:
+        if self._windows_launcher_executable is not None:
+            return self._windows_launcher_executable or None
+        if os.path.isfile("/init") and os.access("/init", os.X_OK):
+            self._windows_launcher_executable = "/init"
+            return self._windows_launcher_executable
+        return None
+
+    def _windows_invocation(self, executable: str) -> tuple[str, ...]:
+        launcher = self._find_windows_launcher()
+        return (executable,) if launcher is None else (launcher, executable)
+
+    @staticmethod
+    def _system_direct_interop_available() -> bool:
+        registration = "/proc/sys/fs/binfmt_misc/WSLInterop"
+        try:
+            with open(registration, encoding="utf-8") as source:
+                return source.readline().strip() == "enabled"
+        except OSError:
+            return False
 
     def _running_under_wsl(self) -> bool:
         if self._is_wsl_override is not None:

@@ -42,6 +42,7 @@ def _picker(factory):
     return NativeWindowsFolderPicker(
         is_wsl=lambda: True,
         which=lambda name: f"/fake/{name}",
+        windows_launcher_executable="/fake/init",
         subprocess_factory=factory,
     )
 
@@ -55,14 +56,17 @@ def test_capability_is_available_only_when_wsl_interop_tools_exist() -> None:
     available = NativeWindowsFolderPicker(
         is_wsl=lambda: True,
         which=lambda name: f"/fake/{name}",
+        windows_launcher_executable="/fake/init",
     ).capability()
     unavailable = NativeWindowsFolderPicker(
         is_wsl=lambda: True,
         which=lambda name: None,
+        windows_launcher_executable="/fake/init",
     ).capability()
     unsupported = NativeWindowsFolderPicker(
         is_wsl=lambda: False,
         which=lambda name: f"/fake/{name}",
+        windows_launcher_executable="/fake/init",
     ).capability()
 
     assert available.available is True
@@ -91,7 +95,8 @@ async def test_select_preserves_cancel_and_uses_fixed_argv_for_unicode_path() ->
     assert result.status == "selected"
     assert result.windows_path == r"C:\Work 中文\space"
     args, kwargs = calls[0]
-    assert args[:6] == (
+    assert args[:7] == (
+        "/fake/init",
         "/fake/powershell.exe",
         "-NoLogo",
         "-NoProfile",
@@ -99,10 +104,24 @@ async def test_select_preserves_cancel_and_uses_fixed_argv_for_unicode_path() ->
         "-ExecutionPolicy",
         "Bypass",
     )
-    assert args[6:8] == ("-Sta", "-Command")
-    assert "System.Windows.Forms.FolderBrowserDialog" in args[8]
+    assert args[7:9] == ("-Sta", "-Command")
+    assert "System.Windows.Forms.FolderBrowserDialog" in args[9]
     assert kwargs["stdout"] is asyncio.subprocess.PIPE
     assert "shell" not in kwargs
+
+
+def test_capability_requires_a_windows_launch_bridge() -> None:
+    picker = NativeWindowsFolderPicker(
+        is_wsl=lambda: True,
+        which=lambda name: f"/fake/{name}",
+        windows_launcher_executable="",
+        direct_interop_available=lambda: False,
+    )
+
+    capability = picker.capability()
+
+    assert capability.available is False
+    assert capability.reason_code == "WINDOWS_INTEROP_UNAVAILABLE"
 
 
 @pytest.mark.anyio
