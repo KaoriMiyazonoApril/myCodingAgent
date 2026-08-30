@@ -336,6 +336,131 @@ test("navigates Host workspaces and selects the current directory", async () => 
   );
 });
 
+test("prefers the native Windows picker and uses its validated WSL workspace", async () => {
+  const requests: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      requests.push(`${init?.method ?? "GET"} ${path}`);
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [] }),
+        } as Response;
+      }
+      if (path === "/api/native-picker/capability") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            available: true,
+            reason_code: null,
+          }),
+        } as Response;
+      }
+      if (path === "/api/native-picker/select") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            status: "selected",
+            workspace: "/mnt/c/项目 with spaces",
+          }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          schema_version: 1,
+          default_provider_id: null,
+          providers: [],
+        }),
+      } as Response;
+    }),
+  );
+
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "选择项目" }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
+
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "当前项目：项目 with spaces" }),
+    ).toBeInTheDocument(),
+  );
+  expect(requests).toContain("GET /api/native-picker/capability");
+  expect(requests).toContain("POST /api/native-picker/select");
+  expect(requests.some((request) => request.includes("/api/workspaces"))).toBe(
+    false,
+  );
+});
+
+test("falls back to Host browser quietly when the native picker is cancelled", async () => {
+  const requests: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      requests.push(`${init?.method ?? "GET"} ${path}`);
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [] }),
+        } as Response;
+      }
+      if (path === "/api/native-picker/capability") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            available: true,
+            reason_code: null,
+          }),
+        } as Response;
+      }
+      if (path === "/api/native-picker/select") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, status: "cancelled" }),
+        } as Response;
+      }
+      if (path.startsWith("/api/workspaces")) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            path: "/workspace",
+            parent: null,
+            roots: ["/workspace"],
+            entries: [],
+            truncated: false,
+          }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          schema_version: 1,
+          default_provider_id: null,
+          providers: [],
+        }),
+      } as Response;
+    }),
+  );
+
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "选择项目" }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
+
+  expect((await screen.findAllByText("/workspace")).length).toBeGreaterThan(0);
+  expect(screen.queryByText("Windows 文件夹选择暂不可用")).not.toBeInTheDocument();
+  expect(requests).toContain("POST /api/native-picker/select");
+  expect(requests.some((request) => request.includes("GET /api/workspaces"))).toBe(
+    true,
+  );
+});
+
 test("keeps workspace errors visible with a reload action", async () => {
   vi.stubGlobal(
     "fetch",

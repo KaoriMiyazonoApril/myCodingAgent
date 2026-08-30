@@ -71,7 +71,15 @@ agent web --workspace-root /home/user/projects
 
 Windows 浏览器通常可直接访问 `http://localhost:3080`。Host 在 WSL 中时，Agent 操作的是
 Linux/WSL 文件系统、shell 和进程环境；例如 Windows 盘需通过 `/mnt/c/...` 显式作为 Host
-workspace root。浏览器不会解释或转换 `C:\...` 路径。
+workspace root。打开项目时，若 WSL 的 Windows interop、`powershell.exe` 和 `wslpath` 可用，
+Host 会优先打开原生 Windows 文件夹选择器；选择结果通过系统 `wslpath` 翻译为 WSL 路径，
+再由同一个 WorkspaceBrowser 校验 configured roots。Cancel、原生选择器不可用或失败时，
+对话框会保留 Host filesystem 浏览器作为 fallback。浏览器不会自行解释或转换 `C:\...` 路径。
+
+原生选择器的 capability 与 selection 只属于 Host transport（分别为
+`GET /api/native-picker/capability` 和 `POST /api/native-picker/select`）；Windows 路径不会
+进入 Runtime、Thread DTO、Snapshot、事件或日志。生产 Host 通过 argv 启动固定受信的
+PowerShell dialog script 和系统 `wslpath`，不使用 shell 拼接用户路径。
 
 Native Windows Host 不在当前 V1 的支持与完成声明中。
 
@@ -98,6 +106,7 @@ Agent Host
     ├── TurnTaskManager
     ├── EventStreamAdapter
     ├── WorkspaceBrowser
+    ├── NativeWindowsFolderPicker (WSL optional)
     └── production static files
     │
     ▼

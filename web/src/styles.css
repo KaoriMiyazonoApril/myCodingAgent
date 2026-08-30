@@ -1340,6 +1340,24 @@ textarea:disabled {
   line-height: 1.5;
 }
 
+.native-picker-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 9px 11px;
+  border-left: 2px solid var(--warning);
+  color: var(--text-soft);
+  background: rgb(91 72 22 / 18%);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.native-picker-notice .quiet-button {
+  flex: 0 0 auto;
+}
+
 .provider-list {
   margin-top: 24px;
   border-top: 1px solid var(--border-subtle);

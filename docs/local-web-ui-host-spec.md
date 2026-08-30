@@ -23,8 +23,9 @@ ToolCoordinator、具体 Provider 或具体工具实现；Host 不得复制 Agen
 
 提供 `agent web` 本地应用入口。Linux 或 WSL2 中启动 Host 后，用户通过浏览器访问
 `http://127.0.0.1:<port>`。Host 使用 FastAPI 与 Uvicorn 提供稳定 JSON command 接口、SSE
-事件、静态 React 资源、Provider 设置和 server-side workspace picker。开发模式由独立 Vite
-server 代理 `/api`；生产模式由 Python Host 直接托管构建后的前端。
+事件、静态 React 资源、server-side workspace picker，以及 WSL 下可选的 native Windows
+folder picker。开发模式由独立 Vite server 代理 `/api`；生产模式由 Python Host 直接托管构建
+后的前端。
 
 首次启动允许 Runtime 尚未配置。用户在 Web 设置中为 DeepSeek、Moonshot/Kimi 或 GLM 填写
 API key，Host 将凭据原子地保存在本机用户配置目录，只向浏览器返回脱敏状态。保存后，前端让
@@ -133,6 +134,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - `TurnTaskManager` is a deep Host module with a small start, cancel, inspect, and shutdown interface. It owns task mappings and cleanup without becoming the source of Agent status.
 - The SSE adapter owns polling, framing, heartbeat, cursor recovery, and disconnect cleanup behind one streaming interface. Runtime and routes do not contain React-specific event reduction.
 - Workspace browsing is hidden behind a root policy interface that normalizes configured roots, checks containment without following symlinks, lists one level, and returns transport-safe entries.
+- Native Windows selection is hidden behind an injected `NativePickerAdapter`. It detects WSL/interop capability, launches a fixed UTF-8 PowerShell dialog through argv, translates the selected Windows path with system `wslpath`, and exposes idempotent close/shutdown. It never authorizes a workspace; the Host calls the same `WorkspaceBrowser.validate()` used by Thread creation.
 
 ### Provider configuration and model discovery
 
@@ -168,7 +170,9 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 ### Workspace browsing
 
 - `agent web` accepts repeatable workspace roots; the default is the process working directory. Browser navigation and Thread creation must remain within at least one normalized configured root.
-- The picker uses Host-native POSIX paths. A WSL Host may therefore expose `/mnt/c/...`; no browser-side Windows-to-WSL path conversion exists.
+- `GET /api/native-picker/capability` reports whether WSL interop and the required executables are available. `POST /api/native-picker/select` waits asynchronously for one native Windows folder dialog, translates its result with `wslpath`, and validates the resulting Host POSIX path against configured roots before returning it.
+- The native adapter is a selection transport only: it does not perform root containment, symlink, accessibility, or directory authorization. A selected path is always passed through `WorkspaceBrowser.validate()`; the existing browser endpoint remains available for `/home/...`, native Linux, unavailable interop, cancellation, and failures.
+- The picker uses Host-native POSIX paths after translation. A WSL Host may therefore expose `/mnt/c/...`; no browser-side Windows-to-WSL path conversion exists. Concurrent native requests return `NATIVE_PICKER_BUSY`, and cancellation returns a normal `cancelled` result.
 - A request lists one level, directory-first and name-sorted, with at most 500 entries and an explicit `truncated` flag.
 - Hidden directories are included. Symlinks and non-directories are excluded, and metadata checks do not follow links.
 - Missing, inaccessible, and root-escape requests receive distinct stable errors. Picker authorization does not replace Runtime workspace validation; creating and starting a Thread still use existing strict workspace rules.
@@ -178,6 +182,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Health exposes process readiness and whether Runtime configuration is required without exposing credentials.
 - Provider commands list preset/configuration state, save a credential and selected model, clear a credential, discover models, and update the default Provider/model.
 - Workspace browsing is a read-only Host command scoped to configured roots.
+- Native workspace selection is exposed as a capability read (`GET /api/native-picker/capability`) and a selection command (`POST /api/native-picker/select`). Capability, interop, process, malformed-result, translation, and busy failures use stable JSON error codes; cancellation is not an error. Windows paths are never returned by the transport.
 - Thread commands list Thread views, create a Thread, get one hydratable Thread view, submit a Turn, cancel, close, and version-update settings.
 - Event transport is the sole SSE endpoint. Approval and destructive Thread deletion endpoints do not exist in V1.
 - Thread view is a stable transport DTO containing Runtime Snapshot, current Runtime event cursor, and optional Host submission lifecycle. It never serializes internal dataclasses or task objects directly.
@@ -215,6 +220,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Provider settings use a password input with save, clear, masked configured state, automatic model discovery, explicit refresh, manual model entry, and default selection.
 - Host errors are never swallowed. The UI distinguishes disconnected Host, invalid workspace, missing Thread, Provider authentication/availability, rejected Turn, failed Turn, failed tool, failed settings update, and failed cancellation.
 - The SSE client reconnects automatically with bounded backoff, keeps current Snapshot-derived UI during disconnection, and refetches the hydratable Thread view when recovery cannot continue.
+- Opening the existing Project dialog queries native capability and, when available, starts the native picker from that user action. A selected validated WSL path becomes the current project; cancel or any unavailable/failure response falls back to the Host filesystem browser, with a retry action for recoverable native failures. Duplicate native requests are disabled in the dialog while the Host also enforces single-flight.
 - At widths below 1024 pixels, Thread navigation becomes a toggleable sidebar and Activity becomes a drawer or tab. Conversation and Composer remain available. V1 is desktop-first rather than a separate mobile product.
 - Interactive controls support keyboard use and visible focus. Status meaning uses text/icon in addition to color, and failures are announced in persistent visible UI.
 

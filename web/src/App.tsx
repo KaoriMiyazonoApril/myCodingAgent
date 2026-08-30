@@ -9,12 +9,15 @@ import {
   getProviders,
   getThread,
   getThreads,
+  getNativePickerCapability,
   getWorkspaces,
   saveProvider,
   selectProviderDefault,
   startTurn,
+  selectNativeWorkspace,
   updateThreadSettings,
   type ProviderView,
+  type NativePickerCapability,
   type ThreadView,
   type WorkspaceListing,
 } from "./api";
@@ -378,6 +381,14 @@ function WorkspaceDialog({
   const [selected, setSelected] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [nativeBusy, setNativeBusy] = useState(false);
+  const [nativeMessage, setNativeMessage] = useState<string | null>(null);
+  const nativeBusyRef = useRef(false);
+  const onSelectRef = useRef(onSelect);
+
+  useEffect(() => {
+    onSelectRef.current = onSelect;
+  }, [onSelect]);
 
   const load = useCallback(async (path?: string) => {
     setLoading(true);
@@ -391,15 +402,48 @@ function WorkspaceDialog({
     }
   }, []);
 
+  const startNativePicker = useCallback(async () => {
+    if (nativeBusyRef.current) {
+      return;
+    }
+    nativeBusyRef.current = true;
+    setNativeBusy(true);
+    setLoading(true);
+    setNativeMessage(null);
+    try {
+      const capability: NativePickerCapability = await getNativePickerCapability();
+      if (!capability.available) {
+        await load();
+        return;
+      }
+      const selection = await selectNativeWorkspace();
+      if (selection.status === "selected" && selection.workspace) {
+        onSelectRef.current(selection.workspace);
+        return;
+      }
+      await load();
+    } catch {
+      setNativeMessage("Windows 文件夹选择暂不可用，可浏览 Host 文件系统。");
+      await load();
+    } finally {
+      nativeBusyRef.current = false;
+      setNativeBusy(false);
+    }
+  }, [load]);
+
   useEffect(() => {
     if (!open) {
       return;
     }
     const timer = window.setTimeout(() => {
-      void load();
+      setListing(null);
+      setSelected(null);
+      setError(null);
+      setNativeMessage(null);
+      void startNativePicker();
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [load, open]);
+  }, [open, startNativePicker]);
 
   useEffect(() => {
     if (!open) {
@@ -425,6 +469,7 @@ function WorkspaceDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="workspace-heading"
+        aria-busy={nativeBusy || loading}
       >
         <div className="dialog-heading">
           <div>
@@ -432,10 +477,30 @@ function WorkspaceDialog({
             <h2 id="workspace-heading">打开项目</h2>
             <p className="field-help">选择一个本地目录作为编码助手的项目上下文。</p>
           </div>
-          <button type="button" className="icon-button" aria-label="关闭项目对话框" onClick={onClose}>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="关闭项目对话框"
+            onClick={onClose}
+            disabled={nativeBusy}
+          >
             ×
           </button>
         </div>
+
+        {nativeMessage ? (
+          <div className="native-picker-notice" role="status">
+            <span>{nativeMessage}</span>
+            <button
+              type="button"
+              className="quiet-button"
+              onClick={() => void startNativePicker()}
+              disabled={nativeBusy}
+            >
+              重试 Windows 选择
+            </button>
+          </div>
+        ) : null}
 
         {error ? (
           <div className="error-banner" role="alert">
@@ -447,7 +512,9 @@ function WorkspaceDialog({
           </div>
         ) : null}
         {loading && listing === null ? (
-          <p className="status-line">正在加载项目目录…</p>
+          <p className="status-line">
+            {nativeBusy ? "正在打开 Windows 文件夹选择…" : "正在加载项目目录…"}
+          </p>
         ) : null}
 
         {listing ? (
@@ -508,6 +575,14 @@ function WorkspaceDialog({
                 }}
               >
                 使用此项目
+              </button>
+              <button
+                type="button"
+                className="quiet-button"
+                onClick={() => void load()}
+                disabled={nativeBusy}
+              >
+                浏览 Host 文件系统
               </button>
               {selected ? <p className="success-line">已选择 · {selected}</p> : null}
             </div>

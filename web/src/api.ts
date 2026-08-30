@@ -48,6 +48,18 @@ export type WorkspaceListing = {
   truncated: boolean;
 };
 
+export type NativePickerCapability = {
+  schema_version: number;
+  available: boolean;
+  reason_code: string | null;
+};
+
+export type NativePickerSelectionResponse = {
+  schema_version: number;
+  status: "selected" | "cancelled";
+  workspace?: string;
+};
+
 export type ThreadSettings = {
   provider_config_id: string;
   model: string;
@@ -111,6 +123,16 @@ export async function getProviders(): Promise<ProvidersResponse> {
 export async function getWorkspaces(path?: string): Promise<WorkspaceListing> {
   const query = path ? `?path=${encodeURIComponent(path)}` : "";
   return requestJson<WorkspaceListing>(`/api/workspaces${query}`);
+}
+
+export async function getNativePickerCapability(): Promise<NativePickerCapability> {
+  return requestJson<NativePickerCapability>("/api/native-picker/capability");
+}
+
+export async function selectNativeWorkspace(): Promise<NativePickerSelectionResponse> {
+  return requestJson<NativePickerSelectionResponse>("/api/native-picker/select", {
+    method: "POST",
+  });
 }
 
 export async function getThreads(): Promise<ThreadView[]> {
