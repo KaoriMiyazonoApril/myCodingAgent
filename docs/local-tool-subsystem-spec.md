@@ -121,17 +121,18 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
   稳定错误码。
 - `process.py` 的 `CommandSandboxBackend` 统一能力探测、异步输出采集、超时与进程组取消
   及幂等资源关闭生命周期；生产 `BubblewrapSandboxBackend` 负责构造隔离命令并在关闭时
-  释放 seccomp descriptor，测试 adapter 通过同一
-  contract 提供确定性执行。`CommandRunner` 通过受验证的初始目录运行一次 shell 命令，并分别在
-  metadata 中返回 stdout、stderr、持续时间、退出码、`command_succeeded`、sandbox、
-  超时和截断状态。非零退出返回 `COMMAND_FAILED`，超时返回 `TIMEOUT`。
+  释放 seccomp descriptor，测试 adapter 通过同一 contract 提供确定性执行。
+  `CommandRunner` 保留一次性 `run_command` 兼容入口；`ProcessManager` 在同一 sandbox
+  构造之上提供 per-Thread 的 `exec_command`/`write_stdin` session，持续 drain stdout/stderr
+  或 PTY 合并输出，返回 bounded cursor 增量，并在 close/timeout/idle 时回收进程。
 - `registry.py` 的 `ToolRegistry` 提供注册、查找、定义列举及对既有
   `ToolCallBlock` 的统一分派；它不保存任何工作区配置。同步工具在 worker thread 中执行，
   取消或 deadline 到达时会先等待 worker 静止，再把实际结果交还 Runtime 记录，避免后台
   文件修改越过 workspace lease 生命周期。其 `close()` 幂等调用组合层注入的资源清理回调，
   关闭后所有执行请求均 fail closed。
 - `local.py` 显式组合共享的文件系统与进程服务，并注册
-  `read_file`、`write_file`、`edit_file`、`apply_patch`、`glob`、`grep`、`run_command` 七个工具。
+  `read_file`、`write_file`、`edit_file`、`apply_patch`、`glob`、`grep`、`run_command`、
+  `exec_command`、`write_stdin` 九个工具。
   组合函数可显式接收一个 `CommandSandboxBackend`；未提供时只使用生产 Bubblewrap，
   capability probe 失败即终止组合，不会回退到 host shell。
 - `apply_patch.py` 解析结构化 `Begin/End Patch` 文档，支持有序的多文件 add/update/delete

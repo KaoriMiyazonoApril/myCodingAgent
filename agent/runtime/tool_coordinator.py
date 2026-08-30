@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+import inspect
 from uuid import uuid4
 
 from agent.core.messages import ToolCallBlock
@@ -166,6 +167,7 @@ class ToolCoordinator:
         if policy_result.decision is PolicyDecision.REQUIRE_APPROVAL:
             if not await self._request_approval(call, policy_result):
                 return self._denied_result(policy_result, approval_denied=True)
+        self._registry.set_event_sink(self._events.emit)
         self._events.tool_started(call)
         conflict = self._change_tracker.before_execution(call)
         if conflict is not None:
@@ -173,6 +175,7 @@ class ToolCoordinator:
         try:
             result = await self._controller.wait(self._registry.execute_async(call))
         except (TurnLimitReached, asyncio.CancelledError):
+            self._registry.cancel_active_sessions()
             self._change_tracker.execution_interrupted(call)
             raise
         self._change_tracker.after_execution(call, result)
@@ -227,14 +230,18 @@ class ToolCoordinator:
     def _decide(self, call: ToolCallBlock) -> PolicyResult:
         decide = self._policy.decide
         try:
+            parameters = inspect.signature(decide).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        accepts_approval_mode = any(
+            parameter.name == "approval_mode"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if accepts_approval_mode:
             decision = decide(call, approval_mode=self._approval_mode)
-        except TypeError as error:
-            # Existing custom policies predate command-aware context. Keep the
-            # public seam source-compatible without hiding other exceptions.
-            try:
-                decision = decide(call)
-            except TypeError:
-                raise error
+        else:
+            decision = decide(call)
         if isinstance(decision, PolicyResult):
             return decision
         if isinstance(decision, PolicyDecision):

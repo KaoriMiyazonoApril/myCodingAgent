@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+import inspect
 import logging
 
 from agent.core.messages import ToolCallBlock
@@ -17,7 +18,8 @@ from agent.tools.types import (
 
 ToolExecutor = Callable[[dict[str, object]], ToolResult]
 AsyncToolExecutor = Callable[[dict[str, object]], Awaitable[ToolResult]]
-CloseCallback = Callable[[], None]
+CloseCallback = Callable[[], object]
+EventSink = Callable[[str, dict[str, object]], object]
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +27,44 @@ logger = logging.getLogger(__name__)
 class ToolRegistry:
     """A workspace-independent registry of model-visible local tools."""
 
-    def __init__(self, *, on_close: CloseCallback | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        on_close: CloseCallback | None = None,
+        async_on_close: CloseCallback | None = None,
+    ) -> None:
         self._tools: dict[
             str, tuple[ToolDefinition, ToolExecutor, AsyncToolExecutor | None]
         ] = {}
         self._on_close = on_close
+        self._async_on_close = async_on_close
         self._closed = False
+        self._event_sink_setters: list[Callable[[EventSink | None], None]] = []
+        self._session_cancellers: list[Callable[[], None]] = []
+
+    def bind_event_sink(
+        self, setter: Callable[[EventSink | None], None]
+    ) -> None:
+        """Bind a runtime-owned event emitter to a capability that produces events."""
+
+        self._event_sink_setters.append(setter)
+
+    def set_event_sink(self, sink: EventSink | None) -> None:
+        """Set or clear the current Turn event sink for bound capabilities."""
+
+        for setter in self._event_sink_setters:
+            setter(sink)
+
+    def bind_session_canceller(self, canceller: Callable[[], None]) -> None:
+        """Bind Turn-cancellation cleanup for stateful capabilities."""
+
+        self._session_cancellers.append(canceller)
+
+    def cancel_active_sessions(self) -> None:
+        """Request cleanup of running session capabilities owned by this Thread."""
+
+        for canceller in self._session_cancellers:
+            canceller()
 
     def close(self) -> bool:
         """Close owned resources once and report whether this call did so."""
@@ -40,6 +74,23 @@ class ToolRegistry:
         self._closed = True
         if self._on_close is not None:
             self._on_close()
+        return True
+
+    async def aclose(self) -> bool:
+        """Await resource cleanup when an owner has an asynchronous lifecycle."""
+
+        if self._closed:
+            if self._async_on_close is not None:
+                result = self._async_on_close()
+                if inspect.isawaitable(result):
+                    await result
+            return False
+        self._closed = True
+        close = self._async_on_close or self._on_close
+        if close is not None:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
         return True
 
     def register(
@@ -82,7 +133,17 @@ class ToolRegistry:
             if call.arguments is None:
                 raise ToolArgumentsValidationError("tool arguments could not be parsed")
             arguments = registered[0].validate_arguments(call.arguments)
-            return registered[1](arguments)
+            result = registered[1](arguments)
+            if inspect.isawaitable(result):
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                return ToolResult(
+                    content="tool requires asynchronous dispatch",
+                    metadata={"tool": call.name},
+                    error_code="ASYNC_ONLY",
+                )
+            return result
         except ToolArgumentsValidationError as error:
             return ToolResult(content=str(error), metadata={}, error_code="INVALID_ARGUMENTS")
         except ToolOperationError as error:

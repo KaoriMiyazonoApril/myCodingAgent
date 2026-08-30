@@ -268,7 +268,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Approval endpoints, Approval Card, dangerous-command classification, or a new production ToolPolicy.
 - Token-level assistant streaming, live command stdout/stderr streaming, or changes to the existing non-streaming model interface.
 - WebSocket, Electron, Tauri, PTY, xterm.js, Monaco IDE, drag-and-drop filesystem access, or browser File System API workspace selection.
-- Thread, Turn, event, conversation, diff, or task persistence across Host restarts; database-backed sessions; command reattachment.
+- Thread, Turn, event, conversation, diff, or task persistence across Host restarts; database-backed sessions; command reattachment beyond the in-memory per-Thread `ProcessManager` lifecycle.
 - Authentication, TLS, remote access, multi-user operation, cloud deployment, distributed Host instances, or cross-process coordination.
 - Custom Provider base URLs, OpenRouter, Ollama, LM Studio, arbitrary OpenAI-compatible endpoints, multiple accounts per Provider, multiple API keys, key rotation, OAuth, or system keyring integration.
 - Provider pricing/capability registries, paid compatibility probes, automatic tool-calling verification, or a Cherry Studio-scale Provider catalog.

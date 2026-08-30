@@ -41,6 +41,9 @@ def _call(command: str, *, tty: bool = False) -> ToolCallBlock:
         ("npm run build", ExecClassification.TEST_BUILD),
         ("python -m my_tool", ExecClassification.ORDINARY_SANDBOXED),
         ("rm -rf build", ExecClassification.DESTRUCTIVE),
+        ("find . -delete", ExecClassification.DESTRUCTIVE),
+        ("git branch -D old", ExecClassification.DESTRUCTIVE),
+        ("git branch -f main old", ExecClassification.DESTRUCTIVE),
         ("curl https://example.test", ExecClassification.NETWORK),
         ("npm install", ExecClassification.PACKAGE_INSTALL),
         ("sudo ls", ExecClassification.PRIVILEGED),
@@ -81,6 +84,26 @@ def test_never_denies_dangerous_commands_with_structured_reason() -> None:
         "DESTRUCTIVE_COMMAND_NEVER",
         "commands requiring approval are disabled by approval mode",
     )
+
+
+@pytest.mark.parametrize("command", ["pytest -q", "python -m my_tool"])
+def test_never_still_allows_test_and_ordinary_sandboxed_commands(command) -> None:
+    result = CommandAwarePolicy().decide(
+        _call(command), approval_mode=ApprovalMode.NEVER
+    )
+    assert result.decision is PolicyDecision.ALLOW
+
+
+def test_legacy_run_command_complex_shell_still_requires_approval() -> None:
+    result = CommandAwarePolicy().decide(
+        ToolCallBlock(
+            id="legacy",
+            name="run_command",
+            arguments={"command": "echo one && echo two"},
+        ),
+        approval_mode=ApprovalMode.ON_REQUEST,
+    )
+    assert result.decision is PolicyDecision.REQUIRE_APPROVAL
 
 
 def test_non_command_tools_are_allowed_without_risk_classification() -> None:
@@ -179,6 +202,30 @@ def test_runtime_denial_contains_policy_reason_metadata(tmp_path) -> None:
     result = finished.payload["result"]
     assert result["error_code"] == "POLICY_DENIED"
     assert result["metadata"]["reason_code"] == "DESTRUCTIVE_COMMAND_NEVER"
+
+
+def test_policy_internal_type_error_is_not_retried_as_legacy_signature(tmp_path) -> None:
+    class InternalTypeErrorPolicy:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def decide(self, call, *, approval_mode=ApprovalMode.ON_REQUEST):
+            del call, approval_mode
+            self.calls += 1
+            raise TypeError("policy implementation failure")
+
+    policy = InternalTypeErrorPolicy()
+    runtime = ThreadRuntime(
+        provider_resolver=lambda _provider, _model: _Provider(),
+        default_settings=ModelSettings(provider_config_id="p", model="m"),
+        tool_registry_factory=_registry,
+        tool_policy=policy,
+    )
+    thread = runtime.create_thread(tmp_path)
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "fail"))
+
+    assert summary.status.value == "failed"
+    assert policy.calls == 1
 
 
 def _messages(runtime: ThreadRuntime, thread_id: str) -> list[object]:

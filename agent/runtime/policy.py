@@ -106,7 +106,6 @@ _INTERACTIVE_EXECUTABLES = frozenset(
 _DESTRUCTIVE_EXECUTABLES = frozenset(
     {"rm", "rmdir", "unlink", "shred", "truncate", "mkfs", "fdisk", "dd"}
 )
-_SHELL_CONTROL_RE = re.compile(r"(?:\|\||&&|[|;]|\$\(|`)")
 _SHELL_WRAPPER_RE = re.compile(r"^(?:ba)?sh\s+-c(?:\s|$)|^zsh\s+-c(?:\s|$)")
 
 
@@ -116,7 +115,7 @@ def classify_exec_command(command: str) -> ExecClassification:
     if not isinstance(command, str) or not command.strip():
         return ExecClassification.UNKNOWN
     source = command.strip()
-    if _SHELL_CONTROL_RE.search(source) or _SHELL_WRAPPER_RE.search(source):
+    if _contains_shell_control(source) or _SHELL_WRAPPER_RE.search(source):
         return ExecClassification.COMPLEX_SHELL
     try:
         tokens = shlex.split(source, posix=True)
@@ -128,6 +127,11 @@ def classify_exec_command(command: str) -> ExecClassification:
     executable = tokens[0].rsplit("/", 1)[-1].lower()
     args = [token.lower() for token in tokens[1:]]
     if executable in _DESTRUCTIVE_EXECUTABLES:
+        return ExecClassification.DESTRUCTIVE
+    if executable == "find" and any(
+        argument in {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
+        for argument in args
+    ):
         return ExecClassification.DESTRUCTIVE
     if executable == "git":
         if _git_is_destructive(args):
@@ -172,13 +176,53 @@ def classify_exec_command(command: str) -> ExecClassification:
 classify_command = classify_exec_command
 
 
+def _contains_shell_control(source: str) -> bool:
+    """Recognize obvious shell operators while respecting quoted arguments."""
+
+    single = False
+    double = False
+    escaped = False
+    index = 0
+    while index < len(source):
+        character = source[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and not single:
+            escaped = True
+            index += 1
+            continue
+        if character == "'" and not double:
+            single = not single
+        elif character == '"' and not single:
+            double = not double
+        elif not single and character == "`":
+            return True
+        elif not single and character == "$" and source[index : index + 2] == "$(":
+            return True
+        elif not single and not double:
+            if character in ";|" or source[index : index + 2] in {"&&", "||"}:
+                return True
+        index += 1
+    return False
+
+
 def _git_is_destructive(args: list[str]) -> bool:
     if not args:
         return False
     command = args[0]
     if command in {"reset", "clean", "restore"}:
         return True
-    return command == "checkout" and "--" in args
+    if command == "checkout" and "--" in args:
+        return True
+    if command in {"branch", "tag"} and any(
+        argument in {"-d", "-D", "-f", "--delete", "--force"} for argument in args
+    ):
+        return True
+    return command in {"stash", "worktree"} and any(
+        argument in {"drop", "clear", "remove"} for argument in args
+    )
 
 
 def _git_is_networked(args: list[str]) -> bool:
@@ -285,33 +329,12 @@ class CommandAwarePolicy:
             if bool(call.arguments.get("tty", False)):
                 classification = ExecClassification.INTERACTIVE
 
-            # ``run_command`` is the pre-Phase-3 compatibility spelling. Its
-            # shell wrapper was historically accepted, so preserve ordinary
-            # ON_REQUEST behavior while keeping the formal ``exec_command``
-            # surface strict. NEVER and UNTRUSTED remain conservative below.
-            if (
-                call.name == "run_command"
-                and classification is ExecClassification.COMPLEX_SHELL
-                and approval_mode is ApprovalMode.ON_REQUEST
-            ):
-                return PolicyResult(
-                    PolicyDecision.ALLOW,
-                    "LEGACY_SHELL_COMMAND",
-                    "legacy command allowed inside the existing sandbox",
-                )
-
         reason_code = _reason_code(classification)
         if classification is ExecClassification.SAFE_READ_ONLY:
             return PolicyResult(
                 PolicyDecision.ALLOW,
                 reason_code,
                 "read-only command allowed",
-            )
-        if approval_mode is ApprovalMode.NEVER:
-            return PolicyResult(
-                PolicyDecision.DENY,
-                f"{reason_code}_NEVER",
-                "commands requiring approval are disabled by approval mode",
             )
         if classification in {
             ExecClassification.TEST_BUILD,
@@ -329,6 +352,12 @@ class CommandAwarePolicy:
                 "sandboxed command allowed",
             )
         if classification in self._approval_required:
+            if approval_mode is ApprovalMode.NEVER:
+                return PolicyResult(
+                    PolicyDecision.DENY,
+                    f"{reason_code}_NEVER",
+                    "commands requiring approval are disabled by approval mode",
+                )
             return PolicyResult(
                 PolicyDecision.REQUIRE_APPROVAL,
                 reason_code,

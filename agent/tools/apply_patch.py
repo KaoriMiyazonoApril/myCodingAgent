@@ -262,12 +262,13 @@ def _validate_patch_path(raw_path: str) -> str:
 def _apply_hunks(content: str, hunks: tuple[PatchHunk, ...], relative: str) -> str:
     had_final_newline = content.endswith(("\n", "\r"))
     lines = content.splitlines()
+    line_offset = 0
     for hunk in hunks:
         pattern = list(hunk.pattern)
         replacement = list(hunk.replacement)
         candidates: list[int] = []
         if hunk.old_start is not None:
-            candidate = max(hunk.old_start - 1, 0)
+            candidate = max(hunk.old_start - 1 + line_offset, 0)
             if _matches(lines, candidate, pattern):
                 candidates = [candidate]
         elif not pattern:
@@ -283,6 +284,8 @@ def _apply_hunks(content: str, hunks: tuple[PatchHunk, ...], relative: str) -> s
             )
         position = candidates[0]
         lines[position : position + len(pattern)] = replacement
+        if hunk.old_start is not None:
+            line_offset += len(replacement) - len(pattern)
     result = "\n".join(lines)
     if had_final_newline and lines:
         result += "\n"

@@ -175,6 +175,11 @@ class ThreadHost:
         if self._runtime is not None:
             for thread_id in self._thread_ids:
                 self._runtime.close_thread(thread_id)
+            close_runtime = getattr(self._runtime, "aclose", None)
+            if callable(close_runtime):
+                result = close_runtime()
+                if inspect.isawaitable(result):
+                    await result
         close = getattr(self._runtime_factory, "close", None)
         if callable(close):
             result = close()

@@ -344,7 +344,22 @@ class ThreadRuntime:
             assert workspace_lease is not None
             self._workspace_leases.release(workspace_lease)
             if record.closing:
-                record.tools.close()
+                await record.tools.aclose()
+
+    async def aclose(self) -> None:
+        """Await cleanup for every Thread-owned stateful tool capability."""
+
+        records = tuple(self._threads.values())
+        for record in records:
+            record.closing = True
+            if record.active_turn is not None:
+                record.active_turn.controller.cancel()
+            else:
+                record.status = ThreadStatus.CLOSED
+        await asyncio.gather(
+            *(record.tools.aclose() for record in records),
+            return_exceptions=True,
+        )
 
     async def _execute_active_turn(
         self,

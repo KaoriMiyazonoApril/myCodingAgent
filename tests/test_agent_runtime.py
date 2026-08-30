@@ -31,6 +31,7 @@ from agent.model.types import (
 )
 from agent.runtime import (
     AgentLimits,
+    AllowAllPolicy,
     ContextLimitError,
     IdempotencyConflictError,
     ModelSettings,
@@ -1964,6 +1965,7 @@ def test_cancelling_run_command_terminates_its_process_group(tmp_path) -> None:
         runtime = runtime_for_provider(
             provider,
             tool_registry_factory=create_test_tool_registry,
+            tool_policy=AllowAllPolicy(),
         )
         thread = runtime.create_thread(tmp_path)
         active = asyncio.create_task(runtime.run_turn(thread.thread_id, "Run then cancel."))

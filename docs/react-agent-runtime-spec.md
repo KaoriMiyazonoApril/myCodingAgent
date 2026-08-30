@@ -113,6 +113,11 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Workstream B Phase 2 将 `apply_patch` 纳入同一 ChangeTracker seam：一次结构化 patch 的
   多个路径先整体检查版本冲突，再按文档顺序记录 original/final 并发出 `file_changed`；
   patch parser 和 WorkspaceFilesystem 提供无部分修改的预检及提交失败逆序恢复。
+- Workstream B Phase 3 在既有 sandbox invocation seam 上增加 per-Thread `ProcessManager`：
+  `exec_command` 返回 running/exited 与 session cursor，`write_stdin` 只访问已创建 session，
+  stdout/stderr 增量、PTY 合并标记和 command lifecycle 均沿 Turn event sink 发出。session
+  会在 timeout、idle、Turn cancellation、Thread close 时终止并回收；Git workspace 的命令
+  前后用轻量 porcelain/diff 记录可观察路径，无法观察时保持 `diff_complete = false`。
 - Ticket 09 已实现严格 workspace 安全：Thread 创建拒绝 symlink 根，每个 Turn 在模型调用前
   完整扫描普通条目并拒绝 symbolic link、regular-file hard link 和嵌套 mount/bind mount；
   扫描按条目数与单调时间双预算 fail closed 为 `WORKSPACE_VALIDATION_LIMIT`。文件工具路径

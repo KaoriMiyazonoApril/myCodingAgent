@@ -12,7 +12,7 @@ import regex
 
 from agent.tools.apply_patch import apply_patch
 from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem
-from agent.tools.process import CommandRunner, CommandSandboxBackend
+from agent.tools.process import CommandRunner, CommandSandboxBackend, ProcessManager
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
 
@@ -260,6 +260,28 @@ async def _run_command_async(
     )
 
 
+async def _exec_command(
+    manager: ProcessManager, arguments: dict[str, object]
+) -> ToolResult:
+    return await manager.exec(
+        cast(str, arguments["command"]),
+        cast(str, arguments["cwd"]),
+        cast(int, arguments["yield_time_ms"]),
+        cast(int, arguments["timeout_ms"]),
+        cast(bool, arguments["tty"]),
+    )
+
+
+async def _write_stdin(
+    manager: ProcessManager, arguments: dict[str, object]
+) -> ToolResult:
+    return await manager.write_stdin(
+        cast(str, arguments["session_id"]),
+        cast(str, arguments["chars"]),
+        cast(int, arguments["yield_time_ms"]),
+    )
+
+
 def create_local_tool_registry(
     workspace_root: Path,
     *,
@@ -269,7 +291,17 @@ def create_local_tool_registry(
 
     filesystem = WorkspaceFilesystem(workspace_root)
     runner = CommandRunner(filesystem, sandbox_backend=sandbox_backend)
-    registry = ToolRegistry(on_close=runner.close)
+    process_manager = ProcessManager(
+        filesystem,
+        sandbox_backend=runner.sandbox,
+        sandbox_checked=True,
+    )
+    registry = ToolRegistry(
+        on_close=process_manager.close,
+        async_on_close=process_manager.aclose,
+    )
+    registry.bind_event_sink(process_manager.set_event_sink)
+    registry.bind_session_canceller(process_manager.cancel_active)
     registry.register(
         ToolDefinition(
             name="read_file",
@@ -380,5 +412,54 @@ def create_local_tool_registry(
         ),
         lambda arguments: _run_command(runner, arguments),
         async_executor=lambda arguments: _run_command_async(runner, arguments),
+    )
+    registry.register(
+        ToolDefinition(
+            name="exec_command",
+            description="Start a sandboxed command and return bounded incremental output.",
+            parameters=_object_schema(
+                {
+                    "command": {"type": "string", "minLength": 1},
+                    "cwd": {"type": "string", "minLength": 1, "default": "."},
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 300000,
+                        "default": 1000,
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 900000,
+                        "default": 60000,
+                    },
+                    "tty": {"type": "boolean", "default": False},
+                },
+                ["command"],
+            ),
+        ),
+        lambda arguments: _exec_command(process_manager, arguments),
+        async_executor=lambda arguments: _exec_command(process_manager, arguments),
+    )
+    registry.register(
+        ToolDefinition(
+            name="write_stdin",
+            description="Write to an existing command session or poll its output.",
+            parameters=_object_schema(
+                {
+                    "session_id": {"type": "string", "minLength": 1},
+                    "chars": {"type": "string", "default": ""},
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 300000,
+                        "default": 1000,
+                    },
+                },
+                ["session_id"],
+            ),
+        ),
+        lambda arguments: _write_stdin(process_manager, arguments),
+        async_executor=lambda arguments: _write_stdin(process_manager, arguments),
     )
     return registry

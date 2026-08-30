@@ -1041,6 +1041,8 @@ def test_all_filesystem_definitions_are_closed_object_schemas(tmp_path) -> None:
         "glob",
         "grep",
         "run_command",
+        "exec_command",
+        "write_stdin",
     }
     assert all(definition.parameters["additionalProperties"] is False for definition in definitions)
     assert registry.lookup("read_file").name == "read_file"

@@ -159,6 +159,35 @@ def test_apply_patch_rejects_unsafe_path(tmp_path, path) -> None:
     assert captured.value.code == "PATCH_INVALID"
 
 
+def test_apply_patch_rejects_final_parent_symlinks_and_hardlinks(tmp_path) -> None:
+    real_directory = tmp_path / "real"
+    real_directory.mkdir()
+    (tmp_path / "linked").symlink_to(real_directory, target_is_directory=True)
+    (tmp_path / "real.txt").write_text("old\n", encoding="utf-8")
+    (tmp_path / "linked-file").symlink_to(tmp_path / "real.txt")
+    (tmp_path / "hard-file").hardlink_to(tmp_path / "real.txt")
+
+    for path, operation in (
+        (
+            "linked/new.txt",
+            "*** Add File: linked/new.txt\n+x\n",
+        ),
+        (
+            "linked-file",
+            "*** Update File: linked-file\n@@\n-old\n+new\n",
+        ),
+        (
+            "hard-file",
+            "*** Update File: hard-file\n@@\n-old\n+new\n",
+        ),
+    ):
+        with pytest.raises(ToolOperationError) as captured:
+            apply_patch(fs(tmp_path), f"*** Begin Patch\n{operation}*** End Patch\n")
+        assert captured.value.code == "WORKSPACE_LINK"
+        assert not (tmp_path / "linked" / "new.txt").exists()
+        assert path
+
+
 def test_registry_exposes_apply_patch_as_a_filesystem_tool(tmp_path) -> None:
     registry = create_local_tool_registry(
         tmp_path,
@@ -240,3 +269,27 @@ def test_change_tracker_tracks_every_apply_patch_path_in_order(tmp_path) -> None
     ]
     changed = [event for event in buffer.read().events if event.type == "file_changed"]
     assert [event.payload["path"] for event in changed] == ["first.txt", "second.txt"]
+
+
+def test_change_tracker_discards_prepared_paths_on_failure_and_cancel(tmp_path) -> None:
+    (tmp_path / "file.txt").write_text("old\n", encoding="utf-8")
+    buffer = EventBuffer(8)
+    events = TurnEventEmitter(
+        thread_id="thread",
+        turn_id="turn",
+        buffer=buffer,
+        reasoning_visibility="hidden",
+    )
+    tracker = ChangeTracker(tmp_path, events)
+    call = ToolCallBlock(
+        id="failed",
+        name="write_file",
+        arguments={"path": "file.txt", "content": "new\n"},
+    )
+
+    assert tracker.before_execution(call) is None
+    tracker.after_execution(call, ToolResult("failed", {}, "IO_ERROR"))
+    assert tracker._prepared == {}
+    assert tracker.before_execution(call) is None
+    tracker.execution_interrupted(call)
+    assert tracker._prepared == {}
