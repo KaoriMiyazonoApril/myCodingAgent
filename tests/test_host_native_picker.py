@@ -20,6 +20,8 @@ from agent.host.native_picker import (
 )
 from agent.host.provider_config import ProviderStore
 from agent.host.workspace import WorkspaceBrowser
+from agent.runtime import ModelSettings, ThreadRuntime
+from agent.tools.registry import ToolRegistry
 
 
 class _Catalog:
@@ -81,6 +83,30 @@ def _app(tmp_path: Path, picker, browser=None):
         workspace_browser=browser or WorkspaceBrowser([tmp_path]),
         native_picker=picker,
     )
+
+
+def _configured_store(path: Path) -> ProviderStore:
+    store = ProviderStore(path)
+    store.save_provider(
+        "deepseek",
+        api_key="test-key",
+        selected_model="deepseek-chat",
+    )
+    store.set_default("deepseek", model="deepseek-chat")
+    return store
+
+
+def _runtime_factory(default_settings: ModelSettings) -> ThreadRuntime:
+    return ThreadRuntime(
+        tool_registry_factory=lambda workspace: ToolRegistry(),
+        provider_resolver=lambda provider_id, model: None,  # type: ignore[return-value]
+        default_settings=default_settings,
+    )
+
+
+class _ImmediateEventStream:
+    async def stream(self, thread_id, *, after_event_id, disconnected):
+        yield "event: probe\nid: probe\ndata: {}\n\n"
 
 
 def test_native_picker_capability_endpoint_is_safe_and_versioned(tmp_path: Path) -> None:
@@ -180,6 +206,37 @@ def test_native_picker_selected_outside_root_uses_existing_workspace_mapping(
     assert response.json()["error"]["code"] == "WORKSPACE_OUTSIDE_ROOT"
 
 
+@pytest.mark.parametrize(
+    ("selected_kind", "expected_code", "expected_status"),
+    [
+        ("file", "WORKSPACE_NOT_ACCESSIBLE", 403),
+        ("symlink", "WORKSPACE_SYMLINK_NOT_ALLOWED", 400),
+    ],
+)
+def test_native_picker_reuses_non_directory_and_symlink_workspace_rejections(
+    tmp_path: Path,
+    selected_kind: str,
+    expected_code: str,
+    expected_status: int,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    selected = root / "selected"
+    if selected_kind == "file":
+        selected.write_text("not a directory", encoding="utf-8")
+    else:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        selected.symlink_to(outside, target_is_directory=True)
+    picker = _FakePicker(translated=str(selected))
+
+    with TestClient(_app(tmp_path, picker, WorkspaceBrowser([root]))) as client:
+        response = client.post("/api/native-picker/select")
+
+    assert response.status_code == expected_status
+    assert response.json()["error"]["code"] == expected_code
+
+
 @pytest.mark.anyio
 async def test_picker_wait_does_not_block_health_and_shutdown_closes_adapter(tmp_path: Path):
     picker = _FakePicker(translated=str(tmp_path))
@@ -191,11 +248,68 @@ async def test_picker_wait_does_not_block_health_and_shutdown_closes_adapter(tmp
         await picker.started.wait()
         health = await client.get("/api/health")
         assert health.status_code == 200
+        threads = await client.get("/api/threads")
+        assert threads.status_code == 200
         picker.release.set()
         assert (await selection).status_code == 200
 
     await app.state.shutdown_resources()
     assert picker.closed == 1
+
+
+@pytest.mark.anyio
+async def test_picker_wait_does_not_block_thread_creation_or_sse(tmp_path: Path):
+    picker = _FakePicker(translated=str(tmp_path))
+    picker.wait_for_release = True
+    app = create_app(
+        provider_store=_configured_store(tmp_path / "providers.json"),
+        model_catalog=_Catalog(),
+        workspace_browser=WorkspaceBrowser([tmp_path]),
+        native_picker=picker,
+        runtime_factory=_runtime_factory,
+        event_stream_adapter=_ImmediateEventStream(),
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        selection = asyncio.create_task(client.post("/api/native-picker/select"))
+        await picker.started.wait()
+
+        created = await client.post("/api/threads", json={"workspace": str(tmp_path)})
+        assert created.status_code == 201
+        thread_id = created.json()["thread"]["snapshot"]["thread_id"]
+        events = await client.get(f"/api/threads/{thread_id}/events")
+        assert events.status_code == 200
+        assert "event: probe" in events.text
+
+        picker.release.set()
+        assert (await selection).status_code == 200
+
+    await app.state.shutdown_resources()
+
+
+@pytest.mark.anyio
+async def test_shutdown_closes_picker_and_threads_when_turn_task_shutdown_fails(
+    tmp_path: Path,
+) -> None:
+    picker = _FakePicker(translated=str(tmp_path))
+    app = _app(tmp_path, picker)
+    threads_closed = 0
+
+    async def fail_turn_shutdown() -> None:
+        raise RuntimeError("turn shutdown failed")
+
+    async def close_threads() -> None:
+        nonlocal threads_closed
+        threads_closed += 1
+
+    app.state.turn_tasks.shutdown = fail_turn_shutdown
+    app.state.thread_host.shutdown = close_threads
+
+    with pytest.raises(RuntimeError, match="turn shutdown failed"):
+        await app.state.shutdown_resources()
+
+    assert picker.closed == 1
+    assert threads_closed == 1
 
 
 @pytest.mark.anyio

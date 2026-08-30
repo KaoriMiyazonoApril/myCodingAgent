@@ -167,11 +167,13 @@ def create_app(
     native_selection_active = False
 
     async def shutdown_resources() -> None:
-        await turn_tasks.shutdown()
         try:
-            await _maybe_await(picker.close())
+            await turn_tasks.shutdown()
         finally:
-            await threads.shutdown()
+            try:
+                await _maybe_await(picker.close())
+            finally:
+                await threads.shutdown()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):

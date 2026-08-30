@@ -155,7 +155,6 @@ class NativeWindowsFolderPicker:
         self._dialog_script = dialog_script
         self._active_task: asyncio.Task[Any] | None = None
         self._active_process: Any | None = None
-        self._closing = False
 
     def capability(self) -> NativePickerCapability:
         """Detect WSL and both required interop executables without spawning."""
@@ -190,7 +189,6 @@ class NativeWindowsFolderPicker:
 
         task = asyncio.current_task()
         self._active_task = task
-        self._closing = False
         try:
             return await self._run_dialog()
         finally:
@@ -259,7 +257,6 @@ class NativeWindowsFolderPicker:
     async def close(self) -> None:
         """Terminate and reap an active child/task; safe to call repeatedly."""
 
-        self._closing = True
         process = self._active_process
         task = self._active_task
         if process is not None:
@@ -324,7 +321,7 @@ class NativeWindowsFolderPicker:
     def _find_powershell(self) -> str | None:
         if self._powershell_executable is not None:
             return self._powershell_executable
-        for name in ("powershell.exe", "pwsh.exe", "pwsh"):
+        for name in ("powershell.exe", "pwsh.exe"):
             executable = self._which(name)
             if executable:
                 self._powershell_executable = executable
