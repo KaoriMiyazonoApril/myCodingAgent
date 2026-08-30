@@ -139,8 +139,10 @@ def classify_exec_command(command: str) -> ExecClassification:
         if _git_is_networked(args):
             return ExecClassification.NETWORK
         if args and args[0] in {
-            "status", "diff", "log", "show", "branch", "ls-files", "rev-parse",
+            "status", "diff", "log", "show", "ls-files", "rev-parse",
         }:
+            return ExecClassification.SAFE_READ_ONLY
+        if args and args[0] == "branch" and _git_branch_is_read_only(args[1:]):
             return ExecClassification.SAFE_READ_ONLY
         return ExecClassification.ORDINARY_SANDBOXED
     if executable in _PRIVILEGED_EXECUTABLES:
@@ -202,7 +204,7 @@ def _contains_shell_control(source: str) -> bool:
         elif not single and character == "$" and source[index : index + 2] == "$(":
             return True
         elif not single and not double:
-            if character in ";|" or source[index : index + 2] in {"&&", "||"}:
+            if character in ";|<>" or source[index : index + 2] in {"&&", "||"}:
                 return True
         index += 1
     return False
@@ -227,6 +229,29 @@ def _git_is_destructive(args: list[str]) -> bool:
 
 def _git_is_networked(args: list[str]) -> bool:
     return bool(args) and args[0] in {"clone", "fetch", "pull", "push", "submodule"}
+
+
+def _git_branch_is_read_only(args: list[str]) -> bool:
+    """Allow only branch listing/inspection forms through the read-only class."""
+
+    if not args:
+        return True
+    read_only_flags = {
+        "-a",
+        "--all",
+        "-l",
+        "--list",
+        "-r",
+        "--remotes",
+        "-v",
+        "-vv",
+        "--verbose",
+        "--contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+    }
+    return all(argument in read_only_flags for argument in args)
 
 
 def _is_package_install(executable: str, args: list[str]) -> bool:

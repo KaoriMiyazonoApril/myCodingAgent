@@ -27,6 +27,21 @@ export type ToolActivity = {
   metadata?: Record<string, unknown>;
 };
 
+export type ProvisionalToolCall = {
+  index: number;
+  id: string | null;
+  name: string | null;
+  arguments: string;
+};
+
+export type ProvisionalAssistant = {
+  turn_id: string | null;
+  text: string;
+  reasoning: string;
+  tool_calls: ProvisionalToolCall[];
+  message_end: boolean;
+};
+
 export type FileChange = {
   path: string;
   change_type: string;
@@ -41,6 +56,7 @@ export type EventState = {
   files: FileChange[];
   cancel_requested: boolean;
   approval: ApprovalRequest | null;
+  provisional: ProvisionalAssistant | null;
   seen_event_ids: string[];
 };
 
@@ -60,6 +76,7 @@ export function hydrateThread(view: ThreadView): EventState {
     files: [],
     cancel_requested: false,
     approval: null,
+    provisional: null,
     seen_event_ids: [],
   };
   view.snapshot.messages.forEach((message, index) => {
@@ -89,6 +106,13 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     files: state.files.map((file) => ({ ...file })),
     cancel_requested: state.cancel_requested,
     approval: state.approval,
+    provisional:
+      state.provisional === null
+        ? null
+        : {
+            ...state.provisional,
+            tool_calls: state.provisional.tool_calls.map((call) => ({ ...call })),
+          },
     seen_event_ids: [...state.seen_event_ids, event.event_id],
   };
 
@@ -97,15 +121,65 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     next.error = null;
     next.files = [];
     next.cancel_requested = false;
+    next.provisional = {
+      turn_id: event.turn_id,
+      text: "",
+      reasoning: "",
+      tool_calls: [],
+      message_end: false,
+    };
     const text = event.payload.user_message;
     if (typeof text === "string") {
       next.messages.push({ id: event.event_id, role: "user", text });
     }
   } else if (event.type === "model_response") {
+    next.provisional = null;
     const message = event.payload.message;
     if (isRecord(message)) {
       hydrateMessage(next, message, event.event_id);
     }
+  } else if (event.type === "model_text_delta") {
+    const provisional = ensureProvisional(next, event.turn_id);
+    if (typeof event.payload.text === "string") {
+      provisional.text += event.payload.text;
+    }
+  } else if (event.type === "model_reasoning_delta") {
+    const provisional = ensureProvisional(next, event.turn_id);
+    if (typeof event.payload.text === "string") {
+      provisional.reasoning += event.payload.text;
+    }
+  } else if (event.type === "model_tool_call_delta") {
+    const provisional = ensureProvisional(next, event.turn_id);
+    const index = event.payload.index;
+    if (typeof index === "number" && Number.isInteger(index) && index >= 0) {
+      let call = provisional.tool_calls.find((item) => item.index === index);
+      if (call === undefined) {
+        call = { index, id: null, name: null, arguments: "" };
+        provisional.tool_calls.push(call);
+      }
+      if (typeof event.payload.id === "string" && event.payload.id) {
+        call.id = event.payload.id;
+      }
+      if (typeof event.payload.name === "string" && event.payload.name) {
+        call.name = event.payload.name;
+      }
+      if (typeof event.payload.arguments_delta === "string") {
+        call.arguments += event.payload.arguments_delta;
+      }
+    }
+  } else if (event.type === "model_message_end") {
+    ensureProvisional(next, event.turn_id).message_end = true;
+  } else if (event.type === "model_error") {
+    next.error = {
+      code:
+        typeof event.payload.error_code === "string"
+          ? event.payload.error_code
+          : "MODEL_STREAM_ERROR",
+      message:
+        typeof event.payload.message === "string"
+          ? event.payload.message
+          : "模型流式响应失败",
+    };
   } else if (event.type === "tool_requested") {
     const call = event.payload.tool_call;
     if (isRecord(call) && typeof call.id === "string") {
@@ -180,6 +254,7 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     const summary = event.payload.summary;
     if (isRecord(summary)) {
       next.terminal = summary;
+      next.provisional = null;
       next.cancel_requested = false;
       next.approval = null;
       hydrateSummaryFiles(next, summary);
@@ -193,10 +268,27 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
       ? safeError(error)
       : { code: "TURN_REJECTED", message: "Turn could not start" };
     next.terminal = { status: "rejected", error: next.error };
+    next.provisional = null;
     next.cancel_requested = false;
     next.approval = null;
   }
   return next;
+}
+
+function ensureProvisional(
+  state: EventState,
+  turnId: string | null,
+): ProvisionalAssistant {
+  if (state.provisional === null) {
+    state.provisional = {
+      turn_id: turnId,
+      text: "",
+      reasoning: "",
+      tool_calls: [],
+      message_end: false,
+    };
+  }
+  return state.provisional;
 }
 
 function hydrateMessage(

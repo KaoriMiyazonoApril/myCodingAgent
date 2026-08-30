@@ -260,6 +260,8 @@ class MessageEndEvent:
 @dataclass(slots=True)
 class ErrorEvent:
     message: str
+    error_code: str | None = None
+    retryable: bool = False
     type: Literal["error"] = field(default="error", init=False)
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -17,7 +18,15 @@ from agent.core.messages import (
     ToolCallBlock,
     ToolResultBlock,
 )
-from agent.model.types import LLMResponse
+from agent.model.types import (
+    ErrorEvent,
+    LLMResponse,
+    MessageEndEvent,
+    ReasoningDeltaEvent,
+    TextDeltaEvent,
+    ToolCallDeltaEvent,
+    Usage,
+)
 from agent.tools.types import ToolResult
 
 from .types import SCHEMA_VERSION
@@ -97,6 +106,20 @@ def public_usage(response: LLMResponse) -> dict[str, int | None]:
     }
 
 
+def usage_dict(usage: Usage | None) -> dict[str, int | None]:
+    if usage is None:
+        return {
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+        }
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+
+
 def public_tool_call(call: ToolCallBlock) -> dict[str, Any]:
     return {
         "id": call.id,
@@ -147,6 +170,85 @@ class EventBatch:
         return asdict(self)
 
 
+class EventSubscription:
+    """A bounded wake-only subscription over an :class:`EventBuffer`."""
+
+    def __init__(self, buffer: EventBuffer, after_event_id: str | None) -> None:
+        self._buffer = buffer
+        self._after_event_id = after_event_id
+        self._wake = asyncio.Event()
+        self._closed = False
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
+
+    def _notify(self) -> None:
+        if self._closed:
+            return
+        if self._loop is None:
+            self._wake.set()
+            return
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if current is self._loop:
+            self._wake.set()
+        else:
+            self._loop.call_soon_threadsafe(self._wake.set)
+
+    async def read(self, after_event_id: str | None = None) -> EventBatch:
+        """Wait until events follow ``after_event_id`` or the cursor expires."""
+
+        if after_event_id is not None:
+            self._after_event_id = after_event_id
+        while True:
+            if self._closed:
+                return self._buffer.read(self._after_event_id)
+            self._wake.clear()
+            batch = self._buffer.read(self._after_event_id)
+            if batch.events or batch.cursor_expired:
+                return batch
+            await self._wake.wait()
+
+    wait = read
+    wait_for_events = read
+    next_batch = read
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def aclose(self) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._buffer._subscriptions.discard(self)
+        self._wake.set()
+
+    async def __aenter__(self) -> EventSubscription:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.aclose()
+
+    def __aiter__(self) -> EventSubscription:
+        return self
+
+    async def __anext__(self) -> AgentEvent:
+        batch = await self.read(self._after_event_id)
+        if not batch.events:
+            await self.aclose()
+            raise StopAsyncIteration
+        event = batch.events[0]
+        self._after_event_id = event.event_id
+        return event
+
+
 class EventBuffer:
     """Drop oldest events at capacity instead of back-pressuring the Agent."""
 
@@ -155,9 +257,34 @@ class EventBuffer:
             raise ValueError("event_buffer_capacity must be a positive integer")
         self._events: deque[AgentEvent] = deque(maxlen=capacity)
         self._thread_sequence = 0
+        self._subscriptions: set[EventSubscription] = set()
 
     def append(self, event: AgentEvent) -> None:
         self._events.append(event)
+        for subscription in tuple(self._subscriptions):
+            subscription._notify()
+
+    def subscribe(self, after_event_id: str | None = None) -> EventSubscription:
+        """Create a wake-only real-time subscription without adding a queue."""
+
+        subscription = EventSubscription(self, after_event_id)
+        self._subscriptions.add(subscription)
+        return subscription
+
+    subscribe_realtime = subscribe
+
+    @property
+    def subscriber_count(self) -> int:
+        return len(self._subscriptions)
+
+    async def wait_for_events(self, after_event_id: str | None = None) -> EventBatch:
+        """Wait once for replayable events, then detach the subscriber."""
+
+        subscription = self.subscribe(after_event_id)
+        try:
+            return await subscription.read()
+        finally:
+            await subscription.aclose()
 
     def emit_thread(
         self,
@@ -260,6 +387,49 @@ class TurnEventEmitter:
                     "model_reasoning",
                     {"iteration": iteration, "text": reasoning},
                 )
+
+    def model_delta(
+        self,
+        event: TextDeltaEvent
+        | ReasoningDeltaEvent
+        | ToolCallDeltaEvent
+        | MessageEndEvent
+        | ErrorEvent,
+    ) -> None:
+        """Publish provisional model output without constructing history."""
+
+        if isinstance(event, TextDeltaEvent):
+            self.emit("model_text_delta", {"text": event.text})
+        elif isinstance(event, ReasoningDeltaEvent):
+            if self._reasoning_visibility == "debug":
+                self.emit("model_reasoning_delta", {"text": event.text})
+        elif isinstance(event, ToolCallDeltaEvent):
+            self.emit(
+                "model_tool_call_delta",
+                {
+                    "index": event.index,
+                    "id": event.id,
+                    "name": event.name,
+                    "arguments_delta": event.arguments_delta,
+                },
+            )
+        elif isinstance(event, MessageEndEvent):
+            self.emit(
+                "model_message_end",
+                {
+                    "finish_reason": event.finish_reason,
+                    "usage": usage_dict(event.usage),
+                },
+            )
+        elif isinstance(event, ErrorEvent):
+            self.emit(
+                "model_error",
+                {
+                    "message": event.message,
+                    "error_code": event.error_code,
+                    "retryable": event.retryable,
+                },
+            )
 
     def tool_requested(self, call: ToolCallBlock) -> None:
         self.emit("tool_requested", {"tool_call": public_tool_call(call)})

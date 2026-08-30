@@ -1762,6 +1762,28 @@ function ConversationFeed({
             <p>{pendingUserMessage}</p>
           </article>
         ) : null}
+        {state.provisional !== null &&
+        (state.provisional.text ||
+          state.provisional.reasoning ||
+          state.provisional.tool_calls.length > 0) ? (
+          <article className="message assistant provisional-message" aria-live="polite">
+            <p className="message-role">编码助手 · 正在生成</p>
+            {state.provisional.text ? <p>{state.provisional.text}</p> : null}
+            {state.provisional.reasoning ? (
+              <p className="message-reasoning">{state.provisional.reasoning}</p>
+            ) : null}
+            {state.provisional.tool_calls.length > 0 ? (
+              <ul className="provisional-tool-calls">
+                {state.provisional.tool_calls.map((call) => (
+                  <li key={call.index}>
+                    <code>{call.name ?? "tool"}</code>
+                    {call.arguments ? <code>{call.arguments}</code> : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </article>
+        ) : null}
         {state.messages.length === 0 && !showPendingUserMessage ? (
           <div className="conversation-empty">
             <div className="conversation-empty-mark" aria-hidden="true">&gt;_</div>

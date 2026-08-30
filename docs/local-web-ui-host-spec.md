@@ -41,7 +41,8 @@ Host 使用受信 Provider preset 的固定 endpoint 获取 Provider 返回的�
 发送 Snapshot recovery。
 
 React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 Conversation 和 Composer，
-右侧 Activity、工具状态、文件变化和简化 diff。完整模型响应一次性显示，不引入 token delta。
+右侧 Activity、工具状态、文件变化和简化 diff。模型 delta 在 provisional state 中实时显示，
+完成后仍以 canonical Snapshot/Conversation 为准。
 运行时 Send 旁提供真正调用 Runtime cancellation 的 Stop。Workstream B Phase 1 已确定
 `ApprovalMode` 与 command-aware Policy，因此 Host 仅增加一个薄的 approval resolution command，
 前端展示 Runtime 提供的原因并允许 approve/deny；风险判断仍不进入 Web。
@@ -135,7 +136,9 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Provider configuration is hidden behind one deep store interface that owns versioned loading, atomic saving, permission enforcement, masking, default selection, and credential clearing.
 - Provider model discovery is hidden behind one catalog interface with production and fake adapters. It returns sanitized model IDs and typed failures; callers do not handle SDK response objects.
 - `TurnTaskManager` is a deep Host module with a small start, cancel, inspect, and shutdown interface. It owns task mappings and cleanup without becoming the source of Agent status.
-- The SSE adapter owns polling, framing, heartbeat, cursor recovery, and disconnect cleanup behind one streaming interface. Runtime and routes do not contain React-specific event reduction.
+- The SSE adapter owns real-time EventBuffer subscription (with replay fallback), framing, heartbeat,
+  cursor recovery, and disconnect cleanup behind one streaming interface. Runtime and routes do not
+  contain React-specific event reduction.
 - Workspace browsing is hidden behind a root policy interface that normalizes configured roots, checks containment without following symlinks, lists one level, and returns transport-safe entries.
 - Native Windows selection is hidden behind an injected `NativePickerAdapter`. It detects WSL/interop capability, launches a fixed UTF-8 PowerShell dialog through argv, translates the selected Windows path with system `wslpath`, and exposes idempotent close/shutdown. The PowerShell process emits its Windows PID before opening the dialog, allowing shutdown to terminate both that process and a WSL `/init` launcher instead of leaving a detached native dialog. It never authorizes a workspace; the Host calls the same `WorkspaceBrowser.validate()` used by Thread creation.
 
@@ -159,7 +162,8 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Workspace validation in `run_turn` runs in a worker thread and is awaited asynchronously. Validation rules, budgets, lease acquisition, history mutation ordering, and fail-closed behavior remain unchanged.
 - A Turn ID and emitter are available before asynchronous preflight. Provider resolution, context checks, workspace lease/validation, or cancellation before `turn_started` produce a sanitized `turn_rejected` event and then preserve the existing exception contract.
 - Cancellation during preflight releases acquired resources and produces an observable rejection/cancellation code. Cancellation after `turn_started` continues through `RunController` and the existing terminal Summary/event behavior.
-- No changes are made to model token streaming, AgentLoop control flow, tool execution ordering, Conversation history, Policy decisions, diff generation, or EventBuffer retention semantics.
+- Runtime streaming remains behind the existing ThreadRuntime/provider seams; the Host only forwards
+  model delta events and does not assemble messages or make Policy decisions.
 
 ### Host lifecycle and Thread catalog
 
@@ -205,7 +209,9 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 
 - Browser-to-Host commands use HTTP; Host-to-browser progress uses SSE. WebSocket is not introduced.
 - Runtime `AgentEvent` envelopes and payloads pass through without domain renaming. SSE `event` is the Runtime event type, `id` is `event_id`, and `data` is strict JSON.
-- The adapter polls every 100 milliseconds while a Thread is active or a submission is starting, every one second while idle or closed, and sends a comment heartbeat every 15 seconds.
+- The adapter subscribes to the Runtime EventBuffer for immediate delivery, retains polling-compatible
+  replay/cursor recovery behavior for injected legacy runtimes, and sends a comment heartbeat every
+  15 seconds.
 - An explicit `after_event_id` query parameter takes precedence over the `Last-Event-ID` header. Both refer to Runtime event IDs rather than sequence values.
 - A normal connection emits retained events strictly in EventBuffer append order. Browser reducers deduplicate by event ID and stable tool-call IDs.
 - A hydratable Thread read captures the latest event cursor and Snapshot without yielding control between those reads, then returns both. The client builds canonical UI from Snapshot and connects after the cursor.
@@ -266,7 +272,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 
 - Native Windows Host execution, Windows command sandboxing, Windows process-tree cancellation, or Windows workspace validation.
 - Approval endpoints, Approval Card, dangerous-command classification, or a new production ToolPolicy.
-- Token-level assistant streaming, live command stdout/stderr streaming, or changes to the existing non-streaming model interface.
+- Live command stdout/stderr streaming, or provider-hosted execution.
 - WebSocket, Electron, Tauri, PTY, xterm.js, Monaco IDE, drag-and-drop filesystem access, or browser File System API workspace selection.
 - Thread, Turn, event, conversation, diff, or task persistence across Host restarts; database-backed sessions; command reattachment beyond the in-memory per-Thread `ProcessManager` lifecycle.
 - Authentication, TLS, remote access, multi-user operation, cloud deployment, distributed Host instances, or cross-process coordination.

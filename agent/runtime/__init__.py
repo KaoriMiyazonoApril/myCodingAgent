@@ -11,7 +11,8 @@ from .errors import (
     WorkspaceBusyError,
     WorkspaceValidationLimitError,
 )
-from .events import AgentEvent, EventBatch
+from .events import AgentEvent, EventBatch, EventSubscription
+from .message_assembler import MessageAssembler
 from .prompt import PromptBuilder
 from .policy import (
     AllowAllPolicy,
@@ -44,6 +45,8 @@ __all__ = [
     "ThreadRuntime",
     "AgentEvent",
     "EventBatch",
+    "EventSubscription",
+    "MessageAssembler",
     "SCHEMA_VERSION",
     "AgentLimits",
     "AllowAllPolicy",

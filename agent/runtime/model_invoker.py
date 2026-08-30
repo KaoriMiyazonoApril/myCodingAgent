@@ -3,14 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 
 from agent.core.messages import Message
-from agent.model.errors import LLMError
+from agent.model.errors import (
+    LLMConnectionError,
+    LLMError,
+    LLMResponseParseError,
+    LLMStreamingNotImplementedError,
+)
 from agent.model.provider import LLMProvider
-from agent.model.types import LLMRequest, LLMResponse
+from agent.model.types import (
+    ErrorEvent,
+    LLMEvent,
+    LLMRequest,
+    LLMResponse,
+    MessageEndEvent,
+)
 from agent.tools.types import ToolDefinition
 
 from .context_budget import ContextBudget
+from .message_assembler import MessageAssembler
 from .settings import TurnConfig
 
 
@@ -69,6 +82,92 @@ class ModelInvoker:
                 if delay > 0:
                     await asyncio.sleep(delay)
         raise AssertionError("model retry loop exhausted without returning or raising")
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition],
+        *,
+        on_event: Callable[[LLMEvent], object] | None = None,
+    ) -> LLMResponse:
+        """Stream one response, retrying only before provisional output appears."""
+
+        self.ensure_context(messages, tools)
+        request = LLMRequest(
+            messages=list(messages),
+            tools=tools,
+            temperature=self._config.temperature,
+            max_tokens=self._config.max_tokens,
+            extra_body=(
+                self._config.thinking.to_extra_body()
+                if self._config.thinking is not None
+                else None
+            ),
+        )
+        if type(self._provider).stream is LLMProvider.stream:
+            # Preserve the established chat seam for providers that have not
+            # opted into streaming yet. Their complete response is already
+            # canonical and must not manufacture duplicate UI deltas.
+            return await self.chat(messages, tools)
+
+        for attempt in range(3):
+            delta_seen = False
+            error_event_delivered = False
+            try:
+                assembler = MessageAssembler()
+                async for event in self._provider.stream(request):
+                    if isinstance(event, ErrorEvent):
+                        error = self._error_from_event(event)
+                        should_retry = (
+                            not delta_seen
+                            and error.retryable
+                            and attempt < 2
+                        )
+                        if on_event is not None and not should_retry:
+                            on_event(event)
+                            error_event_delivered = True
+                        raise error
+                    assembler.add(event)
+                    if not isinstance(event, MessageEndEvent):
+                        delta_seen = delta_seen or assembler.delta_seen
+                    if on_event is not None:
+                        on_event(event)
+                return assembler.assemble()
+            except asyncio.CancelledError:
+                raise
+            except LLMError as error:
+                if on_event is not None and delta_seen and not error_event_delivered:
+                    on_event(
+                        ErrorEvent(
+                            message=str(error),
+                            error_code=type(error).__name__,
+                            retryable=error.retryable,
+                        )
+                    )
+                if isinstance(error, LLMStreamingNotImplementedError):
+                    fallback_response = getattr(error, "fallback_response", None)
+                    if isinstance(fallback_response, LLMResponse):
+                        return fallback_response
+                    return await self.chat(messages, tools)
+                if delta_seen or not error.retryable or attempt == 2:
+                    raise
+                delay = (
+                    self._retry_delays[attempt]
+                    if attempt < len(self._retry_delays)
+                    else 0
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        raise AssertionError("model stream retry loop exhausted")
+
+    def _error_from_event(self, event: ErrorEvent) -> LLMError:
+        if event.error_code == "LLMConnectionError":
+            return LLMConnectionError(event.message, retryable=event.retryable)
+        if event.error_code == "LLMResponseParseError":
+            return LLMResponseParseError(event.message)
+        if event.error_code == "LLMStreamingNotImplementedError":
+            return LLMStreamingNotImplementedError(event.message)
+        return LLMConnectionError(event.message, retryable=event.retryable)
 
     def ensure_context(
         self,

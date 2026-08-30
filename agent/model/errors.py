@@ -71,3 +71,7 @@ class LLMToolArgumentsParseError(LLMResponseParseError):
 
 class LLMStreamingNotImplementedError(LLMError):
     """Streaming event types exist, but this first implementation is non-streaming."""
+
+    def __init__(self, message: str, *, fallback_response=None) -> None:
+        super().__init__(message)
+        self.fallback_response = fallback_response

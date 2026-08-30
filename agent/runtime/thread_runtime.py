@@ -24,7 +24,13 @@ from .errors import (
     ThreadClosedError,
     TurnLimitReached,
 )
-from .events import EventBatch, EventBuffer, TurnEventEmitter, utc_now
+from .events import (
+    EventBatch,
+    EventBuffer,
+    EventSubscription,
+    TurnEventEmitter,
+    utc_now,
+)
 from .loop import AgentLoop
 from .model_invoker import ModelInvoker
 from .prompt import PromptBuilder
@@ -460,6 +466,18 @@ class ThreadRuntime:
         events = self._threads[thread_id].events
         assert events is not None
         return events.read(after_event_id)
+
+    def subscribe_events(
+        self,
+        thread_id: str,
+        *,
+        after_event_id: str | None = None,
+    ) -> EventSubscription:
+        """Subscribe to wake-only real-time events for one Thread."""
+
+        events = self._threads[thread_id].events
+        assert events is not None
+        return events.subscribe(after_event_id)
 
     def cancel_turn(self, thread_id: str) -> bool:
         """Request cancellation of the Thread's active model/tool operation."""

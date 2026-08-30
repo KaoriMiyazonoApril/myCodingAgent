@@ -294,3 +294,54 @@ test("keeps policy reason in the approval state until runtime resolves it", () =
   }));
   expect(state.approval).toBeNull();
 });
+
+test("renders streaming deltas provisionally and clears them on canonical response", () => {
+  let state = hydrateThread({
+    ...view(),
+    snapshot: { ...view().snapshot, messages: [], latest_turn: null },
+  });
+  state = applyAgentEvent(state, event("turn_started", { user_message: "Stream" }));
+  state = applyAgentEvent(state, event("model_text_delta", { text: "生" }));
+  state = applyAgentEvent(state, {
+    ...event("model_tool_call_delta", {
+      index: 0,
+      id: "call",
+      name: "read_file",
+      arguments_delta: '{"path":',
+    }),
+    event_id: "delta-2",
+  });
+  expect(state.messages).toEqual([
+    { id: "turn_started-id", role: "user", text: "Stream" },
+  ]);
+  expect(state.provisional).toEqual({
+    turn_id: "turn-1",
+    text: "生",
+    reasoning: "",
+    tool_calls: [
+      { index: 0, id: "call", name: "read_file", arguments: '{"path":' },
+    ],
+    message_end: false,
+  });
+
+  state = applyAgentEvent(
+    state,
+    event("model_message_end", { finish_reason: "tool_calls" }),
+  );
+  expect(state.provisional?.message_end).toBe(true);
+  state = applyAgentEvent(
+    state,
+    event("model_response", {
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "生" }],
+      },
+    }),
+  );
+  expect(state.provisional).toBeNull();
+  expect(state.messages.at(-1)).toEqual({
+    id: "model_response-id-text",
+    role: "assistant",
+    text: "生",
+  });
+});

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 import inspect
@@ -30,11 +31,16 @@ from .errors import (
 )
 from .provider import LLMProvider
 from .types import (
+    ErrorEvent,
     LLMEvent,
     LLMRequest,
     LLMResponse,
+    MessageEndEvent,
     ProviderConfig,
+    ReasoningDeltaEvent,
     ReasoningRetention,
+    TextDeltaEvent,
+    ToolCallDeltaEvent,
     Usage,
 )
 
@@ -91,11 +97,108 @@ class OpenAICompatibleProvider(LLMProvider):
             await result
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMEvent]:
-        """Reserve the public interface without exposing SDK stream chunks."""
-        raise LLMStreamingNotImplementedError(
-            "Streaming event conversion is planned but not implemented in this phase"
-        )
-        yield  # Keeps the method an async generator for callers and type checkers.
+        """Convert SDK Chat Completions chunks into provider-independent events."""
+
+        payload = self._build_request_payload(request, stream=True)
+        try:
+            created = self._client.chat.completions.create(**payload)
+            raw_stream = await created if inspect.isawaitable(created) else created
+            if not hasattr(raw_stream, "__aiter__"):
+                response = self._parse_response(raw_stream)
+                raise LLMStreamingNotImplementedError(
+                    "The injected completion client did not return an async stream",
+                    fallback_response=response,
+                )
+            finish_reason: str | None = None
+            usage: Usage | None = None
+            call_indexes: dict[str, int] = {}
+            next_index = 0
+            async for chunk in raw_stream:
+                raw_usage = self._get_field(chunk, "usage")
+                if raw_usage is not None:
+                    usage = self._parse_usage(raw_usage)
+                choices = self._get_field(chunk, "choices")
+                if choices is None:
+                    continue
+                if not isinstance(choices, (list, tuple)):
+                    raise LLMResponseParseError("Streaming choices must be a list")
+                if not choices:
+                    continue
+                choice = choices[0]
+                raw_finish = self._get_field(choice, "finish_reason")
+                if raw_finish is not None:
+                    if not isinstance(raw_finish, str):
+                        raise LLMResponseParseError(
+                            "Streaming finish_reason must be a string or null"
+                        )
+                    finish_reason = raw_finish
+                delta = self._get_field(choice, "delta")
+                if delta is None:
+                    continue
+                text = self._parse_content(self._get_field(delta, "content"))
+                if text:
+                    yield TextDeltaEvent(text=text)
+                for field_name in self.config.capabilities.reasoning_output_fields:
+                    reasoning = self._get_field(delta, field_name)
+                    if isinstance(reasoning, str) and reasoning:
+                        yield ReasoningDeltaEvent(text=reasoning)
+                raw_tool_calls = self._get_field(delta, "tool_calls")
+                if raw_tool_calls is None:
+                    continue
+                if not isinstance(raw_tool_calls, (list, tuple)):
+                    raise LLMResponseParseError(
+                        "Streaming delta.tool_calls must be a list"
+                    )
+                for raw_call in raw_tool_calls:
+                    raw_id = self._get_field(raw_call, "id")
+                    call_id = raw_id if isinstance(raw_id, str) and raw_id else None
+                    raw_index = self._get_field(raw_call, "index")
+                    if raw_index is None:
+                        if call_id is not None and call_id in call_indexes:
+                            index = call_indexes[call_id]
+                        else:
+                            index = next_index
+                    elif isinstance(raw_index, bool) or not isinstance(raw_index, int):
+                        raise LLMResponseParseError(
+                            "Streaming tool call index must be an integer"
+                        )
+                    else:
+                        index = raw_index
+                    if index < 0:
+                        raise LLMResponseParseError(
+                            "Streaming tool call index must not be negative"
+                        )
+                    next_index = max(next_index, index + 1)
+                    if call_id is not None:
+                        call_indexes[call_id] = index
+                    function = self._get_field(raw_call, "function")
+                    raw_name = self._get_field(function, "name")
+                    name = raw_name if isinstance(raw_name, str) and raw_name else None
+                    raw_arguments = self._get_field(function, "arguments")
+                    arguments = (
+                        raw_arguments if isinstance(raw_arguments, str) else None
+                    )
+                    if raw_arguments is not None and arguments is None:
+                        arguments = self._stringify_raw_arguments(raw_arguments)
+                    if call_id is not None or name is not None or arguments:
+                        yield ToolCallDeltaEvent(
+                            index=index,
+                            id=call_id,
+                            name=name,
+                            arguments_delta=arguments,
+                        )
+            yield MessageEndEvent(finish_reason=finish_reason, usage=usage)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            translated = error if isinstance(error, LLMError) else self._translate_sdk_error(error)
+            if isinstance(translated, LLMStreamingNotImplementedError):
+                raise translated
+            yield ErrorEvent(
+                message=str(translated),
+                error_code=type(translated).__name__,
+                retryable=translated.retryable,
+            )
 
     def _build_request_payload(self, request: LLMRequest, *, stream: bool) -> dict[str, Any]:
         payload: dict[str, Any] = {

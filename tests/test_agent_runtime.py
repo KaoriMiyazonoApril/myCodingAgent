@@ -2864,6 +2864,7 @@ def test_run_command_marks_diff_incomplete_without_guessing_changed_files(
     runtime = runtime_for_provider(
         provider,
         tool_registry_factory=create_test_tool_registry,
+        tool_policy=AllowAllPolicy(),
     )
     thread = runtime.create_thread(tmp_path)
 
@@ -2987,6 +2988,7 @@ def test_invalid_command_does_not_make_diff_incomplete(tmp_path) -> None:
     runtime = runtime_for_provider(
         provider,
         tool_registry_factory=create_test_tool_registry,
+        tool_policy=AllowAllPolicy(),
     )
     thread = runtime.create_thread(tmp_path)
 

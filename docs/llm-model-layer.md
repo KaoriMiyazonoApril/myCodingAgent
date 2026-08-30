@@ -126,7 +126,9 @@ rate-limit、connection 与 request 的稳定异常子类，使未来 Agent Loop
 
 ## Streaming 状态
 
-已定义 `TextDeltaEvent`、`ReasoningDeltaEvent`、`ToolCallDeltaEvent`、
-`MessageEndEvent` 和 `ErrorEvent`，并在 `LLMProvider` 中预留 `stream()` 接口。
-第一阶段尚未将 SDK stream chunks 转换为这些事件；调用 `stream()` 会得到
-`LLMStreamingNotImplementedError`，不会泄露 SDK stream 对象。
+`OpenAICompatibleProvider.stream()` 将 SDK async stream 转换为
+`TextDeltaEvent`、`ReasoningDeltaEvent`、`ToolCallDeltaEvent`、`MessageEndEvent` 和
+`ErrorEvent`，不会把 SDK chunk 暴露到 Runtime。`MessageAssembler` 按 tool-call index
+累积碎片，并只在正常 `MessageEndEvent` 后解析 JSON、构造 canonical assistant message；
+模型流在首个 delta 后失败不会透明重试。尚未实现 streaming 的旧 Provider 继续使用
+`chat()` 完整响应兼容入口，不合成额外的 UI delta。

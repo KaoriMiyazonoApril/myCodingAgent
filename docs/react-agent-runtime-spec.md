@@ -118,6 +118,10 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   stdout/stderr 增量、PTY 合并标记和 command lifecycle 均沿 Turn event sink 发出。session
   会在 timeout、idle、Turn cancellation、Thread close 时终止并回收；Git workspace 的命令
   前后用轻量 porcelain/diff 记录可观察路径，无法观察时保持 `diff_complete = false`。
+- Workstream B Phase 4 已接通 OpenAI-compatible async streaming：provider chunk 转换为本地
+  delta 事件，`MessageAssembler` 按 index/id 组装 tool-call 并只在 MessageEnd 后构造
+  canonical assistant message；EventBuffer 提供 wake-only async subscription，Host SSE
+  优先实时订阅，前端 reducer 以 provisional state 展示尚未写入 Conversation 的 delta。
 - Ticket 09 已实现严格 workspace 安全：Thread 创建拒绝 symlink 根，每个 Turn 在模型调用前
   完整扫描普通条目并拒绝 symbolic link、regular-file hard link 和嵌套 mount/bind mount；
   扫描按条目数与单调时间双预算 fail closed 为 `WORKSPACE_VALIDATION_LIMIT`。文件工具路径
@@ -287,7 +291,9 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - The separate Host transport maps Thread creation, versioned settings updates, Turn submission, cancellation, Snapshot retrieval, and Thread closure to HTTP commands and forwards Runtime events with SSE. Approval remains excluded from Web V1. The core Runtime still has no dependency on the Web framework.
 - Turn submission accepts a non-empty, at-most-200-character idempotency key and atomically requires the Thread to be `IDLE` for a new key. A matching retry joins the in-flight result or returns a detached completed Summary; reuse with different user text or settings override fails with `IDEMPOTENCY_CONFLICT`. The Host adapter consumes this behavior without moving it into transport code.
 - All external data has an explicit schema version. Compatibility is defined by JSON field semantics, not by importing Python dataclasses into a frontend.
-- The existing non-streaming model call remains sufficient for the first version. Agent events describe complete model stages; LLM token deltas and live command stdout/stderr are not required.
+- OpenAI-compatible model calls use the streaming seam when the provider exposes it. Legacy
+  chat-only providers remain compatible through the complete-response fallback; provisional
+  model deltas never enter Conversation and are cleared on stream failure/cancellation.
 
 ## Testing Decisions
 
@@ -319,7 +325,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Accurate original-content capture for arbitrary file changes made by shell commands, formatters, build scripts, or external processes.
 - Defense against a hostile external process that races workspace validation and replaces entries during execution.
 - Git worktree creation, cross-workspace tasks, automatic merge resolution, persistent job sessions, or command reattachment.
-- LLM token streaming, live command-output streaming, provider-hosted tools, hosted filesystems, and hosted code execution.
+- Provider-hosted tools, hosted filesystems, and hosted code execution remain out of scope.
 - Agent frameworks, orchestration frameworks, agent SDKs, or reuse of another coding-agent runtime.
 
 ## Further Notes

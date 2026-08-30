@@ -24,6 +24,11 @@ type EventClientOptions = {
 
 const EVENT_TYPES = [
   "turn_started",
+  "model_text_delta",
+  "model_reasoning_delta",
+  "model_tool_call_delta",
+  "model_message_end",
+  "model_error",
   "model_response",
   "tool_requested",
   "tool_started",

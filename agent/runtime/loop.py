@@ -32,9 +32,10 @@ class AgentLoop:
         while True:
             controller.begin_iteration()
             response = await controller.wait(
-                model.chat(
+                model.stream(
                     conversation.request_messages(),
                     tools.definitions(),
+                    on_event=events.model_delta,
                 )
             )
             conversation.append_assistant(response.message)
