@@ -38,6 +38,32 @@ class _Process:
         self.returncode = -9
 
 
+class _Stream:
+    def __init__(self, *chunks: bytes) -> None:
+        self._chunks = list(chunks)
+
+    async def readline(self) -> bytes:
+        await asyncio.sleep(0)
+        return self._chunks.pop(0) if self._chunks else b""
+
+    async def read(self) -> bytes:
+        await asyncio.sleep(0)
+        data = b"".join(self._chunks)
+        self._chunks.clear()
+        return data
+
+
+class _StreamingProcess(_Process):
+    def __init__(self, pid_line: bytes, result: bytes) -> None:
+        super().__init__(b"")
+        self.stdout = _Stream(pid_line, result)
+        self.stderr = _Stream()
+
+    async def wait(self) -> int:
+        self.returncode = self._final_returncode
+        return self.returncode
+
+
 def _picker(factory):
     return NativeWindowsFolderPicker(
         is_wsl=lambda: True,
@@ -106,6 +132,7 @@ async def test_select_preserves_cancel_and_uses_fixed_argv_for_unicode_path() ->
     )
     assert args[7:9] == ("-Sta", "-Command")
     assert "System.Windows.Forms.FolderBrowserDialog" in args[9]
+    assert "status = 'started'; pid = $PID" in args[9]
     assert kwargs["stdout"] is asyncio.subprocess.PIPE
     assert "shell" not in kwargs
 
@@ -198,3 +225,60 @@ async def test_select_is_single_flight_and_close_is_idempotent() -> None:
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await first
+
+
+@pytest.mark.anyio
+async def test_close_terminates_windows_dialog_pid_before_wsl_wrapper() -> None:
+    dialog = _StreamingProcess(
+        b'{"status":"started","pid":4242}\n',
+        b'{"status":"cancelled"}\n',
+    )
+    dialog_release = asyncio.Event()
+    terminated_windows_pids: list[int] = []
+
+    async def factory(*args, **kwargs):
+        return dialog
+
+    async def terminate_windows_process(pid: int) -> None:
+        terminated_windows_pids.append(pid)
+        dialog_release.set()
+
+    original_read = dialog.stdout.read
+
+    async def blocked_read() -> bytes:
+        await dialog_release.wait()
+        return await original_read()
+
+    dialog.stdout.read = blocked_read
+    picker = NativeWindowsFolderPicker(
+        is_wsl=lambda: True,
+        which=lambda name: f"/fake/{name}",
+        windows_launcher_executable="/fake/init",
+        subprocess_factory=factory,
+        windows_process_terminator=terminate_windows_process,
+    )
+
+    selection = asyncio.create_task(picker.select())
+    while picker._active_windows_pid is None:
+        await asyncio.sleep(0)
+    await picker.close()
+
+    assert terminated_windows_pids == [4242]
+    assert dialog.terminated is True
+    with pytest.raises(asyncio.CancelledError):
+        await selection
+
+
+@pytest.mark.anyio
+async def test_dialog_rejects_missing_or_malformed_pid_handshake() -> None:
+    async def missing(*args, **kwargs):
+        return _StreamingProcess(b'{"status":"cancelled"}\n', b"")
+
+    with pytest.raises(NativePickerInvalidResultError):
+        await _picker(missing).select()
+
+    async def malformed(*args, **kwargs):
+        return _StreamingProcess(b'{"status":"started","pid":"oops"}\n', b"")
+
+    with pytest.raises(NativePickerInvalidResultError):
+        await _picker(malformed).select()

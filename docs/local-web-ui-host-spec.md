@@ -137,7 +137,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - `TurnTaskManager` is a deep Host module with a small start, cancel, inspect, and shutdown interface. It owns task mappings and cleanup without becoming the source of Agent status.
 - The SSE adapter owns polling, framing, heartbeat, cursor recovery, and disconnect cleanup behind one streaming interface. Runtime and routes do not contain React-specific event reduction.
 - Workspace browsing is hidden behind a root policy interface that normalizes configured roots, checks containment without following symlinks, lists one level, and returns transport-safe entries.
-- Native Windows selection is hidden behind an injected `NativePickerAdapter`. It detects WSL/interop capability, launches a fixed UTF-8 PowerShell dialog through argv, translates the selected Windows path with system `wslpath`, and exposes idempotent close/shutdown. It never authorizes a workspace; the Host calls the same `WorkspaceBrowser.validate()` used by Thread creation.
+- Native Windows selection is hidden behind an injected `NativePickerAdapter`. It detects WSL/interop capability, launches a fixed UTF-8 PowerShell dialog through argv, translates the selected Windows path with system `wslpath`, and exposes idempotent close/shutdown. The PowerShell process emits its Windows PID before opening the dialog, allowing shutdown to terminate both that process and a WSL `/init` launcher instead of leaving a detached native dialog. It never authorizes a workspace; the Host calls the same `WorkspaceBrowser.validate()` used by Thread creation.
 
 ### Provider configuration and model discovery
 

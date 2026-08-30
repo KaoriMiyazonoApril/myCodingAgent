@@ -107,6 +107,8 @@ WINDOWS_FOLDER_DIALOG_SCRIPT = r"""
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $utf8
 $OutputEncoding = $utf8
+[ordered]@{ status = 'started'; pid = $PID } | ConvertTo-Json -Compress
+[Console]::Out.Flush()
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $dialog.Description = 'Select a workspace folder'
@@ -125,6 +127,7 @@ try {
 
 SubprocessFactory = Callable[..., Awaitable[Any]]
 WhichFunction = Callable[[str], str | None]
+WindowsProcessTerminator = Callable[[int], Awaitable[None]]
 
 
 class NativeWindowsFolderPicker:
@@ -148,6 +151,7 @@ class NativeWindowsFolderPicker:
         windows_launcher_executable: str | None = None,
         direct_interop_available: Callable[[], bool] | None = None,
         subprocess_factory: SubprocessFactory = asyncio.create_subprocess_exec,
+        windows_process_terminator: WindowsProcessTerminator | None = None,
         dialog_script: str = WINDOWS_FOLDER_DIALOG_SCRIPT,
     ) -> None:
         self._is_wsl_override = is_wsl
@@ -159,9 +163,14 @@ class NativeWindowsFolderPicker:
             direct_interop_available or self._system_direct_interop_available
         )
         self._subprocess_factory = subprocess_factory
+        self._windows_process_terminator = (
+            windows_process_terminator or self._terminate_windows_process_by_pid
+        )
         self._dialog_script = dialog_script
         self._active_task: asyncio.Task[Any] | None = None
         self._active_process: Any | None = None
+        self._active_windows_pid: int | None = None
+        self._dialog_pid_ready: asyncio.Event | None = None
 
     def capability(self) -> NativePickerCapability:
         """Detect WSL and both required interop executables without spawning."""
@@ -204,6 +213,8 @@ class NativeWindowsFolderPicker:
             return await self._run_dialog()
         finally:
             self._active_process = None
+            self._active_windows_pid = None
+            self._dialog_pid_ready = None
             if self._active_task is task:
                 self._active_task = None
 
@@ -271,7 +282,11 @@ class NativeWindowsFolderPicker:
         process = self._active_process
         task = self._active_task
         if process is not None:
-            await self._terminate_process(process)
+            pid_ready = self._dialog_pid_ready
+            if pid_ready is not None and not pid_ready.is_set():
+                with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+                    await asyncio.wait_for(pid_ready.wait(), timeout=1.0)
+            await self._terminate_dialog_process(process)
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, TimeoutError):
@@ -294,6 +309,7 @@ class NativeWindowsFolderPicker:
             raise WindowsInteropUnavailableError("PowerShell interop is unavailable")
 
         process: Any | None = None
+        self._dialog_pid_ready = asyncio.Event()
         try:
             invocation = self._windows_invocation(executable)
             process = await self._subprocess_factory(
@@ -311,10 +327,10 @@ class NativeWindowsFolderPicker:
                 stderr=asyncio.subprocess.PIPE,
             )
             self._active_process = process
-            stdout, _stderr = await process.communicate()
+            stdout = await self._read_dialog_output(process)
         except asyncio.CancelledError:
             if process is not None:
-                await self._terminate_process(process)
+                await self._terminate_dialog_process(process)
             raise
         except FileNotFoundError as error:
             raise WindowsInteropUnavailableError(
@@ -327,12 +343,84 @@ class NativeWindowsFolderPicker:
                 ) from error
             raise NativePickerProcessError("Native picker process could not start") from error
         finally:
+            if self._dialog_pid_ready is not None:
+                self._dialog_pid_ready.set()
             if self._active_process is process:
                 self._active_process = None
+            self._active_windows_pid = None
 
         if getattr(process, "returncode", None) not in (0, None):
             raise NativePickerProcessError("Native picker process failed")
         return _parse_dialog_result(stdout)
+
+    async def _read_dialog_output(self, process: Any) -> bytes | str | None:
+        """Read the PID handshake before waiting on the long-lived dialog."""
+
+        stdout_stream = getattr(process, "stdout", None)
+        stderr_stream = getattr(process, "stderr", None)
+        if not callable(getattr(stdout_stream, "readline", None)):
+            # Lightweight injected process doubles may expose communicate only.
+            stdout, _stderr = await process.communicate()
+            if self._dialog_pid_ready is not None:
+                self._dialog_pid_ready.set()
+            return stdout
+
+        first_line = await stdout_stream.readline()
+        self._active_windows_pid = _parse_dialog_started(first_line)
+        if self._dialog_pid_ready is not None:
+            self._dialog_pid_ready.set()
+
+        stdout_read = stdout_stream.read()
+        if callable(getattr(stderr_stream, "read", None)):
+            remaining, _stderr = await asyncio.gather(
+                stdout_read,
+                stderr_stream.read(),
+            )
+        else:
+            remaining = await stdout_read
+        wait = getattr(process, "wait", None)
+        if callable(wait):
+            result = wait()
+            if inspect.isawaitable(result):
+                await result
+        return remaining
+
+    async def _terminate_dialog_process(self, process: Any) -> None:
+        windows_pid = self._active_windows_pid
+        self._active_windows_pid = None
+        if windows_pid is not None:
+            with contextlib.suppress(OSError, TimeoutError):
+                await self._windows_process_terminator(windows_pid)
+        await self._terminate_process(process)
+
+    async def _terminate_windows_process_by_pid(self, windows_pid: int) -> None:
+        """Stop the Windows child hidden behind WSL's ``/init`` launcher."""
+
+        if windows_pid <= 0:
+            return
+        executable = self._find_powershell()
+        if executable is None:
+            return
+        invocation = self._windows_invocation(executable)
+        process = await self._subprocess_factory(
+            *invocation,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Stop-Process -Id ([int]$args[0]) -Force -ErrorAction SilentlyContinue",
+            str(windows_pid),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        communicate = getattr(process, "communicate", None)
+        if callable(communicate):
+            with contextlib.suppress(asyncio.CancelledError, OSError, TimeoutError):
+                await asyncio.wait_for(
+                    communicate(),
+                    timeout=self._PROCESS_REAP_TIMEOUT_SECONDS,
+                )
 
     def _find_powershell(self) -> str | None:
         if self._powershell_executable is not None:
@@ -440,6 +528,31 @@ def _parse_dialog_result(stdout: bytes | str | None) -> NativePickerSelection:
             )
         return NativePickerSelection.selected(path)
     raise NativePickerInvalidResultError("Native picker returned an unknown status")
+
+
+def _parse_dialog_started(line: bytes | str | None) -> int:
+    try:
+        if isinstance(line, bytes):
+            text = line.decode("utf-8")
+        elif isinstance(line, str):
+            text = line
+        else:
+            raise TypeError("dialog handshake is not text")
+        payload = json.loads(text.strip())
+    except (UnicodeDecodeError, TypeError, json.JSONDecodeError) as error:
+        raise NativePickerInvalidResultError(
+            "Native picker returned a malformed startup handshake"
+        ) from error
+    if not isinstance(payload, Mapping) or payload.get("status") != "started":
+        raise NativePickerInvalidResultError(
+            "Native picker returned an invalid startup handshake"
+        )
+    pid = payload.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise NativePickerInvalidResultError(
+            "Native picker returned an invalid process identifier"
+        )
+    return pid
 
 
 def _decode_translation_output(stdout: bytes | str | None) -> str:
