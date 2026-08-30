@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, test, vi } from "vitest";
 
 import { App } from "./App";
@@ -54,18 +54,22 @@ beforeEach(() => {
   );
 });
 
-test("starts in provider setup mode without hiding the host state", async () => {
+test("starts with a compact empty state when no model is configured", async () => {
   render(<App />);
 
   expect(
-    await screen.findByRole("heading", { name: "Connect a model provider" }),
+    await screen.findByRole("heading", { name: "选择一个项目开始" }),
+  ).toBeInTheDocument();
+  expect(screen.getAllByText("尚未配置模型").length).toBeGreaterThan(0);
+  expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "设置" }));
+  expect(
+    await screen.findByRole("heading", { name: "模型与服务商" }),
   ).toBeInTheDocument();
   expect(screen.getByText("DeepSeek")).toBeInTheDocument();
   expect(screen.getByText("Moonshot / Kimi")).toBeInTheDocument();
   expect(screen.getByText("GLM")).toBeInTheDocument();
-  expect(
-    screen.getByText(/Provider setup required before creating a thread\./),
-  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "连接 DeepSeek" })).toBeInTheDocument();
 });
 
 test("saves a key, discovers models, and selects a default", async () => {
@@ -159,26 +163,27 @@ test("saves a key, discovers models, and selects a default", async () => {
   );
   render(<App />);
 
+  fireEvent.click(screen.getByRole("button", { name: "设置" }));
   fireEvent.click(
-    await screen.findByRole("button", { name: "Configure DeepSeek" }),
+    await screen.findByRole("button", { name: "连接 DeepSeek" }),
   );
-  const key = screen.getByLabelText("API key");
+  const key = screen.getByLabelText("访问密钥");
   fireEvent.change(key, { target: { value: "sk-api-secret" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save and discover" }));
+  fireEvent.click(screen.getByRole("button", { name: "保存并发现模型" }));
 
   expect(
     await screen.findByRole("option", { name: "deepseek-reasoner" }),
   ).toBeInTheDocument();
   expect(key).toHaveValue("");
-  expect(screen.getByText("Key saved · ••••cret")).toBeInTheDocument();
+  expect(screen.getByText("凭据已保存 · ••••cret")).toBeInTheDocument();
 
-  fireEvent.change(screen.getByLabelText("Provider model"), {
+  fireEvent.change(screen.getByLabelText("服务商模型"), {
     target: { value: "deepseek-reasoner" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Use as default" }));
+  fireEvent.click(screen.getByRole("button", { name: "设为默认" }));
 
-  expect((await screen.findAllByText("Default provider")).length).toBeGreaterThan(0);
-  fireEvent.click(screen.getByRole("button", { name: "Refresh models" }));
+  expect((await screen.findAllByText("默认")).length).toBeGreaterThan(0);
+  fireEvent.click(screen.getByRole("button", { name: "刷新模型" }));
   await waitFor(() =>
     expect(
       requests.filter(({ path }) => path.endsWith("/models/discover")),
@@ -251,13 +256,14 @@ test("shows provider request failures inline", async () => {
   });
 
   render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "设置" }));
   fireEvent.click(
-    await screen.findByRole("button", { name: "Configure DeepSeek" }),
+    await screen.findByRole("button", { name: "连接 DeepSeek" }),
   );
-  fireEvent.change(screen.getByLabelText("API key"), {
+  fireEvent.change(screen.getByLabelText("访问密钥"), {
     target: { value: "rejected-key" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Save and discover" }));
+  fireEvent.click(screen.getByRole("button", { name: "保存并发现模型" }));
 
   expect(
     await screen.findByRole("alert"),
@@ -313,12 +319,18 @@ test("navigates Host workspaces and selects the current directory", async () => 
   render(<App />);
 
   expect(
-    await screen.findByRole("heading", { name: "Choose a workspace" }),
+    await screen.findByRole("heading", { name: "选择一个项目开始" }),
   ).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Open project" }));
+  fireEvent.click(screen.getByRole("button", { name: "选择项目" }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
+  expect(await screen.findByRole("heading", { name: "打开项目" })).toBeInTheDocument();
+  const dialog = await screen.findByRole("dialog");
+  fireEvent.click(within(dialog).getByRole("button", { name: "打开 project" }));
+  await waitFor(() => expect(workspaceRequests.length).toBeGreaterThan(1));
   expect(await screen.findByText("/home/student/project")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Use this workspace" }));
-  expect(screen.getByText("Selected · /home/student/project")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "使用此项目" }));
+  expect(screen.getByRole("button", { name: "当前项目：project" })).toBeInTheDocument();
+  expect(screen.queryByText("/home/student/project")).not.toBeInTheDocument();
   expect(workspaceRequests).toContain(
     "/api/workspaces?path=%2Fhome%2Fstudent%2Fproject",
   );
@@ -360,9 +372,11 @@ test("keeps workspace errors visible with a reload action", async () => {
 
   render(<App />);
 
-  expect(await screen.findByText("Workspace unavailable")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "选择项目" }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
+  expect(await screen.findByText("项目不可用")).toBeInTheDocument();
   expect(screen.getByText("Workspace path is not accessible")).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Reload roots" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "重新加载根目录" })).toBeInTheDocument();
 });
 
 test("creates switches refreshes and closes Host threads", async () => {
@@ -390,7 +404,47 @@ test("creates switches refreshes and closes Host threads", async () => {
         },
         version: 0,
       },
-      messages: [],
+      messages:
+        id === "thread-existing"
+          ? [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: "修复浏览器恢复时的重复事件",
+                  },
+                ],
+              },
+              {
+                role: "assistant",
+                content: [
+                  {
+                    type: "text",
+                    text: "我先检查当前实现。",
+                  },
+                  {
+                    type: "tool_call",
+                    id: "call-read",
+                    name: "read_file",
+                    arguments: { path: "src/example.py" },
+                  },
+                ],
+              },
+              {
+                role: "tool",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_call_id: "call-read",
+                    ok: true,
+                    content: "print('example')",
+                    error_code: null,
+                  },
+                ],
+              },
+            ]
+          : [],
       created_at: "2026-08-29T00:00:00Z",
       updated_at: "2026-08-29T00:00:00Z",
       latest_turn:
@@ -523,79 +577,116 @@ test("creates switches refreshes and closes Host threads", async () => {
 
   render(<App />);
   expect(
-    await screen.findByRole("navigation", { name: "Workspace and threads" }),
+    await screen.findByRole("button", {
+      name: /修复浏览器恢复时的重复事件/,
+    }),
   ).toBeInTheDocument();
   expect(
-    screen.getByRole("region", { name: "Agent conversation" }),
+    screen.getByRole("button", { name: "当前项目：old" }),
   ).toBeInTheDocument();
-  expect(screen.getByRole("complementary", { name: "Activity" })).toBeInTheDocument();
-  expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
-    "Iterations2",
-  );
-  expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
-    "Input tokens8",
-  );
-  expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
-    "Stop reasoncompleted",
-  );
-  expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
-    "src/example.py",
-  );
+  expect(screen.queryByText("thread-existing")).not.toBeInTheDocument();
   expect(
-    screen.getByLabelText("Conversation file changes"),
+    screen.getByRole("heading", { name: "修复浏览器恢复时的重复事件" }),
+  ).toBeInTheDocument();
+  const conversation = screen.getByRole("region", { name: "编码助手对话" });
+  expect(conversation).not.toHaveTextContent("/home/student/old");
+  expect(conversation).not.toHaveTextContent("settings v0");
+  const workProcess = screen.getByLabelText("编码助手工作过程");
+  expect(workProcess).toHaveTextContent("读取文件");
+  expect(workProcess).toHaveTextContent("src/example.py");
+  fireEvent.click(within(workProcess).getByText("技术详情"));
+  expect(workProcess).toHaveTextContent("read_file");
+  fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
+  expect(screen.getByRole("menuitem", { name: "对话详情" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("menuitem", { name: "对话详情" }));
+  const details = screen.getByLabelText("对话详情");
+  expect(details).toHaveTextContent("thread-existing");
+  expect(details).toHaveTextContent("/home/student/old");
+  expect(details).toHaveTextContent("设置版本0");
+  fireEvent.click(screen.getByRole("button", { name: "关闭对话详情" }));
+  expect(
+    await screen.findByRole("navigation", { name: "对话记录" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("region", { name: "编码助手对话" }),
+  ).toBeInTheDocument();
+  const contextPanel = screen.getByRole("complementary", { name: "动态与修改" });
+  expect(contextPanel).not.toHaveTextContent("迭代次数2");
+  expect(screen.getByRole("button", { name: "展开动态与修改" })).toHaveTextContent(
+    "修改 1",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "展开动态与修改" }));
+  expect(await screen.findByRole("tab", { name: "动态" })).toHaveAttribute(
+    "aria-selected",
+    "false",
+  );
+  expect(screen.getByRole("tab", { name: "修改 1" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  expect(contextPanel).toHaveTextContent("src/example.py");
+  expect(contextPanel).toHaveTextContent("差异可能不完整");
+  expect(
+    screen.getByLabelText("对话文件修改"),
   ).toHaveTextContent("src/example.py");
-  expect(screen.getByRole("complementary", { name: "Activity" })).toHaveTextContent(
-    "Diff may be incomplete",
-  );
-  expect(screen.getByRole("button", { name: "Show navigation" })).toHaveAttribute(
+  fireEvent.click(screen.getByRole("tab", { name: "动态" }));
+  expect(contextPanel).toHaveTextContent("迭代次数2");
+  expect(contextPanel).toHaveTextContent("输入令牌8");
+  fireEvent.click(screen.getByRole("button", { name: "收起动态与修改" }));
+  expect(screen.getByRole("button", { name: "显示对话记录" })).toHaveAttribute(
     "aria-pressed",
     "false",
   );
-  fireEvent.click(screen.getByRole("button", { name: "Show navigation" }));
-  expect(screen.getByRole("button", { name: "Show navigation" })).toHaveAttribute(
+  fireEvent.click(screen.getByRole("button", { name: "显示对话记录" }));
+  expect(screen.getByRole("button", { name: "显示对话记录" })).toHaveAttribute(
     "aria-pressed",
     "true",
   );
-  fireEvent.click(screen.getByRole("button", { name: "Show conversation" }));
+  fireEvent.click(screen.getByRole("button", { name: "显示对话" }));
   expect(
-    await screen.findByRole("heading", { name: "thread-existing" }),
+    await screen.findByRole("heading", { name: "修复浏览器恢复时的重复事件" }),
   ).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Use this workspace" }));
-  fireEvent.click(screen.getByRole("button", { name: "New thread" }));
+  fireEvent.click(screen.getByRole("button", { name: "当前项目：old" }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "使用此项目" }));
+  fireEvent.click(screen.getByRole("button", { name: "新对话" }));
 
   expect(
-    await screen.findByRole("heading", { name: "thread-new" }),
+    await screen.findByRole("heading", { name: "新对话" }),
   ).toBeInTheDocument();
-  expect(screen.getAllByText("/home/student/project").length).toBeGreaterThan(0);
-  expect(screen.getByText("DeepSeek · deepseek-chat · settings v0")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Thread settings" }));
-  fireEvent.change(screen.getByLabelText("Thread model"), {
+  expect(
+    screen.getByRole("heading", { name: "想让编码助手做什么？" }),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "解释这个项目" }));
+  expect(screen.getByLabelText("询问编码助手")).toHaveValue("解释这个项目");
+  expect(screen.queryByText("/home/student/project")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
+  fireEvent.change(screen.getByLabelText("对话模型"), {
     target: { value: "deepseek-reasoner" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Save thread settings" }));
-  expect(
-    await screen.findByText("DeepSeek · deepseek-reasoner · settings v1"),
-  ).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Thread settings" }));
-  fireEvent.change(screen.getByLabelText("Thread model"), {
+  fireEvent.click(screen.getByRole("button", { name: "保存对话设置" }));
+  await waitFor(() =>
+    expect(screen.queryByLabelText("对话设置")).not.toBeInTheDocument(),
+  );
+  fireEvent.click(await screen.findByRole("button", { name: "对话选项" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
+  fireEvent.change(screen.getByLabelText("对话模型"), {
     target: { value: "stale-model" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Save thread settings" }));
+  fireEvent.click(screen.getByRole("button", { name: "保存对话设置" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Settings update failed · Thread settings changed",
+    "更新对话设置失败 · Thread settings changed",
   );
-  fireEvent.click(screen.getByRole("button", { name: "Refresh active thread" }));
+  fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "刷新状态" }));
   await waitFor(() =>
     expect(requests.some(({ path }) => path === "/api/threads/thread-new")).toBe(true),
   );
-  fireEvent.click(screen.getByRole("button", { name: "Close active thread" }));
-  expect(
-    await screen.findByText(
-      (_, element) =>
-        element?.classList.contains("thread-status") === true &&
-        element.textContent === "Status · closed",
-    ),
-  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "关闭对话" }));
+  expect(await screen.findByText("此对话已关闭")).toBeInTheDocument();
+  expect(screen.getByLabelText("询问编码助手")).toBeDisabled();
   expect(requests).toEqual(
     expect.arrayContaining([
       {
@@ -771,15 +862,21 @@ test("submits multiline work and stops through Host commands", async () => {
   );
 
   render(<App />);
-  const composer = await screen.findByLabelText("Ask Agent");
+  const composer = await screen.findByLabelText("询问编码助手");
   const threadReadsBeforeSubmit = requests.filter(
     ({ path, method }) =>
       path === "/api/threads/thread-1" && method === "GET",
   ).length;
   fireEvent.change(composer, { target: { value: "First line\nSecond line" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
-  expect(await screen.findByText("Starting…")).toBeInTheDocument();
+  expect(await screen.findByText("正在启动编码助手…")).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: "First line Second line" }),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "编码助手对话" })).toHaveTextContent(
+    "First line Second line",
+  );
   await waitFor(() =>
     expect(
       requests.filter(
@@ -788,8 +885,8 @@ test("submits multiline work and stops through Host commands", async () => {
       ).length,
     ).toBeGreaterThan(threadReadsBeforeSubmit),
   );
-  fireEvent.click(screen.getByRole("button", { name: "Stop" }));
-  expect(await screen.findByText("Cancelling…")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "停止" }));
+  expect(await screen.findByText("正在停止…")).toBeInTheDocument();
   expect(requests).toEqual(
     expect.arrayContaining([
       {
