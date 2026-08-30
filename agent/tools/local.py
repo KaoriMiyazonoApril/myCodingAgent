@@ -10,6 +10,7 @@ from typing import cast
 
 import regex
 
+from agent.tools.apply_patch import apply_patch
 from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem
 from agent.tools.process import CommandRunner, CommandSandboxBackend
 from agent.tools.registry import ToolRegistry
@@ -111,6 +112,22 @@ def _edit_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) ->
     return ToolResult(
         content=f"edited {relative}",
         metadata={"path": relative, "replacements": replacements},
+    )
+
+
+def _apply_patch(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> ToolResult:
+    result = apply_patch(filesystem, arguments["patch"])
+    return ToolResult(
+        content=(
+            f"applied patch to {len(result.affected_paths)} file"
+            f"{'s' if len(result.affected_paths) != 1 else ''}"
+        ),
+        metadata={
+            "affected_paths": result.affected_paths,
+            "added_count": result.added_count,
+            "updated_count": result.updated_count,
+            "deleted_count": result.deleted_count,
+        },
     )
 
 
@@ -302,6 +319,17 @@ def create_local_tool_registry(
             ),
         ),
         lambda arguments: _edit_file(filesystem, arguments),
+    )
+    registry.register(
+        ToolDefinition(
+            name="apply_patch",
+            description="Atomically apply ordered add, update, and delete file operations.",
+            parameters=_object_schema(
+                {"patch": {"type": "string", "minLength": 1}},
+                ["patch"],
+            ),
+        ),
+        lambda arguments: _apply_patch(filesystem, arguments),
     )
     registry.register(
         ToolDefinition(

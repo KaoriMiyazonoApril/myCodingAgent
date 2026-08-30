@@ -97,7 +97,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 - Approval workflows, user interaction, general permission policy, and command authorization beyond the mandatory workspace sandbox.
 - Agent-loop control, conversation-history mutation, UI communication, and conversion of execution results into conversation result blocks.
 - Persistent command sessions, stdin streaming, job management, process reattachment, cancellation tokens beyond coroutine cancellation, and production command sandbox backends other than bubblewrap.
-- `apply_patch`, git-specific, browser, web, MCP, or subagent tools.
+- git-specific, browser, web, MCP, or subagent tools.
 - Arbitrary shell-command translation between operating systems.
 - Ripgrep integration, pluggable search backends, parallel tool execution, deferred-tool exposure, tool search, and registry production features beyond the MVP.
 - Full ACL, extended-attribute, ownership, or durability management during writes.
@@ -131,9 +131,13 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
   文件修改越过 workspace lease 生命周期。其 `close()` 幂等调用组合层注入的资源清理回调，
   关闭后所有执行请求均 fail closed。
 - `local.py` 显式组合共享的文件系统与进程服务，并注册
-  `read_file`、`write_file`、`edit_file`、`glob`、`grep`、`run_command` 六个工具。
+  `read_file`、`write_file`、`edit_file`、`apply_patch`、`glob`、`grep`、`run_command` 七个工具。
   组合函数可显式接收一个 `CommandSandboxBackend`；未提供时只使用生产 Bubblewrap，
   capability probe 失败即终止组合，不会回退到 host shell。
+- `apply_patch.py` 解析结构化 `Begin/End Patch` 文档，支持有序的多文件 add/update/delete
+  操作。所有路径、文本和 hunk 会在首个写入前完成校验；提交阶段使用
+  `WorkspaceFilesystem` 的原子文件替换，并在中途 I/O 失败时按逆序恢复已提交文件。
+  工具结果显式返回有序 `affected_paths` 与 add/update/delete 计数。
 
 所有工具定义均使用关闭的对象 schema（`additionalProperties: false`）。文件查询与搜索
 结果均使用工作区相对的 POSIX 路径；工具路径或搜索遍历遇到任何 symbolic link 都以

@@ -9,12 +9,13 @@ from pathlib import Path
 
 from agent.core.messages import ToolCallBlock
 from agent.tools.types import ToolResult
-from agent.tools.filesystem import content_fingerprint
+from agent.tools.apply_patch import parse_patch
+from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem, content_fingerprint
 
 from .events import TurnEventEmitter
 
 
-_MUTATING_FILE_TOOLS = frozenset({"write_file", "edit_file"})
+_MUTATING_FILE_TOOLS = frozenset({"write_file", "edit_file", "apply_patch"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,38 +39,49 @@ class _FileKind(str, Enum):
 class ChangeTracker:
     """Track file-tool changes completely and command changes conservatively."""
 
-    def __init__(self, workspace: Path, events: TurnEventEmitter) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        events: TurnEventEmitter,
+        filesystem: WorkspaceFilesystem | None = None,
+    ) -> None:
         self._workspace = workspace
+        self._filesystem = filesystem or WorkspaceFilesystem(workspace)
         self._events = events
         self._known: dict[str, str] = {}
         self._originals: dict[str, _FileState] = {}
         self._finals: dict[str, _FileState] = {}
-        self._prepared: dict[str, str] = {}
+        self._prepared: dict[str, tuple[str, ...]] = {}
         self._order: list[str] = []
         self.diff_complete = True
 
     def before_execution(self, call: ToolCallBlock) -> ToolResult | None:
         if call.name not in _MUTATING_FILE_TOOLS:
             return None
-        resolved = self._resolve_call_path(call)
-        if resolved is None:
+        paths = self._resolve_call_paths(call)
+        if paths is None:
             return None
-        path, relative = resolved
-        current = self._snapshot(path)
-        known = self._known.get(relative)
-        if known is not None and known != current.fingerprint:
-            return ToolResult(
-                content=(
-                    f"file changed since it was last read: {relative}; "
-                    "read it again before writing"
-                ),
-                metadata={"path": relative, "executed": False},
-                error_code="FILE_CHANGED",
-            )
-        if relative not in self._originals:
-            self._originals[relative] = current
-            self._order.append(relative)
-        self._prepared[call.id] = relative
+        current_states = [(path, relative, self._snapshot(path)) for path, relative in paths]
+        for _, relative, current in current_states:
+            known = self._known.get(relative)
+            if known is not None and known != current.fingerprint:
+                return ToolResult(
+                    content=(
+                        f"file changed since it was last read: {relative}; "
+                        "read it again before writing"
+                    ),
+                    metadata={
+                        "path": relative,
+                        "paths": [item[1] for item in current_states],
+                        "executed": False,
+                    },
+                    error_code="FILE_CHANGED",
+                )
+        for _, relative, current in current_states:
+            if relative not in self._originals:
+                self._originals[relative] = current
+                self._order.append(relative)
+        self._prepared[call.id] = tuple(relative for _, relative, _ in current_states)
         return None
 
     def after_execution(self, call: ToolCallBlock, result: ToolResult) -> None:
@@ -84,21 +96,22 @@ class ChangeTracker:
             return
         if call.name not in _MUTATING_FILE_TOOLS:
             return
-        relative = self._prepared.pop(call.id, None)
-        if relative is None:
+        relatives = self._prepared.pop(call.id, None)
+        if relatives is None:
             return
-        previous = self._finals.get(relative, self._originals[relative])
-        final = self._snapshot(self._workspace / relative)
-        self._known[relative] = final.fingerprint
-        self._finals[relative] = final
-        change = self._diff_record(relative)
-        if change is not None:
-            self._events.emit("file_changed", change)
-        elif previous != final:
-            self._events.emit(
-                "file_changed",
-                {"path": relative, "change_type": "reverted", "diff": ""},
-            )
+        for relative in relatives:
+            previous = self._finals.get(relative, self._originals[relative])
+            final = self._snapshot(self._workspace / relative)
+            self._known[relative] = final.fingerprint
+            self._finals[relative] = final
+            change = self._diff_record(relative)
+            if change is not None:
+                self._events.emit("file_changed", change)
+            elif previous != final:
+                self._events.emit(
+                    "file_changed",
+                    {"path": relative, "change_type": "reverted", "diff": ""},
+                )
 
     def execution_interrupted(self, call: ToolCallBlock) -> None:
         if call.name == "run_command":
@@ -119,24 +132,42 @@ class ChangeTracker:
             return
         self._known[relative] = f"{_FileKind.FILE.value}:{fingerprint}"
 
+    def _resolve_call_paths(
+        self,
+        call: ToolCallBlock,
+    ) -> list[tuple[Path, str]] | None:
+        if call.arguments is None:
+            return None
+        if call.name == "apply_patch":
+            try:
+                paths = parse_patch(call.arguments.get("patch")).affected_paths
+            except ToolOperationError:
+                # The registry owns the structured parser error. Do not make
+                # an invalid patch look like a tracker conflict.
+                return None
+            resolved: list[tuple[Path, str]] = []
+            for raw_path in paths:
+                try:
+                    resolved.append(self._filesystem.resolve(raw_path))
+                except ToolOperationError:
+                    return None
+            return resolved
+        raw_path = call.arguments.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            return None
+        try:
+            return [self._filesystem.resolve(raw_path)]
+        except ToolOperationError:
+            return None
+
     def _resolve_call_path(
         self,
         call: ToolCallBlock,
     ) -> tuple[Path, str] | None:
-        if call.arguments is None:
-            return None
-        raw_path = call.arguments.get("path")
-        if not isinstance(raw_path, str) or not raw_path:
-            return None
-        candidate = Path(raw_path)
-        if candidate.is_absolute():
-            return None
-        try:
-            target = (self._workspace / candidate).resolve()
-            relative = target.relative_to(self._workspace).as_posix()
-        except (OSError, RuntimeError, ValueError):
-            return None
-        return target, relative
+        """Compatibility helper for callers that track one file call."""
+
+        paths = self._resolve_call_paths(call)
+        return None if not paths else paths[0]
 
     @staticmethod
     def _snapshot(path: Path) -> _FileState:

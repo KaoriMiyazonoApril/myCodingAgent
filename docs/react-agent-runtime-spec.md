@@ -110,6 +110,9 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   `read_file` 与文件写入会刷新已知内容指纹，外部变化在覆盖前返回 `FILE_CHANGED`，模型
   重新读取后可安全重试。只由文件工具修改的 Turn 报告 `diff_complete = true`；实际执行过
   `run_command` 的 Turn 保守报告 `false`，且不会猜测无法恢复 original 的命令改动文件。
+- Workstream B Phase 2 将 `apply_patch` 纳入同一 ChangeTracker seam：一次结构化 patch 的
+  多个路径先整体检查版本冲突，再按文档顺序记录 original/final 并发出 `file_changed`；
+  patch parser 和 WorkspaceFilesystem 提供无部分修改的预检及提交失败逆序恢复。
 - Ticket 09 已实现严格 workspace 安全：Thread 创建拒绝 symlink 根，每个 Turn 在模型调用前
   完整扫描普通条目并拒绝 symbolic link、regular-file hard link 和嵌套 mount/bind mount；
   扫描按条目数与单调时间双预算 fail closed 为 `WORKSPACE_VALIDATION_LIMIT`。文件工具路径

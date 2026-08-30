@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
@@ -58,6 +59,15 @@ class ToolOperationError(Exception):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class FileSnapshot:
+    """Recoverable state for one regular workspace file."""
+
+    exists: bool
+    content: bytes | None
+    mode: int | None = None
 
 
 class WorkspaceFilesystem:
@@ -264,6 +274,95 @@ class WorkspaceFilesystem:
                 temporary_path.unlink(missing_ok=True)
             raise ToolOperationError("IO_ERROR", f"could not write file: {relative}") from error
         return relative, content_bytes
+
+    def snapshot(self, raw_path: object) -> FileSnapshot:
+        """Capture one path without following a final symbolic link."""
+
+        target, relative = self.resolve(raw_path)
+        try:
+            metadata = os.stat(target, follow_symlinks=False)
+        except FileNotFoundError:
+            return FileSnapshot(exists=False, content=None)
+        except OSError as error:
+            raise ToolOperationError("IO_ERROR", f"could not inspect file: {relative}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            return FileSnapshot(exists=True, content=None, mode=stat.S_IMODE(metadata.st_mode))
+        if metadata.st_nlink > 1:
+            raise ToolOperationError("WORKSPACE_LINK", "workspace hard links are forbidden")
+        if metadata.st_size > MAX_TEXT_FILE_BYTES:
+            raise ToolOperationError(
+                "FILE_TOO_LARGE",
+                f"file exceeds the {MAX_TEXT_FILE_BYTES}-byte resource limit: {relative}",
+            )
+        try:
+            content = target.read_bytes()
+        except OSError as error:
+            raise ToolOperationError("IO_ERROR", f"could not read file: {relative}") from error
+        return FileSnapshot(
+            exists=True,
+            content=content,
+            mode=stat.S_IMODE(metadata.st_mode),
+        )
+
+    def remove_file(self, raw_path: object) -> str:
+        """Unlink one regular workspace file without following links."""
+
+        target, relative = self.resolve(raw_path)
+        try:
+            metadata = os.stat(target, follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise ToolOperationError("NOT_FOUND", f"file not found: {relative}") from error
+        except OSError as error:
+            raise ToolOperationError("IO_ERROR", f"could not inspect file: {relative}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ToolOperationError("NOT_A_FILE", f"not a regular file: {relative}")
+        try:
+            target.unlink()
+        except FileNotFoundError as error:
+            raise ToolOperationError("NOT_FOUND", f"file not found: {relative}") from error
+        except OSError as error:
+            raise ToolOperationError("IO_ERROR", f"could not delete file: {relative}") from error
+        return relative
+
+    def restore_snapshot(self, raw_path: object, snapshot: FileSnapshot) -> str:
+        """Restore a snapshot using an internal atomic write path.
+
+        This intentionally does not call ``write_text_file``: rollback must
+        remain available when a public commit operation has been injected to
+        fail.
+        """
+
+        target, relative = self.resolve(raw_path)
+        if not snapshot.exists:
+            try:
+                metadata = os.stat(target, follow_symlinks=False)
+            except FileNotFoundError:
+                return relative
+            except OSError as error:
+                raise ToolOperationError("IO_ERROR", f"could not inspect file: {relative}") from error
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ToolOperationError("NOT_A_FILE", f"not a regular file: {relative}")
+            try:
+                target.unlink()
+            except OSError as error:
+                raise ToolOperationError("IO_ERROR", f"could not restore file: {relative}") from error
+            return relative
+
+        if snapshot.content is None:
+            raise ToolOperationError("IO_ERROR", f"snapshot is not a regular file: {relative}")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="wb", dir=target.parent, delete=False) as temporary:
+                temporary.write(snapshot.content)
+                temporary_path = Path(temporary.name)
+            if snapshot.mode is not None:
+                os.chmod(temporary_path, snapshot.mode)
+            os.replace(temporary_path, target)
+        except OSError as error:
+            if "temporary_path" in locals():
+                temporary_path.unlink(missing_ok=True)
+            raise ToolOperationError("IO_ERROR", f"could not restore file: {relative}") from error
+        return relative
 
     def regular_files(self, raw_path: object = ".") -> Iterator[tuple[Path, str]]:
         """Yield regular files beneath a selected workspace directory in stable order."""

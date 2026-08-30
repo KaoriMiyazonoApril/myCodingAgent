@@ -1029,7 +1029,7 @@ def test_tool_composition_rejects_a_workspace_with_a_symlink_parent(tmp_path) ->
         create_test_tool_registry(linked_parent / "workspace")
 
 
-def test_all_six_definitions_are_closed_object_schemas(tmp_path) -> None:
+def test_all_filesystem_definitions_are_closed_object_schemas(tmp_path) -> None:
     registry = create_test_tool_registry(tmp_path)
     definitions = registry.definitions()
 
@@ -1037,6 +1037,7 @@ def test_all_six_definitions_are_closed_object_schemas(tmp_path) -> None:
         "read_file",
         "write_file",
         "edit_file",
+        "apply_patch",
         "glob",
         "grep",
         "run_command",
