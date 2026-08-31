@@ -293,12 +293,19 @@ def test_completed_thread_accepts_a_second_turn_with_preserved_history(
         ("course-provider", "course-model"),
         ("course-provider", "course-model"),
     ]
-    assert provider.requests[1].messages == [
-        provider.requests[0].messages[0],
+    assert provider.requests[1].messages[1:] == [
         Message(role="user", content=[TextBlock(text="First question.")]),
         Message(role="assistant", content=[TextBlock(text="First answer.")]),
         Message(role="user", content=[TextBlock(text="Second question.")]),
     ]
+    assert provider.requests[1].messages[0].content[0] == (
+        provider.requests[0].messages[0].content[0]
+    )
+    assert provider.requests[0].messages[0].content[1] != (
+        provider.requests[1].messages[0].content[1]
+    )
+    assert "runtime_context:" in provider.requests[0].messages[0].content[1].text
+    assert "task_state:" in provider.requests[0].messages[0].content[1].text
 
 
 def test_thread_settings_reject_a_stale_version_without_overwriting(

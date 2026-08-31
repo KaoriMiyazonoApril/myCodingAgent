@@ -37,6 +37,24 @@ class ContextBudget:
             1, min(4096, context_window_tokens // 4)
         )
 
+    @property
+    def context_window_tokens(self) -> int:
+        """Configured model window used by the assembly owner."""
+
+        return self._context_window_tokens
+
+    @property
+    def output_reserve_tokens(self) -> int:
+        """Conservative output reservation excluded from input capacity."""
+
+        return self._output_reserve
+
+    @property
+    def input_budget_tokens(self) -> int:
+        """Maximum estimated input size accepted for this request."""
+
+        return max(0, self._context_window_tokens - self._output_reserve)
+
     def ensure_fits(
         self,
         messages: list[Message],

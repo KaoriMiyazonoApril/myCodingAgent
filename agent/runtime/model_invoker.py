@@ -22,7 +22,6 @@ from agent.model.types import (
 )
 from agent.tools.types import ToolDefinition
 
-from .context_budget import ContextBudget
 from .message_assembler import MessageAssembler
 from .settings import TurnConfig
 
@@ -41,13 +40,10 @@ class ModelInvoker:
         self._provider = provider
         self._config = config
         self._retry_delays = retry_delays
-        self._context_budget = ContextBudget(
-            context_window_tokens=(
-                provider.capabilities.context_window_tokens
-                or default_context_window_tokens
-            ),
-            output_tokens=config.max_tokens,
-        )
+        # ContextManager owns request assembly and capacity checks. Keep the
+        # old constructor option for embedders while making this invoker a
+        # pure prepared-request executor.
+        del default_context_window_tokens
         if config.thinking is not None:
             config.thinking.validate_for(provider.capabilities.thinking)
 
@@ -56,7 +52,6 @@ class ModelInvoker:
         messages: list[Message],
         tools: list[ToolDefinition],
     ) -> LLMResponse:
-        self.ensure_context(messages, tools)
         request = LLMRequest(
             messages=list(messages),
             tools=tools,
@@ -92,7 +87,6 @@ class ModelInvoker:
     ) -> LLMResponse:
         """Stream one response, retrying only before provisional output appears."""
 
-        self.ensure_context(messages, tools)
         request = LLMRequest(
             messages=list(messages),
             tools=tools,
@@ -174,6 +168,6 @@ class ModelInvoker:
         messages: list[Message],
         tools: list[ToolDefinition],
     ) -> None:
-        """Reject an oversized request before contacting the provider."""
+        """Retained compatibility hook; ContextManager owns this check now."""
 
-        self._context_budget.ensure_fits(messages, tools)
+        del messages, tools

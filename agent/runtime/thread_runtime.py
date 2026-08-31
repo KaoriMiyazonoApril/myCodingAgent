@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,6 +16,14 @@ from agent.tools.registry import ToolRegistry
 
 from .conversation import Conversation
 from .change_tracker import ChangeTracker
+from .context import (
+    BaseSystemInstructions,
+    ContextManager,
+    RuntimeContext,
+    StaticProjectInstructionsProvider,
+    TaskState,
+)
+from .context_budget import ContextBudget
 from .errors import (
     ApprovalTimeoutError,
     ContextLimitError,
@@ -164,9 +173,15 @@ class ThreadRuntime:
         self._tool_registry_factory = tool_registry_factory
         self._provider_resolver = provider_resolver
         self._default_settings = default_settings
-        self._system_prompt = (prompt_builder or PromptBuilder()).build(
+        self._base_system_instructions = BaseSystemInstructions(
+            (prompt_builder or PromptBuilder()).build()
+        )
+        self._project_instructions_provider = StaticProjectInstructionsProvider(
             additional_system_instructions
         )
+        # Conversation persists the stable base only. Project/runtime/task
+        # sections are assembled into detached model requests by ContextManager.
+        self._system_prompt = self._base_system_instructions.text
         self._loop = AgentLoop()
         self._threads: dict[str, _ThreadRecord] = {}
         self._event_buffer_capacity = event_buffer_capacity
@@ -529,9 +544,18 @@ class ThreadRuntime:
                 retry_delays=self._model_retry_delays,
                 default_context_window_tokens=self._default_context_window_tokens,
             )
-            model.ensure_context(
-                record.conversation.prospective_request_messages(user_text),
-                record.tools.definitions(),
+            task_state = TaskState(goal=user_text)
+            context_manager = self._context_manager_for(
+                record,
+                turn_config,
+                provider,
+            )
+            context_manager.assemble(
+                record.conversation.canonical_messages(),
+                current_input=user_text,
+                runtime_context=self._runtime_context_for(record, turn_config),
+                task_state=task_state,
+                tools=record.tools.definitions(),
             )
             workspace_lease = self._workspace_leases.acquire(record.workspace)
             if record.status is ThreadStatus.CLOSED or record.closing:
@@ -595,7 +619,14 @@ class ThreadRuntime:
                     },
                 },
             )
-            summary = await self._execute_active_turn(record, active_turn, model)
+            summary = await self._execute_active_turn(
+                record,
+                active_turn,
+                model,
+                context_manager,
+                task_state,
+                turn_config,
+            )
             if submission is not None:
                 submission.summary = deepcopy(summary)
                 assert submission.future is not None
@@ -639,11 +670,51 @@ class ThreadRuntime:
             return_exceptions=True,
         )
 
+    def _context_manager_for(
+        self,
+        record: _ThreadRecord,
+        turn_config: TurnConfig,
+        provider: LLMProvider,
+    ) -> ContextManager:
+        """Create one request-context assembler for a frozen Turn config."""
+
+        return ContextManager(
+            base_system_instructions=self._base_system_instructions,
+            project_instructions_provider=self._project_instructions_provider,
+            budget=ContextBudget(
+                context_window_tokens=(
+                    provider.capabilities.context_window_tokens
+                    or self._default_context_window_tokens
+                ),
+                output_tokens=turn_config.max_tokens,
+            ),
+        )
+
+    @staticmethod
+    def _runtime_context_for(
+        record: _ThreadRecord,
+        turn_config: TurnConfig,
+    ) -> RuntimeContext:
+        """Collect cheap environment facts without scanning the workspace."""
+
+        return RuntimeContext(
+            workspace=record.workspace,
+            cwd=record.workspace,
+            shell=os.environ.get("SHELL") or "/bin/sh",
+            approval_mode=turn_config.approval_mode,
+            capabilities=tuple(
+                definition.name for definition in record.tools.definitions()
+            ),
+        )
+
     async def _execute_active_turn(
         self,
         record: _ThreadRecord,
         active_turn: _ActiveTurn,
         model: ModelInvoker,
+        context_manager: ContextManager,
+        task_state: TaskState,
+        turn_config: TurnConfig,
     ) -> TurnSummary:
         controller = active_turn.controller
         try:
@@ -653,6 +724,12 @@ class ThreadRuntime:
                 model,
                 active_turn.events,
                 controller,
+                context_manager=context_manager,
+                runtime_context_factory=lambda: self._runtime_context_for(
+                    record, turn_config
+                ),
+                task_state=task_state,
+                current_input=task_state.goal,
             )
             return self._finish_turn(
                 record,

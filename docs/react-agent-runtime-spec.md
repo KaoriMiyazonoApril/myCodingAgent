@@ -142,13 +142,18 @@ workspace，也不保存 Provider secret 或进程运行时对象。独立 Host 
   `WORKSPACE_ESCAPE`，搜索遍历跳过工作区外目标并避免目录环。生产
   `BubblewrapSandboxBackend` 通过 execution profile 控制 workspace 挂载、网络与只读系统
   配置；它继续丢弃 capabilities，网络仅由已批准的 network profile 开启。
-- Ticket 10 已实现上下文容量预检与 Turn 提交幂等：`ModelInvoker` 在首次和每次后续模型
+- Ticket 10 已实现上下文容量预检与 Turn 提交幂等：`ContextManager` 在首次和每次后续模型
   请求前，按完整消息、content block、工具 schema 与输出 token 预留执行 tokenizer-free
   保守估算；模型 capability 可声明精确 context window，未声明时使用后端保守默认值。首个
   请求超限以 `CONTEXT_LIMIT` 拒绝且不写入用户历史，工具结果使后续请求超限时则返回带相同
   error code 的失败 Summary，历史从不被静默删除或总结。`run_turn()` 接受有界
   `idempotency_key`；同 key、同 payload 的进行中重试等待原 Turn，完成后重试返回原 Summary，
   不同 payload 复用同 key 明确返回 `IDEMPOTENCY_CONFLICT`，不会创建第二个 Turn。
+- Issue #3 Phase 2 已将模型可见 Context 与 durable canonical history 分离：
+  `ContextManager` 从 detached history 与四类 Context source 生成可解释的
+  `ContextPlan`，再由 `ContextRenderer` 交给 ModelInvoker；默认 selector/compactor
+  为 NoOp，`ContextBudget` 在 assembly 中显式拒绝超限且不删除历史。详细 ownership
+  与后续扩展边界见 `docs/context-architecture.md`。
 - Ticket 11 已补齐 Thread 关闭生命周期与最终验收：`close_thread()` 对空闲 Thread 立即进入
   `CLOSED`，对活跃 Thread 发出 `thread_close_requested`、取消当前模型或工具操作，并在统一
   清理路径释放 workspace lease 后进入 `CLOSED`。关闭操作幂等，快照和历史仍可读取；新的

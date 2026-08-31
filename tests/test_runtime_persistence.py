@@ -195,7 +195,8 @@ def test_runtime_restart_preserves_real_tool_history_and_continues_turns(
 
     assert second_summary.status is TurnStatus.COMPLETED
     assert second.get_snapshot(thread.thread_id).completed_turns == 2
-    assert [message.role for message in second_provider.requests[0].messages] == [
+    resumed_request = second_provider.requests[0].messages
+    assert [message.role for message in resumed_request] == [
         "system",
         "user",
         "assistant",
@@ -203,6 +204,11 @@ def test_runtime_restart_preserves_real_tool_history_and_continues_turns(
         "assistant",
         "user",
     ]
+    assert resumed_request[1].content[0].text == "Update app."
+    assert resumed_request[2].content[0].id == "write-app"
+    assert resumed_request[3].content[0].tool_call_id == "write-app"
+    assert resumed_request[4].content[0].text == "File updated."
+    assert resumed_request[5].content[0].text == "Continue after restart."
     asyncio.run(second.aclose())
     second_store.close()
 
