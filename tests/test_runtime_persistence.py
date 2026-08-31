@@ -9,6 +9,7 @@ from agent.core.messages import Message, TextBlock, ToolCallBlock
 from agent.model.provider import LLMProvider
 from agent.model.types import LLMRequest, LLMResponse, Usage
 from agent.runtime import (
+    AllowAllPolicy,
     ApprovalMode,
     IdempotencyConflictError,
     IdempotencyInterruptedError,
@@ -25,6 +26,7 @@ from agent.runtime.thread_store import (
     StoredIdempotency,
     ThreadState,
 )
+from agent.tools.local import create_local_tool_registry
 from agent.tools.registry import ToolRegistry
 
 
@@ -40,6 +42,16 @@ class _Provider(LLMProvider):
             finish_reason="stop",
             usage=Usage(input_tokens=1, output_tokens=1, total_tokens=2),
         )
+
+
+class _ScriptedProvider(LLMProvider):
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        self.responses = iter(responses)
+        self.requests: list[LLMRequest] = []
+
+    async def chat(self, request: LLMRequest) -> LLMResponse:
+        self.requests.append(request)
+        return next(self.responses)
 
 
 def _runtime(store, provider: _Provider) -> ThreadRuntime:
@@ -100,6 +112,97 @@ def test_runtime_restarts_with_messages_settings_turns_and_events(
         "user",
     ]
     store.close()
+
+
+def test_runtime_restart_preserves_real_tool_history_and_continues_turns(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = LocalThreadStore(tmp_path / "state" / "threads.db")
+    first_provider = _ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[
+                        ToolCallBlock(
+                            id="write-app",
+                            name="write_file",
+                            arguments={
+                                "path": "app.py",
+                                "content": "VALUE = 1\n",
+                            },
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+                usage=Usage(input_tokens=2, output_tokens=1, total_tokens=3),
+            ),
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[TextBlock(text="File updated.")],
+                ),
+                finish_reason="stop",
+                usage=Usage(input_tokens=3, output_tokens=2, total_tokens=5),
+            ),
+        ]
+    )
+    first = ThreadRuntime(
+        tool_registry_factory=create_local_tool_registry,
+        provider_resolver=lambda _provider_id, _model: first_provider,
+        default_settings=ModelSettings(provider_config_id="provider", model="model"),
+        tool_policy=AllowAllPolicy(),
+        store=store,
+    )
+    thread = first.create_thread(workspace)
+    first_summary = asyncio.run(first.run_turn(thread.thread_id, "Update app."))
+
+    assert first_summary.modified_files == ["app.py"]
+    assert (workspace / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    asyncio.run(first.aclose())
+    store.close()
+
+    second_store = LocalThreadStore(tmp_path / "state" / "threads.db")
+    second_provider = _Provider("Second turn complete.")
+    second = ThreadRuntime(
+        tool_registry_factory=create_local_tool_registry,
+        provider_resolver=lambda _provider_id, _model: second_provider,
+        default_settings=ModelSettings(provider_config_id="provider", model="model"),
+        tool_policy=AllowAllPolicy(),
+        store=second_store,
+    )
+    restored = second.open_thread(thread.thread_id)
+
+    assert restored.latest_turn == first_summary
+    assert restored.turns == [first_summary]
+    assert [message["role"] for message in restored.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert restored.messages[1]["content"][0]["name"] == "write_file"
+    assert restored.messages[2]["content"][0]["tool_call_id"] == "write-app"
+    assert restored.messages[2]["content"][0]["error_code"] is None
+
+    second_summary = asyncio.run(
+        second.run_turn(thread.thread_id, "Continue after restart.")
+    )
+
+    assert second_summary.status is TurnStatus.COMPLETED
+    assert second.get_snapshot(thread.thread_id).completed_turns == 2
+    assert [message.role for message in second_provider.requests[0].messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+    ]
+    asyncio.run(second.aclose())
+    second_store.close()
 
 
 def test_completed_idempotency_replays_after_restart_without_provider_call(tmp_path) -> None:

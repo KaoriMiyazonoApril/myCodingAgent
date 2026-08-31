@@ -932,6 +932,30 @@ def test_read_file_byte_boundary_does_not_split_utf8_or_claim_unreturned_lines(
     assert result.metadata["total_lines"] == 3
 
 
+def test_read_file_reports_truthful_crlf_bytes_across_chunks(
+    tmp_path, monkeypatch
+) -> None:
+    source = b"one\r\ntwo\r\n"
+    (tmp_path / "crlf.txt").write_bytes(source)
+    monkeypatch.setattr("agent.tools.filesystem.READ_CHUNK_BYTES", 4)
+    registry = create_test_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="call_crlf_bounded_read",
+            name="read_file",
+            arguments={"path": "crlf.txt", "offset": 1, "limit": 2},
+        )
+    )
+
+    assert result.error_code is None
+    assert result.content == "1: one\n2: two"
+    assert result.metadata["returned_bytes"] == len(result.content.encode("utf-8"))
+    assert result.metadata["original_selected_bytes"] == len(source)
+    assert result.metadata["total_lines"] == 2
+    assert result.metadata["truncated"] is False
+
+
 def test_write_overwrite_preserves_mode_and_edit_failure_is_immutable(tmp_path) -> None:
     script = tmp_path / "script.sh"
     script.write_text("one\none\n", encoding="utf-8")

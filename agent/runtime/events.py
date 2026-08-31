@@ -181,6 +181,7 @@ _TRANSIENT_EVENT_TYPES = frozenset(
         "command_output_delta",
     }
 )
+DEFAULT_SEQUENCE_RESERVATION_SIZE = 64
 
 
 class EventSubscription:
@@ -271,17 +272,30 @@ class EventBuffer:
         *,
         events: list[AgentEvent] | tuple[AgentEvent, ...] = (),
         initial_sequence: int | None = None,
+        sequence_reservation_size: int = DEFAULT_SEQUENCE_RESERVATION_SIZE,
     ) -> None:
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
             raise ValueError("event_buffer_capacity must be a positive integer")
+        if (
+            isinstance(sequence_reservation_size, bool)
+            or not isinstance(sequence_reservation_size, int)
+            or sequence_reservation_size < 1
+        ):
+            raise ValueError("sequence_reservation_size must be a positive integer")
         self._events: deque[AgentEvent] = deque(maxlen=capacity)
         self._thread_sequence = max(
             0,
             max((event.sequence for event in events), default=0),
             0 if initial_sequence is None else initial_sequence,
         )
+        # ``_sequence_watermark`` is a durable high-water mark, not the last
+        # event assigned.  Runtime reserves a range before emitting events so
+        # a crash after a transient delta cannot cause sequence reuse.
+        self._sequence_watermark = self._thread_sequence
+        self._sequence_reservation_size = sequence_reservation_size
         self._subscriptions: set[EventSubscription] = set()
         self._durable_sink: Callable[[AgentEvent], object] | None = None
+        self._sequence_checkpoint: Callable[[int], object] | None = None
         for event in events:
             self._events.append(event)
 
@@ -290,20 +304,58 @@ class EventBuffer:
 
         self._durable_sink = sink
 
+    def set_sequence_checkpoint(
+        self,
+        checkpoint: Callable[[int], object] | None,
+    ) -> None:
+        """Persist reserved sequence high-water marks in bounded batches."""
+
+        self._sequence_checkpoint = checkpoint
+
     @property
     def thread_sequence(self) -> int:
         """Latest Thread-scoped event sequence, including retained events."""
 
         return self._thread_sequence
 
+    @property
+    def sequence_watermark(self) -> int:
+        """Highest sequence reserved durably for this Thread."""
+
+        return self._sequence_watermark
+
     def next_sequence(self) -> int:
         """Allocate one monotonic sequence for any Thread event emitter."""
 
+        if self._sequence_checkpoint is not None and (
+            self._thread_sequence >= self._sequence_watermark
+        ):
+            previous_watermark = self._sequence_watermark
+            watermark = max(
+                self._thread_sequence,
+                self._sequence_watermark,
+            ) + self._sequence_reservation_size
+            self._sequence_watermark = watermark
+            try:
+                self._sequence_checkpoint(watermark)
+            except BaseException:
+                self._sequence_watermark = previous_watermark
+                raise
         self._thread_sequence += 1
+        if self._sequence_checkpoint is None:
+            self._sequence_watermark = max(
+                self._sequence_watermark,
+                self._thread_sequence,
+            )
         return self._thread_sequence
 
     def append(self, event: AgentEvent) -> None:
         self._thread_sequence = max(self._thread_sequence, event.sequence)
+        if self._sequence_checkpoint is None:
+            self._sequence_watermark = max(
+                self._sequence_watermark,
+                self._thread_sequence,
+            )
         self._events.append(event)
         if self._durable_sink is not None and event.type not in _TRANSIENT_EVENT_TYPES:
             self._durable_sink(event)

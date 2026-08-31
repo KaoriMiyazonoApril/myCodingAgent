@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from agent.core.messages import Message, ReasoningBlock, TextBlock, ToolCallBlock, ToolResultBlock
+from agent.host.provider_config import ProviderStore
 from agent.runtime import (
     AgentEvent,
     AgentLimits,
@@ -29,7 +28,7 @@ from agent.runtime.thread_store import (
 def _state() -> ThreadState:
     settings = ThreadSettings.from_model_settings(
         ModelSettings(
-            provider_config_id="opaque-provider",
+            provider_config_id="deepseek",
             model="opaque-model",
             temperature=0.4,
             max_tokens=2048,
@@ -135,15 +134,21 @@ def test_thread_store_round_trips_canonical_state(store_factory, tmp_path) -> No
 
 def test_local_store_uses_versioned_schema_and_does_not_store_provider_secret(tmp_path) -> None:
     database = tmp_path / "state" / "threads.sqlite3"
+    provider_store = ProviderStore(tmp_path / "providers.json")
+    provider_store.save_provider(
+        "deepseek",
+        api_key="api-key-sentinel",
+        selected_model="opaque-model",
+    )
     store = LocalThreadStore(database)
     state = _state()
     store.save_thread(state)
     store.close()
 
-    assert json.dumps(state, default=str)  # smoke-check test fixture is non-empty
+    assert provider_store.get_credential("deepseek") == "api-key-sentinel"
     raw = database.read_bytes()
     assert b"api-key-sentinel" not in raw
-    assert b"opaque-provider" in raw
+    assert b"deepseek" in raw
     reopened = LocalThreadStore(database)
     assert reopened.get_thread("thread-1") == state
     reopened.close()

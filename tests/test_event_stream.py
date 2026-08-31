@@ -275,6 +275,51 @@ def test_query_cursor_precedes_last_event_id_header() -> None:
     assert select_event_cursor(None, "header") == "header"
 
 
+def test_event_buffer_reserves_sequence_ranges_across_transient_restart() -> None:
+    checkpoints: list[int] = []
+    durable: list[object] = []
+    buffer = EventBuffer(32, sequence_reservation_size=8)
+    buffer.set_sequence_checkpoint(checkpoints.append)
+    buffer.set_durable_sink(durable.append)
+
+    started = buffer.emit_thread(
+        thread_id="thread",
+        event_type="turn_started",
+        payload={},
+    )
+    transient = [
+        buffer.emit_thread(
+            thread_id="thread",
+            event_type="model_text_delta",
+            payload={"text": str(index)},
+        )
+        for index in range(5)
+    ]
+
+    assert checkpoints == [8]
+    assert durable == [started]
+    assert transient[-1].sequence == 6
+
+    # A new process sees only the durable event and the reserved high-water
+    # mark. Its first recovery event must skip the unused range.
+    restarted = EventBuffer(
+        32,
+        events=[started],
+        initial_sequence=checkpoints[-1],
+        sequence_reservation_size=8,
+    )
+    restarted.set_sequence_checkpoint(checkpoints.append)
+    recovered = restarted.emit_thread(
+        thread_id="thread",
+        event_type="turn_failed",
+        payload={"reason": "runtime_restarted"},
+    )
+
+    assert recovered.sequence > transient[-1].sequence
+    assert recovered.sequence == 9
+    assert checkpoints == [8, 16]
+
+
 def test_sse_route_maps_query_and_header_cursors_with_streaming_headers(
     tmp_path,
 ) -> None:

@@ -212,6 +212,9 @@ class ThreadRuntime:
         record.events.set_durable_sink(
             lambda event, current=record: self._on_durable_event(current, event)
         )
+        record.events.set_sequence_checkpoint(
+            lambda _watermark, current=record: self._persist_record(current)
+        )
         self._threads[thread_id] = record
         self._persist_record(record)
         return self._snapshot(record)
@@ -270,6 +273,9 @@ class ThreadRuntime:
             )
             events.set_durable_sink(
                 lambda event, current=record: self._on_durable_event(current, event)
+            )
+            events.set_sequence_checkpoint(
+                lambda _watermark, current=record: self._persist_record(current)
             )
             self._threads[record.thread_id] = record
             if state.active_turn is not None or state.status in {
@@ -376,7 +382,7 @@ class ThreadRuntime:
             latest_turn=deepcopy(record.latest_turn),
             turns=deepcopy(record.turns),
             events=deepcopy(record.durable_events),
-            event_sequence=events.thread_sequence,
+            event_sequence=events.sequence_watermark,
             active_turn=active_state,
             idempotency={
                 key: StoredIdempotency(

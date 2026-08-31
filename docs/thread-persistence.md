@@ -32,8 +32,11 @@ canonical Conversation 包括 system、user、assistant、tool 消息及 reasoni
 Host 的 public snapshot 仍按既有规则隐藏 system prompt 和 reasoning。
 
 EventBuffer 仍是实时订阅与有限 replay 的唯一运行时机制。语义事件在 emitter/buffer
-边界镜像到 Store；模型 token/delta 事件不写 SQLite。事件 sequence 属于 Thread，
-恢复后从已保存的最大 sequence 继续分配，event ID 不会与旧记录冲突。
+边界镜像到 Store；模型 token/delta 事件不写 SQLite。事件 sequence 属于 Thread。
+Runtime 以固定大小的 range（当前每次 64 个）预留并 checkpoint sequence high-water
+mark；只有 range 用尽时才写一次 Store，因此 transient delta 不会逐 token 提交。崩溃
+可能留下未使用的 sequence 间隙，但恢复会从已保存的 high-water mark 之后继续分配，
+不会复用客户端已经观察到的 transient sequence，event ID 也不会与旧记录冲突。
 
 ## 重启语义
 

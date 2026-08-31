@@ -295,6 +295,7 @@ class WorkspaceFilesystem:
         line_capture = bytearray()
         line_capture_truncated = False
         skip_lf_after_cr = False
+        pending_cr_selected = False
 
         def current_line_number() -> int:
             return total_lines + 1
@@ -348,7 +349,10 @@ class WorkspaceFilesystem:
         def finish_line(separator_bytes: int) -> None:
             nonlocal total_lines, line_bytes, line_capture
             nonlocal line_capture_truncated, skip_lf_after_cr
-            append_selected_line(current_line_number(), separator_bytes)
+            nonlocal pending_cr_selected
+            line_number = current_line_number()
+            append_selected_line(line_number, separator_bytes)
+            pending_cr_selected = offset <= line_number < offset + limit
             total_lines += 1
             line_bytes = 0
             line_capture.clear()
@@ -357,12 +361,20 @@ class WorkspaceFilesystem:
 
         def consume(decoded: str) -> None:
             nonlocal line_bytes, line_capture_truncated, skip_lf_after_cr
+            nonlocal pending_cr_selected, original_selected_bytes
             for character in decoded:
                 encoded = character.encode("utf-8")
                 if skip_lf_after_cr and character == "\n":
+                    # ``finish_line`` counted the CR separator immediately;
+                    # account for the LF here, including when the two bytes
+                    # arrive in different read chunks.
+                    if pending_cr_selected:
+                        original_selected_bytes += len(encoded)
                     skip_lf_after_cr = False
+                    pending_cr_selected = False
                     continue
                 skip_lf_after_cr = False
+                pending_cr_selected = False
                 if character in _LINE_SEPARATORS:
                     finish_line(len(encoded))
                     if character == "\r":
