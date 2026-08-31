@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
 
-from agent.model import OpenAICompatibleProvider, create_provider_config
+from agent.model import (
+    OpenAICompatibleClientPool,
+    OpenAICompatibleProvider,
+    create_provider_config,
+)
 from agent.runtime import (
     ApprovalMode,
     ModelSettings,
@@ -334,7 +338,7 @@ class ProductionRuntimeFactory:
         if state_dir is not None and database_path is not None:
             raise ValueError("provide either state_dir or database_path, not both")
         self._store = store
-        self._providers: list[OpenAICompatibleProvider] = []
+        self._provider_pool = OpenAICompatibleClientPool()
         self._thread_store = thread_store
         if self._thread_store is None:
             self._thread_store = (
@@ -351,9 +355,20 @@ class ProductionRuntimeFactory:
                 api_key=credential,
                 model=model,
             )
-            provider = OpenAICompatibleProvider(config)
-            self._providers.append(provider)
-            return provider
+            return self._provider_pool.resolve(config)
+
+        def capabilities_for(provider_config_id: str, model: str):
+            credential = self._store.get_credential(provider_config_id)
+            config = create_provider_config(
+                provider_config_id,
+                api_key=credential,
+                model=model,
+            )
+            return config.capabilities
+
+        # ThreadRuntime uses this optional provider-independent preflight hook
+        # to read model capabilities without allocating a transport.
+        resolve.capabilities_for = capabilities_for  # type: ignore[attr-defined]
 
         return ThreadRuntime(
             tool_registry_factory=create_local_tool_registry,
@@ -363,9 +378,7 @@ class ProductionRuntimeFactory:
         )
 
     async def close(self) -> None:
-        providers, self._providers = self._providers, []
-        for provider in providers:
-            await provider.close()
+        await self._provider_pool.aclose()
         close_store = getattr(self._thread_store, "close", None)
         if callable(close_store):
             close_store()

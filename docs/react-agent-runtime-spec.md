@@ -1,5 +1,12 @@
 # 多轮 ReAct Coding Agent Runtime 规格
 
+> Status: historical/superseded for workspace security and lifecycle rules.
+> Follow [Autonomous Web Workspace Refactor Spec](autonomous-web-workspace-refactor-spec.md)
+> and [Kernel Freeze Lifecycle Hardening Spec](specs/kernel-freeze-lifecycle-hardening-spec.md)
+> for current architecture. The old link-syscall/seccomp prohibition is not current:
+> workspace-internal symlink and hard-link aliases remain legal under access-time canonical
+> containment.
+
 ## Problem Statement
 
 项目已经具备供应商无关的消息模型、OpenAI Compatible 模型连接层，以及能够读取、修改、
@@ -65,8 +72,8 @@ workspace，也不保存 Provider secret 或进程运行时对象。独立 Host 
   并单独验证非零测试退出码作为结构化失败回传给模型后由最终答复诚实报告。
 - Ticket 02 已提取公共 `CommandSandboxBackend`：生产 Bubblewrap 与确定性测试 adapter
   共享 capability probe、输出、超时和取消 contract。普通 Runtime 测试不再要求开发主机
-  可运行 Bubblewrap，生产组合仍 fail-fast 且绝不回退到 host shell。Ticket 09 已在生产
-  backend 上补充 link syscall 禁令及对应 capability probe。
+  可运行 Bubblewrap，生产组合仍 fail-fast 且绝不回退到 host shell。历史 Ticket 09 曾提出
+  link syscall 禁令；该安全规则已被 autonomous workspace 设计取代，不再约束当前 backend。
 - Ticket 03 已实现多 Turn 与设置冻结：`Conversation` 独占合法历史，Runtime 通过公开
   provider 配置 ID 和模型解析每个 Turn 的 `LLMProvider`，`ModelInvoker` 将冻结的
   temperature、max tokens 与 allowlisted thinking 设置应用于整个工具链。默认设置更新

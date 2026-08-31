@@ -75,6 +75,8 @@ export type EventState = {
 export type ApprovalRequest = {
   approval_id: string;
   tool_call: Record<string, unknown> | null;
+  timeout_seconds?: number;
+  decision?: string;
   reason_code: string;
   message: string;
 };
@@ -101,6 +103,27 @@ export function hydrateThread(view: ThreadView): EventState {
   if (isRecord(view.host_error)) {
     state.error = safeError(view.host_error);
     state.terminal = { status: "rejected", error: state.error };
+  }
+  const pending = view.snapshot.pending_approval;
+  if (isRecord(pending) && typeof pending.approval_id === "string") {
+    state.approval = {
+      approval_id: pending.approval_id,
+      tool_call: isRecord(pending.tool_call) ? pending.tool_call : null,
+      ...(typeof pending.timeout_seconds === "number"
+        ? { timeout_seconds: pending.timeout_seconds }
+        : {}),
+      ...(typeof pending.decision === "string"
+        ? { decision: pending.decision }
+        : {}),
+      reason_code:
+        typeof pending.reason_code === "string"
+          ? pending.reason_code
+          : "APPROVAL_REQUIRED",
+      message:
+        typeof pending.message === "string"
+          ? pending.message
+          : "该命令需要确认",
+    };
   }
   hydrateSummaryFiles(state, view.snapshot.latest_turn);
   return state;
@@ -133,6 +156,7 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     next.error = null;
     next.files = [];
     next.cancel_requested = false;
+    next.approval = null;
     next.provisional = {
       turn_id: event.turn_id,
       text: "",
@@ -245,6 +269,12 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
         tool_call: isRecord(event.payload.tool_call)
           ? event.payload.tool_call
           : null,
+        ...(typeof event.payload.timeout_seconds === "number"
+          ? { timeout_seconds: event.payload.timeout_seconds }
+          : {}),
+        ...(typeof event.payload.decision === "string"
+          ? { decision: event.payload.decision }
+          : {}),
         reason_code:
           typeof event.payload.reason_code === "string"
             ? event.payload.reason_code

@@ -332,6 +332,7 @@ def create_local_tool_registry(
     )
     registry.bind_event_sink(process_manager.set_event_sink)
     registry.bind_session_canceller(process_manager.cancel_active)
+    registry.bind_session_context_setter(process_manager.set_session_context)
     registry.bind_execution_profile_setter(runner.set_execution_profile)
     registry.bind_execution_profile_setter(process_manager.set_execution_profile)
     registry.register(

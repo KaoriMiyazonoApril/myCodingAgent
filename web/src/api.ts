@@ -122,6 +122,7 @@ export type ThreadView = {
     created_at: string;
     updated_at: string;
     latest_turn: Record<string, unknown> | null;
+    pending_approval?: PendingApproval | null;
   };
   event_cursor: string | null;
   submission: TurnSubmission | null;
@@ -132,6 +133,15 @@ export type ThreadView = {
     message: string;
     details?: Record<string, unknown>;
   } | null;
+};
+
+export type PendingApproval = {
+  approval_id: string;
+  tool_call: Record<string, unknown> | null;
+  timeout_seconds?: number;
+  decision?: string;
+  reason_code: string;
+  message: string;
 };
 
 type ThreadsResponse = {

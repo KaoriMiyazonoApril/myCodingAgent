@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import sqlite3
 from threading import RLock
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from agent.core.messages import (
     Message,
@@ -102,6 +102,14 @@ class ThreadStore(Protocol):
     def save_thread(self, state: ThreadState) -> None:
         """Atomically persist one complete semantic state transition."""
 
+    def save_thread_transition(
+        self,
+        state: ThreadState,
+        *,
+        new_events: Sequence[AgentEvent] = (),
+    ) -> None:
+        """Persist state plus only newly appended durable events."""
+
     def close(self) -> None:
         """Release store resources; repeated calls are safe."""
 
@@ -141,6 +149,18 @@ class InMemoryThreadStore:
         if state.thread_id not in self._states:
             self._order.append(state.thread_id)
         self._states[state.thread_id] = deepcopy(state)
+
+    def save_thread_transition(
+        self,
+        state: ThreadState,
+        *,
+        new_events: Sequence[AgentEvent] = (),
+    ) -> None:
+        # In-memory state is detached in one assignment; accepting the
+        # transition seam keeps Runtime provider-independent and mirrors the
+        # SQLite implementation without adding persistence-specific logic.
+        del new_events
+        self.save_thread(state)
 
     # Friendly aliases for embedders that call the seam ``save``/``get``.
     save = save_thread
@@ -263,6 +283,22 @@ class LocalThreadStore:
             return None if row is None else self._load_row(row[0])
 
     def save_thread(self, state: ThreadState) -> None:
+        self._save_state(state, new_events=state.events)
+
+    def save_thread_transition(
+        self,
+        state: ThreadState,
+        *,
+        new_events: Sequence[AgentEvent] = (),
+    ) -> None:
+        self._save_state(state, new_events=new_events)
+
+    def _save_state(
+        self,
+        state: ThreadState,
+        *,
+        new_events: Sequence[AgentEvent],
+    ) -> None:
         _validate_state(state)
         state_json = _encode(_state_to_dict(state, include_events=False, include_idempotency=False))
         event_rows = [
@@ -272,7 +308,7 @@ class LocalThreadStore:
                 event.sequence,
                 _encode(event.to_dict()),
             )
-            for event in state.events
+            for event in new_events
         ]
         idempotency_rows = [
             (
@@ -295,25 +331,31 @@ class LocalThreadStore:
                     """,
                     (state.thread_id, state_json, state.created_at, state.updated_at),
                 )
-                self._connection.execute(
-                    "DELETE FROM thread_events WHERE thread_id = ?",
-                    (state.thread_id,),
-                )
                 self._connection.executemany(
                     """
-                    INSERT INTO thread_events(thread_id, event_id, sequence, event_json)
+                    INSERT OR IGNORE INTO thread_events(thread_id, event_id, sequence, event_json)
                     VALUES (?, ?, ?, ?)
                     """,
                     event_rows,
                 )
-                self._connection.execute(
-                    "DELETE FROM thread_idempotency WHERE thread_id = ?",
-                    (state.thread_id,),
-                )
+                if idempotency_rows:
+                    placeholders = ",".join("?" for _ in idempotency_rows)
+                    self._connection.execute(
+                        "DELETE FROM thread_idempotency "
+                        f"WHERE thread_id = ? AND idempotency_key NOT IN ({placeholders})",
+                        (state.thread_id, *(row[1] for row in idempotency_rows)),
+                    )
+                else:
+                    self._connection.execute(
+                        "DELETE FROM thread_idempotency WHERE thread_id = ?",
+                        (state.thread_id,),
+                    )
                 self._connection.executemany(
                     """
                     INSERT INTO thread_idempotency(thread_id, idempotency_key, request_json)
                     VALUES (?, ?, ?)
+                    ON CONFLICT(thread_id, idempotency_key) DO UPDATE SET
+                        request_json = excluded.request_json
                     """,
                     idempotency_rows,
                 )

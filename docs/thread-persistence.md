@@ -22,9 +22,11 @@ client、Future、task、lock、PTY、subprocess 或 pickle 数据。
 ## Schema 与序列化
 
 SQLite 使用 PRAGMA user_version，当前 STORE_SCHEMA_VERSION 为 1。Thread 的快照
-保存在 threads，事件和幂等请求分别保存在 thread_events 与 thread_idempotency；
-单次 save_thread 在一个事务中替换三部分，因此恢复时不会观察到半个状态。未知的新
-schema 会显式失败，未来迁移集中在 Store 初始化处。
+保存在 threads，事件和幂等请求分别保存在 thread_events 与 thread_idempotency。
+每次 Runtime 语义转换在一个事务中 UPSERT 当前快照，并只 INSERT 新增 durable event；
+事件表是 append-only 的幂等日志，不会随着 Thread 长度反复 DELETE/重建，因此写入量
+随新增事件线性增长。恢复时不会观察到半个状态。未知的新 schema 会显式失败，未来迁移
+集中在 Store 初始化处。
 
 thread_store.py 中的显式 JSON mapper 负责枚举、时间戳、设置版本、消息及所有
 canonical block、Turn summary、Agent event 和 idempotency override。Runtime 的

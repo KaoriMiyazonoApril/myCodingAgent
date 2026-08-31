@@ -1094,6 +1094,27 @@ def test_file_tools_allow_hard_links_and_internal_symlinked_parent_components(
     assert parent_result.content == "1: nested"
 
 
+def test_write_file_preserves_internal_hard_link_aliases(tmp_path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("before", encoding="utf-8")
+    alias = tmp_path / "alias.txt"
+    os.link(source, alias)
+    registry = create_test_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="write-hard-link",
+            name="write_file",
+            arguments={"path": "alias.txt", "content": "after"},
+        )
+    )
+
+    assert result.error_code is None
+    assert source.read_text(encoding="utf-8") == "after"
+    assert alias.read_text(encoding="utf-8") == "after"
+    assert source.stat().st_ino == alias.stat().st_ino
+
+
 def test_tool_composition_canonicalizes_a_workspace_with_a_symlink_parent(tmp_path) -> None:
     real_parent = tmp_path / "real-parent"
     real_parent.mkdir()

@@ -106,6 +106,34 @@ test("hydrates messages tools and terminal outcome from a Snapshot", () => {
   expect(state.terminal).toEqual({ status: "completed", final_text: "Done" });
 });
 
+test("hydrates a pending approval from a snapshot without replaying its event", () => {
+  const state = hydrateThread({
+    ...view(),
+    snapshot: {
+      ...view().snapshot,
+      status: "waiting_approval",
+      active_turn_id: "turn-approval",
+      pending_approval: {
+        approval_id: "approval-snapshot",
+        tool_call: { id: "call-snapshot", name: "run_command" },
+        timeout_seconds: 300,
+        decision: "require_approval",
+        reason_code: "NETWORK_COMMAND",
+        message: "command requires approval",
+      },
+    },
+  });
+
+  expect(state.approval).toEqual({
+    approval_id: "approval-snapshot",
+    tool_call: { id: "call-snapshot", name: "run_command" },
+    timeout_seconds: 300,
+    decision: "require_approval",
+    reason_code: "NETWORK_COMMAND",
+    message: "command requires approval",
+  });
+});
+
 test("deduplicates event IDs and merges a tool lifecycle by call ID", () => {
   let state = hydrateThread({
     ...view(),

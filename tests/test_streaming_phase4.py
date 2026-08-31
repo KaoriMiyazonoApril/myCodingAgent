@@ -256,6 +256,25 @@ def test_model_stream_retries_before_first_delta_but_not_after_output() -> None:
     assert no_retry.calls == 1
     assert any(isinstance(event, ErrorEvent) for event in after_error_events)
 
+    class TerminalProvider(_StreamingProvider):
+        async def stream(self, request):
+            self.calls += 1
+            raise LLMConnectionError("still unavailable")
+            yield  # pragma: no cover - keeps this an async generator
+
+    terminal = TerminalProvider([])
+    terminal_events = []
+    with pytest.raises(LLMConnectionError):
+        asyncio.run(
+            ModelInvoker(terminal, _config(), retry_delays=(0, 0)).stream(
+                [], [], on_event=terminal_events.append
+            )
+        )
+    assert terminal.calls == 3
+    assert len(
+        [event for event in terminal_events if isinstance(event, ErrorEvent)]
+    ) == 1
+
 
 def test_event_buffer_subscription_wakes_without_blocking_or_unbounded_queue() -> None:
     async def scenario():

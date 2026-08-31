@@ -65,6 +65,7 @@ class ThreadSnapshot:
     created_at: str = ""
     updated_at: str = ""
     latest_turn: TurnSummary | None = None
+    pending_approval: dict[str, Any] | None = None
     turns: list[TurnSummary] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:

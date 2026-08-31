@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 import inspect
 import os
@@ -685,6 +686,8 @@ class ProcessSession:
         self,
         *,
         session_id: str,
+        owner_thread_id: str | None,
+        owner_turn_id: str | None,
         command: str,
         cwd: str,
         tty: bool,
@@ -696,6 +699,11 @@ class ProcessSession:
         execution_profile: "ExecutionProfile | None" = None,
     ) -> None:
         self.session_id = session_id
+        # Ownership is deliberately captured once.  A ProcessSession may
+        # outlive the Turn that created it, but it must never be rebound to a
+        # later Turn merely because that Turn is currently executing.
+        self._owner_thread_id = owner_thread_id
+        self._owner_turn_id = owner_turn_id
         self.command = command
         self.cwd = cwd
         self.tty = tty
@@ -715,6 +723,7 @@ class ProcessSession:
         self._timed_out = False
         self._idle_timed_out = False
         self._closed = False
+        self._cancelled = False
         self._last_interaction = time.monotonic()
         self._interaction_lock = asyncio.Lock()
         self._output_tasks: list[asyncio.Task[None]] = []
@@ -729,9 +738,23 @@ class ProcessSession:
                 asyncio.create_task(self._read_output("stderr", spawned.stderr))
             )
 
+        self._terminal_result: ToolResult | None = None
+
     @property
     def running(self) -> bool:
         return not self._exited and self._process.returncode is None
+
+    @property
+    def owner_thread_id(self) -> str | None:
+        """Immutable Thread owner captured at process creation."""
+
+        return self._owner_thread_id
+
+    @property
+    def owner_turn_id(self) -> str | None:
+        """Immutable creator Turn owner captured at process creation."""
+
+        return self._owner_turn_id
 
     @property
     def exited(self) -> bool:
@@ -817,6 +840,7 @@ class ProcessSession:
         if self._closed:
             return
         self._closed = True
+        self._cancelled = True
         if self.running:
             await self._terminate()
         self._close_transports()
@@ -842,16 +866,26 @@ class ProcessSession:
             await asyncio.wait_for(asyncio.shield(self._process.wait()), timeout=0.2)
         except (TimeoutError, asyncio.CancelledError):
             pass
+        self._event_sink = None
+        self._on_terminal = None
 
     def close_sync(self) -> None:
         """Best-effort synchronous kill used by registry/Host close hooks."""
 
+        self._cancelled = True
         if self.running:
             CommandSandboxBackend._signal_process_group(self._process.pid, signal.SIGTERM)
             CommandSandboxBackend._signal_process_group(self._process.pid, signal.SIGKILL)
         self._close_transports()
+        self._event_sink = None
+        self._on_terminal = None
 
     def _result(self) -> ToolResult:
+        if self._terminal_result is not None:
+            return self._terminal_result
+        return self._build_result()
+
+    def _build_result(self) -> ToolResult:
         stdout, stderr = self._take_pending()
         status = "running" if self.running else "exited"
         error_code: str | None = None
@@ -872,6 +906,8 @@ class ProcessSession:
             metadata={
                 "status": status,
                 "session_id": self.session_id,
+                "owner_thread_id": self.owner_thread_id,
+                "owner_turn_id": self.owner_turn_id,
                 "cwd": self.cwd,
                 "command": self.command,
                 "execution_profile": getattr(
@@ -921,6 +957,8 @@ class ProcessSession:
                     "command_output_delta",
                     {
                         "session_id": self.session_id,
+                        "owner_thread_id": self.owner_thread_id,
+                        "owner_turn_id": self.owner_turn_id,
                         "stream": stream,
                         "text": chunk.decode("utf-8", errors="replace"),
                     },
@@ -954,6 +992,8 @@ class ProcessSession:
                 "command_completed",
                 {
                     "session_id": self.session_id,
+                    "owner_thread_id": self.owner_thread_id,
+                    "owner_turn_id": self.owner_turn_id,
                     "status": "exited",
                     "exit_code": self._process.returncode,
                     "timed_out": self._timed_out,
@@ -961,6 +1001,11 @@ class ProcessSession:
                     "tty": self.tty,
                 },
             )
+            # Freeze the one final poll result before handing ownership back
+            # to ProcessManager.  The manager can now release this object's
+            # transports, readers and event callback without losing output
+            # that arrived after the caller's last poll.
+            self._terminal_result = self._build_result()
             if self._on_terminal is not None:
                 self._on_terminal(self.session_id)
 
@@ -1033,6 +1078,26 @@ class ProcessSession:
             except RuntimeError:
                 pass
 
+    def release_completed(self) -> None:
+        """Release heavy resources after the watcher has observed process exit.
+
+        This method is intentionally synchronous and must only be called once
+        ``_watch_process`` has reached its terminal callback.  It avoids
+        retaining PTYs, pipe transports and the Turn emitter while a compact
+        completed result is cached by ProcessManager.
+        """
+
+        self._close_transports()
+        self._event_sink = None
+        self._on_terminal = None
+        self._pending.clear()
+        self._pending_bytes = {"stdout": 0, "stderr": 0}
+        self._captures.clear()
+        for task in (*self._output_tasks, self._timeout_task, self._idle_task):
+            if not task.done():
+                task.cancel()
+        self._output_tasks.clear()
+
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         if self._event_sink is not None:
             try:
@@ -1053,6 +1118,9 @@ class ProcessManager:
         max_sessions: int = 4,
         idle_timeout_seconds: float = 15 * 60,
         event_sink: Callable[[str, dict[str, Any]], object] | None = None,
+        owner_thread_id: str | None = None,
+        max_completed_sessions: int | None = None,
+        max_dead_sessions: int | None = None,
         sandbox_checked: bool = False,
     ) -> None:
         if max_sessions < 1:
@@ -1066,19 +1134,74 @@ class ProcessManager:
         self._max_sessions = max_sessions
         self._idle_timeout_seconds = idle_timeout_seconds
         self._event_sink = event_sink
+        self._owner_thread_id = owner_thread_id
+        default_retention = max(16, max_sessions * 4)
+        self._max_completed_sessions = (
+            default_retention
+            if max_completed_sessions is None
+            else max_completed_sessions
+        )
+        self._max_dead_sessions = (
+            default_retention if max_dead_sessions is None else max_dead_sessions
+        )
+        if self._max_completed_sessions < 1 or self._max_dead_sessions < 1:
+            raise ValueError("session retention limits must be positive")
         self._sessions: dict[str, ProcessSession] = {}
         # Naturally exited sessions are kept separately from active sessions
         # so one final output/exit poll can be collected without counting
         # against the active-session limit.
-        self._exited_sessions: dict[str, ProcessSession] = {}
+        self._exited_sessions: OrderedDict[str, ToolResult] = OrderedDict()
         # Keep a small in-memory tombstone for sessions whose one final poll
         # has already been consumed. This distinguishes a known dead session
         # from a typo/unknown id without retaining process resources.
-        self._dead_sessions: set[str] = set()
+        self._dead_sessions: OrderedDict[str, None] = OrderedDict()
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._sandbox_released = False
         self._closed = False
         self._execution_profile: "ExecutionProfile | None" = None
+        self._current_turn_id: str | None = None
+
+    @property
+    def active_session_count(self) -> int:
+        """Number of live ProcessSession resources owned by this Thread."""
+
+        return len(self._sessions)
+
+    @property
+    def completed_session_count(self) -> int:
+        """Number of lightweight final results retained for one final poll."""
+
+        return len(self._exited_sessions)
+
+    @property
+    def dead_session_count(self) -> int:
+        """Number of bounded dead-session tombstones retained."""
+
+        return len(self._dead_sessions)
+
+    def set_owner_thread_id(self, owner_thread_id: str | None) -> None:
+        """Set the Thread identity for sessions created from this manager."""
+
+        if (
+            self._owner_thread_id is not None
+            and owner_thread_id != self._owner_thread_id
+        ):
+            raise RuntimeError("cannot change Thread identity")
+        if self._sessions or self._exited_sessions:
+            raise RuntimeError("cannot change Thread identity with live sessions")
+        self._owner_thread_id = owner_thread_id
+
+    def set_session_context(
+        self,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None,
+    ) -> None:
+        """Capture owner IDs used by sessions created by the next execution."""
+
+        if thread_id is not None and thread_id != self._owner_thread_id:
+            self.set_owner_thread_id(thread_id)
+        self._current_turn_id = turn_id
 
     def set_execution_profile(self, profile: "ExecutionProfile | None") -> None:
         """Set the profile for newly created sessions."""
@@ -1088,11 +1211,14 @@ class ProcessManager:
     def _on_terminal(self, session_id: str) -> None:
         session = self._sessions.pop(session_id, None)
         if session is not None:
-            if self._closed:
+            if self._closed or session._cancelled:
                 session.close_sync()
-                self._schedule_cleanup(session)
+                session.release_completed()
             else:
-                self._exited_sessions[session_id] = session
+                final = session._terminal_result
+                if final is not None:
+                    self._remember_completed(session_id, final)
+                session.release_completed()
 
     def _schedule_cleanup(self, session: ProcessSession) -> None:
         """Retain asynchronous session cleanup until its reader tasks are drained."""
@@ -1108,9 +1234,13 @@ class ProcessManager:
     def set_event_sink(
         self, event_sink: Callable[[str, dict[str, Any]], object] | None
     ) -> None:
+        """Set the sink for sessions created after this call.
+
+        Existing sessions retain the sink captured at creation.  Rebinding
+        them here would attribute persistent process output to a later Turn.
+        """
+
         self._event_sink = event_sink
-        for session in [*self._sessions.values(), *self._exited_sessions.values()]:
-            session._event_sink = event_sink
 
     async def exec(
         self,
@@ -1141,6 +1271,8 @@ class ProcessManager:
         )
         session = ProcessSession(
             session_id=session_id,
+            owner_thread_id=self._owner_thread_id,
+            owner_turn_id=self._current_turn_id,
             command=command,
             cwd=relative_cwd,
             tty=tty,
@@ -1156,6 +1288,8 @@ class ProcessManager:
             "command_started",
             {
                 "session_id": session_id,
+                "owner_thread_id": self._owner_thread_id,
+                "owner_turn_id": self._current_turn_id,
                 "command": command,
                 "cwd": relative_cwd,
                 "tty": tty,
@@ -1191,7 +1325,15 @@ class ProcessManager:
             raise ToolOperationError("PROCESS_MANAGER_CLOSED", "process manager is closed")
         session = self._sessions.get(session_id)
         if session is None:
-            session = self._exited_sessions.get(session_id)
+            completed = self._exited_sessions.get(session_id)
+            if completed is not None:
+                if chars:
+                    self._mark_dead(session_id)
+                    self._exited_sessions.pop(session_id, None)
+                    raise ToolOperationError("SESSION_DEAD", "process session has exited")
+                self._exited_sessions.pop(session_id, None)
+                self._mark_dead(session_id)
+                return deepcopy(completed)
         if session is None:
             if session_id in self._dead_sessions:
                 raise ToolOperationError("SESSION_DEAD", "process session has exited")
@@ -1209,17 +1351,32 @@ class ProcessManager:
             await session.close()
         return result
 
-    def cancel_active(self) -> None:
-        """Terminate all still-running sessions without waiting on the caller."""
+    def cancel_active(self, owner_turn_id: str | None = None) -> None:
+        """Terminate sessions owned by one Turn without touching other Turns.
 
-        sessions = [*self._sessions.values(), *self._exited_sessions.values()]
-        self._sessions.clear()
-        self._exited_sessions.clear()
-        self._dead_sessions.update(session.session_id for session in sessions)
+        ``owner_turn_id=None`` is reserved for Thread/Host shutdown callers
+        that explicitly intend to close every remaining session.
+        """
+
+        sessions = [
+            session
+            for session in self._sessions.values()
+            if owner_turn_id is None or session.owner_turn_id == owner_turn_id
+        ]
         for session in sessions:
+            self._sessions.pop(session.session_id, None)
+            self._mark_dead(session.session_id)
             session.close_sync()
-        for session in sessions:
             self._schedule_cleanup(session)
+        completed_ids = [
+            session_id
+            for session_id, result in self._exited_sessions.items()
+            if owner_turn_id is None
+            or result.metadata.get("owner_turn_id") == owner_turn_id
+        ]
+        for session_id in completed_ids:
+            self._exited_sessions.pop(session_id, None)
+            self._mark_dead(session_id)
 
     def close(self) -> None:
         """Idempotently terminate sessions and release the sandbox resource."""
@@ -1227,9 +1384,10 @@ class ProcessManager:
         if self._closed:
             return
         self._closed = True
-        sessions = [*self._sessions.values(), *self._exited_sessions.values()]
+        sessions = [*self._sessions.values()]
         self._sessions.clear()
         self._exited_sessions.clear()
+        self._dead_sessions.clear()
         for session in sessions:
             session.close_sync()
         for session in sessions:
@@ -1248,9 +1406,10 @@ class ProcessManager:
             self._release_sandbox()
             return
         self._closed = True
-        sessions = [*self._sessions.values(), *self._exited_sessions.values()]
+        sessions = [*self._sessions.values()]
         self._sessions.clear()
         self._exited_sessions.clear()
+        self._dead_sessions.clear()
         await asyncio.gather(*(session.close() for session in sessions), return_exceptions=True)
         cleanup_tasks = tuple(self._cleanup_tasks)
         if cleanup_tasks:
@@ -1267,7 +1426,20 @@ class ProcessManager:
         removed = self._sessions.pop(session_id, None)
         removed = self._exited_sessions.pop(session_id, removed)
         if removed is not None:
-            self._dead_sessions.add(session_id)
+            self._mark_dead(session_id)
+
+    def _remember_completed(self, session_id: str, result: ToolResult) -> None:
+        self._exited_sessions[session_id] = deepcopy(result)
+        self._exited_sessions.move_to_end(session_id)
+        while len(self._exited_sessions) > self._max_completed_sessions:
+            evicted_id, _ = self._exited_sessions.popitem(last=False)
+            self._mark_dead(evicted_id)
+
+    def _mark_dead(self, session_id: str) -> None:
+        self._dead_sessions[session_id] = None
+        self._dead_sessions.move_to_end(session_id)
+        while len(self._dead_sessions) > self._max_dead_sessions:
+            self._dead_sessions.popitem(last=False)
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         if self._event_sink is not None:

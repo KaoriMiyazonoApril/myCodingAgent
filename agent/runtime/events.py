@@ -182,6 +182,14 @@ _TRANSIENT_EVENT_TYPES = frozenset(
     }
 )
 DEFAULT_SEQUENCE_RESERVATION_SIZE = 64
+_TURN_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        "turn_completed",
+        "turn_failed",
+        "turn_cancelled",
+        "turn_limit_reached",
+    }
+)
 
 
 class EventSubscription:
@@ -446,6 +454,7 @@ class TurnEventEmitter:
         self._turn_id = turn_id
         self._buffer = buffer
         self._reasoning_visibility = reasoning_visibility
+        self._terminal_event: AgentEvent | None = None
 
     def emit(
         self,
@@ -454,6 +463,13 @@ class TurnEventEmitter:
         *,
         checkpoint: bool = True,
     ) -> AgentEvent:
+        # A persistent ProcessSession keeps its original emitter after its
+        # creator Turn finishes.  Gate that emitter at the lifecycle boundary
+        # so delayed process callbacks cannot append ordinary events after a
+        # terminal Turn event (or leak into a later Turn through a rebound
+        # sink).
+        if self._terminal_event is not None:
+            return self._terminal_event
         event = AgentEvent(
             schema_version=SCHEMA_VERSION,
             event_id=str(uuid4()),
@@ -465,7 +481,15 @@ class TurnEventEmitter:
             payload=json_safe(payload),
         )
         self._buffer.append(event)
+        if event_type in _TURN_TERMINAL_EVENT_TYPES:
+            self._terminal_event = event
         return event
+
+    @property
+    def terminal(self) -> bool:
+        """Whether this Turn's ordinary event channel is closed."""
+
+        return self._terminal_event is not None
 
     def model_response(self, response: LLMResponse, iteration: int) -> None:
         message = public_message(response.message)

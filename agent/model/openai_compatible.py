@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
+import hashlib
 import json
 from collections.abc import AsyncIterator
 import inspect
@@ -53,10 +55,19 @@ class OpenAICompatibleProvider(LLMProvider):
     HTTP client itself.
     """
 
-    def __init__(self, config: ProviderConfig, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        config: ProviderConfig,
+        client: Any | None = None,
+        *,
+        owns_client: bool | None = None,
+    ) -> None:
         self.config = config
         self.capabilities = config.capabilities
-        self._client = client or self._create_client(config)
+        self._client = client if client is not None else self._create_client(config)
+        # Injected clients remain owned by a standalone adapter for backwards
+        # compatibility; pooled adapters explicitly pass owns_client=False.
+        self._owns_client = True if owns_client is None else owns_client
 
     @staticmethod
     def _create_client(config: ProviderConfig) -> Any:
@@ -89,12 +100,15 @@ class OpenAICompatibleProvider(LLMProvider):
     async def close(self) -> None:
         """Release the owned SDK client when a Host lifecycle ends."""
 
+        if not self._owns_client:
+            return
         close = getattr(self._client, "close", None)
         if not callable(close):
             return
         result = close()
         if inspect.isawaitable(result):
             await result
+
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMEvent]:
         """Convert SDK Chat Completions chunks into provider-independent events."""
@@ -518,3 +532,93 @@ class OpenAICompatibleProvider(LLMProvider):
         return LLMConnectionError(
             f"Model request failed: {error}", provider=provider
         )
+
+
+class OpenAICompatibleClientPool:
+    """Bounded transport pool for lightweight per-Turn provider adapters.
+
+    Model and generation settings live on each adapter/configuration, while
+    endpoint, credential identity and timeout determine the HTTP transport.
+    Pooling at this provider-layer seam keeps SDK details below Runtime and
+    avoids one connection pool per Turn.
+    """
+
+    def __init__(self, *, max_clients: int = 16) -> None:
+        if (
+            isinstance(max_clients, bool)
+            or not isinstance(max_clients, int)
+            or max_clients < 1
+        ):
+            raise ValueError("max_clients must be a positive integer")
+        self._max_clients = max_clients
+        self._clients: OrderedDict[tuple[object, ...], Any] = OrderedDict()
+        self._retired_clients: list[Any] = []
+        self._retired_close_tasks: set[asyncio.Task[Any]] = set()
+        self._closed = False
+
+    @property
+    def client_count(self) -> int:
+        """Number of live transport clients retained by this pool."""
+
+        return len(self._clients)
+
+    def resolve(self, config: ProviderConfig) -> OpenAICompatibleProvider:
+        """Return a model-specific adapter backed by a pooled transport."""
+
+        if self._closed:
+            raise LLMConfigurationError("Provider client pool is closed")
+        key = self._transport_key(config)
+        client = self._clients.get(key)
+        if client is None:
+            client = OpenAICompatibleProvider._create_client(config)
+            self._clients[key] = client
+            self._clients.move_to_end(key)
+            while len(self._clients) > self._max_clients:
+                _, retired = self._clients.popitem(last=False)
+                self._schedule_close(retired)
+        else:
+            self._clients.move_to_end(key)
+        return OpenAICompatibleProvider(config, client=client, owns_client=False)
+
+    @staticmethod
+    def _transport_key(config: ProviderConfig) -> tuple[object, ...]:
+        # Do not retain the raw credential in the pool key; its digest still
+        # distinguishes rotated credentials for transport isolation.
+        credential_identity = hashlib.sha256(
+            config.api_key.encode("utf-8")
+        ).hexdigest()
+        return (config.provider, config.base_url, config.timeout, credential_identity)
+
+    def _schedule_close(self, client: Any) -> None:
+        close = getattr(client, "close", None)
+        if not callable(close):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._retired_clients.append(client)
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            task = loop.create_task(result)
+            self._retired_close_tasks.add(task)
+            task.add_done_callback(self._retired_close_tasks.discard)
+
+    async def aclose(self) -> None:
+        """Close every retained transport exactly once."""
+
+        if self._closed:
+            return
+        self._closed = True
+        clients = tuple(self._clients.values()) + tuple(self._retired_clients)
+        self._clients.clear()
+        self._retired_clients.clear()
+        for client in clients:
+            close = getattr(client, "close", None)
+            if not callable(close):
+                continue
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        if self._retired_close_tasks:
+            await asyncio.gather(*self._retired_close_tasks, return_exceptions=True)

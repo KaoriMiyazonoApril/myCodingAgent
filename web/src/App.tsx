@@ -2169,7 +2169,6 @@ function initialThreadState(thread: ThreadView) {
     state.error = null;
     state.files = [];
     state.cancel_requested = false;
-    state.approval = null;
   }
   return state;
 }

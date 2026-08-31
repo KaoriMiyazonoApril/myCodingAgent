@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 import inspect
 from uuid import uuid4
@@ -25,6 +26,11 @@ from .settings import ApprovalMode
 class _PendingApproval:
     approval_id: str
     future: asyncio.Future[bool]
+    tool_call: dict[str, object]
+    timeout_seconds: float
+    decision: str
+    reason_code: str
+    message: str
 
 
 class ToolCoordinator:
@@ -33,6 +39,7 @@ class ToolCoordinator:
     def __init__(
         self,
         *,
+        turn_id: str,
         registry: ToolRegistry,
         conversation: Conversation,
         events: TurnEventEmitter,
@@ -43,6 +50,7 @@ class ToolCoordinator:
         change_tracker: ChangeTracker,
         approval_mode: ApprovalMode = ApprovalMode.ON_REQUEST,
     ) -> None:
+        self._turn_id = turn_id
         self._registry = registry
         self._conversation = conversation
         self._events = events
@@ -56,6 +64,23 @@ class ToolCoordinator:
 
     def definitions(self) -> list[ToolDefinition]:
         return self._registry.definitions()
+
+    def pending_approval(self) -> dict[str, object] | None:
+        """Return the detached actionable approval state for Thread snapshots."""
+
+        pending = self._pending_approval
+        if pending is None or pending.future.done():
+            return None
+        return deepcopy(
+            {
+                "approval_id": pending.approval_id,
+                "tool_call": pending.tool_call,
+                "timeout_seconds": pending.timeout_seconds,
+                "decision": pending.decision,
+                "reason_code": pending.reason_code,
+                "message": pending.message,
+            }
+        )
 
     async def execute(self, calls: list[ToolCallBlock]) -> None:
         for index, call in enumerate(calls):
@@ -167,6 +192,9 @@ class ToolCoordinator:
         if policy_result.decision is PolicyDecision.REQUIRE_APPROVAL:
             if not await self._request_approval(call, policy_result):
                 return self._denied_result(policy_result, approval_denied=True)
+        set_context = getattr(self._registry, "set_session_context", None)
+        if callable(set_context):
+            set_context(turn_id=self._turn_id)
         self._registry.set_event_sink(self._events.emit)
         execution_profile = policy_result.execution_profile
         self._events.tool_started(call)
@@ -191,7 +219,7 @@ class ToolCoordinator:
             )
             result = await self._controller.wait(execution)
         except (TurnLimitReached, asyncio.CancelledError):
-            self._registry.cancel_active_sessions()
+            self._registry.cancel_active_sessions(self._turn_id)
             self._change_tracker.execution_interrupted(call)
             raise
         self._change_tracker.after_execution(call, result)
@@ -205,7 +233,15 @@ class ToolCoordinator:
         loop = asyncio.get_running_loop()
         approval_id = str(uuid4())
         approval = loop.create_future()
-        self._pending_approval = _PendingApproval(approval_id, approval)
+        self._pending_approval = _PendingApproval(
+            approval_id=approval_id,
+            future=approval,
+            tool_call=public_tool_call(call),
+            timeout_seconds=self._approval_timeout_seconds,
+            decision=policy_result.decision.value,
+            reason_code=policy_result.reason_code,
+            message=policy_result.message,
+        )
         self._controller.pause_deadline()
         self._set_waiting(True)
         self._events.emit(

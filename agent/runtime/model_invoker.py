@@ -130,7 +130,8 @@ class ModelInvoker:
             except asyncio.CancelledError:
                 raise
             except LLMError as error:
-                if on_event is not None and delta_seen and not error_event_delivered:
+                terminal_error = delta_seen or not error.retryable or attempt == 2
+                if on_event is not None and terminal_error and not error_event_delivered:
                     on_event(
                         ErrorEvent(
                             message=str(error),
@@ -143,7 +144,7 @@ class ModelInvoker:
                     if isinstance(fallback_response, LLMResponse):
                         return fallback_response
                     return await self.chat(messages, tools)
-                if delta_seen or not error.retryable or attempt == 2:
+                if terminal_error:
                     raise
                 delay = (
                     self._retry_delays[attempt]

@@ -25,6 +25,7 @@ AsyncToolExecutor = Callable[[dict[str, object]], Awaitable[ToolResult]]
 CloseCallback = Callable[[], object]
 EventSink = Callable[[str, dict[str, object]], object]
 ExecutionProfileSetter = Callable[[object | None], None]
+SessionContextSetter = Callable[..., None]
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,8 @@ class ToolRegistry:
         self._async_on_close = async_on_close
         self._closed = False
         self._event_sink_setters: list[Callable[[EventSink | None], None]] = []
-        self._session_cancellers: list[Callable[[], None]] = []
+        self._session_cancellers: list[Callable[..., None]] = []
+        self._session_context_setters: list[SessionContextSetter] = []
         self._execution_profile_setters: list[ExecutionProfileSetter] = []
 
     def bind_event_sink(
@@ -61,10 +63,24 @@ class ToolRegistry:
         for setter in self._event_sink_setters:
             setter(sink)
 
-    def bind_session_canceller(self, canceller: Callable[[], None]) -> None:
+    def bind_session_canceller(self, canceller: Callable[..., None]) -> None:
         """Bind Turn-cancellation cleanup for stateful capabilities."""
 
         self._session_cancellers.append(canceller)
+
+    def bind_session_context_setter(self, setter: SessionContextSetter) -> None:
+        """Bind immutable owner context capture for newly-created sessions."""
+
+        self._session_context_setters.append(setter)
+
+    def set_session_context(
+        self,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> None:
+        for setter in self._session_context_setters:
+            setter(thread_id=thread_id, turn_id=turn_id)
 
     def bind_execution_profile_setter(self, setter: ExecutionProfileSetter) -> None:
         """Bind the sandbox profile seam for command-capable tools."""
@@ -75,11 +91,17 @@ class ToolRegistry:
         for setter in self._execution_profile_setters:
             setter(profile)
 
-    def cancel_active_sessions(self) -> None:
-        """Request cleanup of running session capabilities owned by this Thread."""
+    def cancel_active_sessions(self, owner_turn_id: str | None = None) -> None:
+        """Request cleanup of sessions owned by one Turn or whole Thread."""
 
         for canceller in self._session_cancellers:
-            canceller()
+            try:
+                canceller(owner_turn_id)
+            except TypeError:
+                # Keep compatibility with simple embedders whose cleanup
+                # callback predates owner-filtered cancellation.
+                if owner_turn_id is None:
+                    canceller()
 
     def close(self) -> bool:
         """Close owned resources once and report whether this call did so."""

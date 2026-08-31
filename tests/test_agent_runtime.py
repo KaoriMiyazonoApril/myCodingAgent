@@ -2531,6 +2531,10 @@ def test_external_approval_resumes_with_execution_or_policy_denial(
             await asyncio.sleep(0.005)
         snapshot = runtime.get_snapshot(thread.thread_id)
         assert snapshot.status is ThreadStatus.WAITING_APPROVAL
+        assert snapshot.pending_approval is not None
+        assert snapshot.pending_approval["approval_id"]
+        assert snapshot.pending_approval["tool_call"]["id"] == "approval-call"
+        assert snapshot.pending_approval["reason_code"]
         approval_event = next(
             event
             for event in runtime.get_events(thread.thread_id).events

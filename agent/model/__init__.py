@@ -1,6 +1,6 @@
 """Provider-independent LLM data structures and OpenAI-compatible adapter."""
 
-from .openai_compatible import OpenAICompatibleProvider
+from .openai_compatible import OpenAICompatibleClientPool, OpenAICompatibleProvider
 from .presets import PROVIDER_PRESETS, create_provider_config
 from .types import (
     LLMRequest,
@@ -19,6 +19,7 @@ __all__ = [
     "LLMResponse",
     "ModelProfile",
     "OpenAICompatibleProvider",
+    "OpenAICompatibleClientPool",
     "PROVIDER_PRESETS",
     "ProviderCapabilities",
     "ProviderConfig",

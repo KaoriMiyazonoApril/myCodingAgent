@@ -4,6 +4,11 @@
 > [autonomous-web-workspace-refactor-spec.md](autonomous-web-workspace-refactor-spec.md)
 > 取代。Web 端项目选择现在只使用 Host filesystem browser；原生 picker、PowerShell
 > dialog、Windows path translation 和对应 transport API 均不再属于系统架构。
+>
+> 本文保留后续 Workstream 的历史记录，不是当前安全规范。凡与新规格冲突的旧描述（包括
+> 递归拒绝内部 symlink/hard-link 或旧的 link syscall 限制）均不具规范效力；当前实现遵循
+> access-time canonical containment，并允许 workspace-internal alias。见
+> [current-architecture.md](current-architecture.md)。
 
 ## 1. 目的与交付顺序
 

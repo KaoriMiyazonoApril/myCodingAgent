@@ -23,7 +23,10 @@ from agent.model.errors import (
     LLMRateLimitError,
     LLMRequestError,
 )
-from agent.model.openai_compatible import OpenAICompatibleProvider
+from agent.model.openai_compatible import (
+    OpenAICompatibleClientPool,
+    OpenAICompatibleProvider,
+)
 from agent.model.presets import create_provider_config
 from agent.model.types import (
     LLMRequest,
@@ -71,6 +74,56 @@ def test_provider_close_releases_async_sdk_client() -> None:
     asyncio.run(configured.close())
 
     assert client.closed is True
+
+
+def test_provider_client_pool_reuses_transport_across_model_adapters(monkeypatch) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    clients: list[Client] = []
+
+    def create_client(config):
+        del config
+        client = Client()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        OpenAICompatibleProvider,
+        "_create_client",
+        staticmethod(create_client),
+    )
+    pool = OpenAICompatibleClientPool()
+    first = pool.resolve(
+        ProviderConfig(
+            provider="deepseek",
+            base_url="https://example.invalid/v1",
+            api_key="test-key",
+            model="model-a",
+        )
+    )
+    second = pool.resolve(
+        ProviderConfig(
+            provider="deepseek",
+            base_url="https://example.invalid/v1",
+            api_key="test-key",
+            model="model-b",
+        )
+    )
+
+    assert pool.client_count == 1
+    assert len(clients) == 1
+    await_first = first.close()
+    await_second = second.close()
+    asyncio.run(await_first)
+    asyncio.run(await_second)
+    assert clients[0].close_calls == 0
+    asyncio.run(pool.aclose())
+    assert clients[0].close_calls == 1
 
 
 def response(*, content: str | None, tool_calls=None, usage=None):

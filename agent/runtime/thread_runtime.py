@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from agent.model.errors import LLMError
 from agent.model.provider import LLMProvider
+from agent.model.types import ProviderCapabilities
 from agent.tools.registry import ToolRegistry
 
 from .conversation import Conversation
@@ -109,6 +110,7 @@ class _ThreadRecord:
     idempotent_submissions: dict[str, _IdempotentSubmission] = field(
         default_factory=dict
     )
+    preflight_turn_id: str | None = None
     closing: bool = False
 
 
@@ -223,6 +225,9 @@ class ThreadRuntime:
             updated_at=created_at,
             events=EventBuffer(self._event_buffer_capacity),
         )
+        set_context = getattr(record.tools, "set_session_context", None)
+        if callable(set_context):
+            set_context(thread_id=thread_id, turn_id=None)
         assert record.events is not None
         record.events.set_durable_sink(
             lambda event, current=record: self._on_durable_event(current, event)
@@ -286,6 +291,9 @@ class ThreadRuntime:
                     for key, value in state.idempotency.items()
                 },
             )
+            set_context = getattr(record.tools, "set_session_context", None)
+            if callable(set_context):
+                set_context(thread_id=record.thread_id, turn_id=None)
             events.set_durable_sink(
                 lambda event, current=record: self._on_durable_event(current, event)
             )
@@ -424,9 +432,14 @@ class ThreadRuntime:
 
         if event not in record.durable_events:
             record.durable_events.append(event)
-        self._persist_record(record)
+        self._persist_record(record, new_events=(event,))
 
-    def _persist_record(self, record: _ThreadRecord) -> None:
+    def _persist_record(
+        self,
+        record: _ThreadRecord,
+        *,
+        new_events: tuple[AgentEvent, ...] = (),
+    ) -> None:
         """Write one detached semantic state transition through ThreadStore."""
 
         events = record.events
@@ -467,7 +480,11 @@ class ThreadRuntime:
                 for key, value in record.idempotent_submissions.items()
             },
         )
-        self._store.save_thread(state)
+        transition = getattr(self._store, "save_thread_transition", None)
+        if callable(transition):
+            transition(state, new_events=new_events)
+        else:
+            self._store.save_thread(state)
 
     async def run_turn(
         self,
@@ -499,11 +516,15 @@ class ThreadRuntime:
                     return deepcopy(existing.summary)
                 assert existing.future is not None
                 return deepcopy(await asyncio.shield(existing.future))
-        if record.status is not ThreadStatus.IDLE:
+        if record.status is not ThreadStatus.IDLE or record.preflight_turn_id is not None:
             if record.status is ThreadStatus.CLOSED or record.closing:
                 raise ThreadClosedError(f"thread is closed: {thread_id}")
             raise ThreadBusyError(f"thread already has an active turn: {thread_id}")
         turn_id = str(uuid4())
+        # Reserve the Turn slot before the first await.  Host submissions have
+        # their own starting marker, but direct Runtime callers must also be
+        # unable to race two preflight phases into one Thread.
+        record.preflight_turn_id = turn_id
         assert record.events is not None
         events = TurnEventEmitter(
             thread_id=thread_id,
@@ -534,21 +555,29 @@ class ThreadRuntime:
                     reasoning_visibility=self._reasoning_visibility,
                 )
             )
-            provider = self._provider_resolver(
-                turn_config.provider_config_id,
-                turn_config.model,
-            )
-            model = ModelInvoker(
-                provider,
-                turn_config,
-                retry_delays=self._model_retry_delays,
-                default_context_window_tokens=self._default_context_window_tokens,
-            )
+            # Acquire the workspace lease and complete the provider-free
+            # context preflight before resolving a model client.  Rejected
+            # Turns therefore do not allocate an HTTP transport.
+            workspace_lease = self._workspace_leases.acquire(record.workspace)
+            if record.status is ThreadStatus.CLOSED or record.closing:
+                raise ThreadClosedError(f"thread is closed: {thread_id}")
+            provider_capabilities = self._provider_capabilities_for(turn_config)
+            provider: LLMProvider | None = None
+            if provider_capabilities is None:
+                # Legacy/in-memory resolvers may expose capabilities only on
+                # the provider object.  Keep that compatibility path while
+                # production resolvers use ``capabilities_for`` above to stay
+                # lazy about HTTP client construction.
+                provider = self._provider_resolver(
+                    turn_config.provider_config_id,
+                    turn_config.model,
+                )
+                provider_capabilities = provider.capabilities
             task_state = TaskState(goal=user_text)
             context_manager = self._context_manager_for(
                 record,
                 turn_config,
-                provider,
+                provider_capabilities,
             )
             context_manager.assemble(
                 record.conversation.canonical_messages(),
@@ -557,14 +586,25 @@ class ThreadRuntime:
                 task_state=task_state,
                 tools=record.tools.definitions(),
             )
-            workspace_lease = self._workspace_leases.acquire(record.workspace)
-            if record.status is ThreadStatus.CLOSED or record.closing:
-                raise ThreadClosedError(f"thread is closed: {thread_id}")
+            if provider is None:
+                provider = self._provider_resolver(
+                    turn_config.provider_config_id,
+                    turn_config.model,
+                )
+            model = ModelInvoker(
+                provider,
+                turn_config,
+                retry_delays=self._model_retry_delays,
+                default_context_window_tokens=self._default_context_window_tokens,
+            )
         except BaseException as error:
             events.emit("turn_rejected", self._preflight_rejection(error))
             if workspace_lease is not None:
                 self._workspace_leases.release(workspace_lease)
             raise
+        finally:
+            if record.preflight_turn_id == turn_id:
+                record.preflight_turn_id = None
         record.status = ThreadStatus.RUNNING
         submission: _IdempotentSubmission | None = None
         try:
@@ -576,6 +616,7 @@ class ThreadRuntime:
             controller.bind(current_task)
             changes = ChangeTracker(record.workspace, events)
             tools = ToolCoordinator(
+                turn_id=turn_id,
                 registry=record.tools,
                 conversation=record.conversation,
                 events=events,
@@ -674,7 +715,7 @@ class ThreadRuntime:
         self,
         record: _ThreadRecord,
         turn_config: TurnConfig,
-        provider: LLMProvider,
+        provider_capabilities: ProviderCapabilities | None,
     ) -> ContextManager:
         """Create one request-context assembler for a frozen Turn config."""
 
@@ -683,12 +724,31 @@ class ThreadRuntime:
             project_instructions_provider=self._project_instructions_provider,
             budget=ContextBudget(
                 context_window_tokens=(
-                    provider.capabilities.context_window_tokens
+                    (
+                        provider_capabilities.context_window_tokens
+                        if provider_capabilities is not None
+                        else None
+                    )
                     or self._default_context_window_tokens
                 ),
                 output_tokens=turn_config.max_tokens,
             ),
         )
+
+    def _provider_capabilities_for(
+        self,
+        turn_config: TurnConfig,
+    ) -> ProviderCapabilities | None:
+        """Read provider capabilities without constructing its HTTP client."""
+
+        capabilities_for = getattr(self._provider_resolver, "capabilities_for", None)
+        if not callable(capabilities_for):
+            return None
+        capabilities = capabilities_for(
+            turn_config.provider_config_id,
+            turn_config.model,
+        )
+        return capabilities if isinstance(capabilities, ProviderCapabilities) else None
 
     @staticmethod
     def _runtime_context_for(
@@ -943,6 +1003,11 @@ class ThreadRuntime:
         active_turn_id = (
             None if record.active_turn is None else record.active_turn.turn_id
         )
+        pending_approval = (
+            None
+            if record.active_turn is None
+            else record.active_turn.tools.pending_approval()
+        )
         return ThreadSnapshot(
             schema_version=SCHEMA_VERSION,
             thread_id=record.thread_id,
@@ -955,6 +1020,7 @@ class ThreadRuntime:
             created_at=record.created_at,
             updated_at=record.updated_at,
             latest_turn=deepcopy(record.latest_turn),
+            pending_approval=pending_approval,
             turns=deepcopy(record.turns),
         )
 

@@ -167,3 +167,36 @@ def test_local_store_rejects_newer_schema(tmp_path) -> None:
 
     with pytest.raises(ThreadStoreError, match="schema version"):
         LocalThreadStore(database)
+
+
+def test_local_store_incremental_transition_does_not_rebuild_event_log(tmp_path) -> None:
+    database = tmp_path / "incremental.db"
+    store = LocalThreadStore(database)
+    state = _state()
+    state.events = []
+    state.event_sequence = 0
+    store.save_thread(state)
+    statements: list[str] = []
+    store._connection.set_trace_callback(statements.append)
+
+    for sequence in range(1, 25):
+        event = AgentEvent(
+            schema_version=1,
+            event_id=f"event-{sequence}",
+            thread_id=state.thread_id,
+            turn_id="turn-1",
+            sequence=sequence,
+            type="tool_finished",
+            timestamp="2026-01-01T00:00:01Z",
+            payload={"sequence": sequence},
+        )
+        state.events.append(event)
+        state.event_sequence = sequence
+        store.save_thread_transition(state, new_events=(event,))
+
+    assert not any("DELETE FROM thread_events" in statement for statement in statements)
+    assert sum("INSERT OR IGNORE INTO thread_events" in statement for statement in statements) == 24
+    restored = store.get_thread(state.thread_id)
+    assert restored is not None
+    assert [event.sequence for event in restored.events] == list(range(1, 25))
+    store.close()
