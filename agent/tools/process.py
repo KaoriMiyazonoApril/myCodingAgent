@@ -1338,13 +1338,19 @@ class ProcessManager:
             if session_id in self._dead_sessions:
                 raise ToolOperationError("SESSION_DEAD", "process session has exited")
             raise ToolOperationError("SESSION_NOT_FOUND", "unknown process session")
+        interaction_turn_id = self._current_turn_id
         try:
             if chars and not session.running:
                 raise ToolOperationError("SESSION_DEAD", "process session has exited")
             result = await session.interact(chars, yield_time_ms)
         except asyncio.CancelledError:
-            self._drop_session(session_id)
-            await session.close()
+            # A later Turn may poll or write a Thread-persistent Session without
+            # taking ownership of it.  Cancelling that interaction must unwind
+            # only the caller; owner-filtered Turn cleanup below will terminate
+            # the Session iff this Turn actually created it.
+            if session.owner_turn_id == interaction_turn_id:
+                self._drop_session(session_id)
+                await session.close()
             raise
         if result.metadata.get("status") == "exited":
             self._drop_session(session_id)
@@ -1368,15 +1374,9 @@ class ProcessManager:
             self._mark_dead(session.session_id)
             session.close_sync()
             self._schedule_cleanup(session)
-        completed_ids = [
-            session_id
-            for session_id, result in self._exited_sessions.items()
-            if owner_turn_id is None
-            or result.metadata.get("owner_turn_id") == owner_turn_id
-        ]
-        for session_id in completed_ids:
-            self._exited_sessions.pop(session_id, None)
-            self._mark_dead(session_id)
+        # Naturally completed results are no longer active resources and keep
+        # their one bounded final-poll contract even if their creator Turn is
+        # cancelled after process exit.
 
     def close(self) -> None:
         """Idempotently terminate sessions and release the sandbox resource."""

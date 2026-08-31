@@ -115,6 +115,9 @@ export function hydrateThread(view: ThreadView): EventState {
       ...(typeof pending.decision === "string"
         ? { decision: pending.decision }
         : {}),
+      ...(typeof pending.execution_profile === "string"
+        ? { execution_profile: pending.execution_profile }
+        : {}),
       reason_code:
         typeof pending.reason_code === "string"
           ? pending.reason_code
@@ -274,6 +277,9 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
           : {}),
         ...(typeof event.payload.decision === "string"
           ? { decision: event.payload.decision }
+          : {}),
+        ...(typeof event.payload.execution_profile === "string"
+          ? { execution_profile: event.payload.execution_profile }
           : {}),
         reason_code:
           typeof event.payload.reason_code === "string"

@@ -16,6 +16,7 @@ from agent.host.model_catalog import (
     ProviderResponseError,
 )
 from agent.host.provider_config import ProviderConfigurationError, ProviderStore
+from agent.host.thread_service import ProductionRuntimeFactory
 
 
 class _Catalog:
@@ -31,6 +32,29 @@ class _RejectedCatalog:
 class _UnexpectedCatalog:
     async def discover(self, provider_id: str, api_key: str) -> ModelDiscovery:
         raise RuntimeError(f"unexpected failure for {api_key} at /private/config")
+
+
+def test_production_factory_closes_store_even_if_provider_shutdown_fails() -> None:
+    class FailingPool:
+        async def aclose(self) -> None:
+            raise RuntimeError("provider close failed")
+
+    class Store:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    factory = object.__new__(ProductionRuntimeFactory)
+    factory._provider_pool = FailingPool()
+    thread_store = Store()
+    factory._thread_store = thread_store
+
+    with pytest.raises(RuntimeError, match="provider close failed"):
+        asyncio.run(factory.close())
+
+    assert thread_store.closed is True
 
 
 def test_provider_configuration_persists_without_exposing_secret(tmp_path) -> None:

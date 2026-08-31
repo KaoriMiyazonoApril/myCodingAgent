@@ -200,3 +200,20 @@ def test_local_store_incremental_transition_does_not_rebuild_event_log(tmp_path)
     assert restored is not None
     assert [event.sequence for event in restored.events] == list(range(1, 25))
     store.close()
+
+
+def test_local_store_full_save_replaces_the_complete_event_set(tmp_path) -> None:
+    store = LocalThreadStore(tmp_path / "replace.db")
+    state = _state()
+    assert state.events
+    store.save_thread(state)
+
+    state.events = []
+    state.event_sequence = 0
+    store.save_thread(state)
+
+    restored = store.get_thread(state.thread_id)
+    assert restored is not None
+    assert restored.events == []
+    assert restored.event_sequence == 0
+    store.close()

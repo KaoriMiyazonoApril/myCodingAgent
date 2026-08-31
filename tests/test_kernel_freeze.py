@@ -88,6 +88,43 @@ def test_process_session_owner_and_turn_cancellation_are_isolated(tmp_path) -> N
     asyncio.run(scenario())
 
 
+def test_cancelling_cross_turn_poll_does_not_kill_session_owner(tmp_path) -> None:
+    async def scenario() -> None:
+        manager = ProcessManager(
+            WorkspaceFilesystem(tmp_path),
+            sandbox_backend=DeterministicSandboxBackend(),
+            owner_thread_id="thread-1",
+        )
+        manager.set_session_context(turn_id="turn-a")
+        started = await manager.exec(
+            "read line; printf 'A:%s' \"$line\"", yield_time_ms=0
+        )
+        session_id = str(started.metadata["session_id"])
+
+        # Turn B is allowed to interact with a Thread-persistent Session, but
+        # cancelling that interaction must not transfer ownership or kill the
+        # Session created by Turn A.
+        manager.set_session_context(turn_id="turn-b")
+        polling = asyncio.create_task(
+            manager.write_stdin(session_id, yield_time_ms=300_000)
+        )
+        await asyncio.sleep(0.02)
+        polling.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await polling
+        manager.cancel_active("turn-b")
+
+        completed = await manager.write_stdin(
+            session_id, chars="still-alive\n", yield_time_ms=100
+        )
+        assert completed.metadata["status"] == "exited"
+        assert completed.metadata["owner_turn_id"] == "turn-a"
+        assert completed.metadata["stdout"] == "A:still-alive"
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_completed_process_resources_and_tombstones_are_bounded(tmp_path) -> None:
     async def scenario() -> None:
         manager = ProcessManager(
@@ -104,6 +141,33 @@ def test_completed_process_resources_and_tombstones_are_bounded(tmp_path) -> Non
         assert manager.active_session_count == 0
         assert manager.completed_session_count <= 2
         assert manager.dead_session_count <= 2
+        await manager.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_turn_cancellation_preserves_naturally_completed_final_poll(tmp_path) -> None:
+    async def scenario() -> None:
+        manager = ProcessManager(
+            WorkspaceFilesystem(tmp_path),
+            sandbox_backend=DeterministicSandboxBackend(),
+            owner_thread_id="thread-1",
+        )
+        manager.set_session_context(turn_id="turn-a")
+        started = await manager.exec("printf completed", yield_time_ms=0)
+        session_id = str(started.metadata["session_id"])
+        for _ in range(100):
+            if manager.completed_session_count:
+                break
+            await asyncio.sleep(0.01)
+        assert manager.completed_session_count == 1
+
+        manager.cancel_active("turn-a")
+
+        final = await manager.write_stdin(session_id, yield_time_ms=0)
+        assert final.metadata["status"] == "exited"
+        assert final.metadata["owner_turn_id"] == "turn-a"
+        assert final.metadata["stdout"] == "completed"
         await manager.aclose()
 
     asyncio.run(scenario())

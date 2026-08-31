@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
+import logging
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -65,6 +66,9 @@ from .types import SCHEMA_VERSION, ThreadSnapshot, ThreadStatus, TurnStatus, Tur
 from .tool_coordinator import ToolCoordinator
 from .workspace_lease import WorkspaceLease, WorkspaceLeaseManager
 from .workspace_validator import WorkspaceValidator
+
+
+logger = logging.getLogger(__name__)
 
 
 ToolRegistryFactory = Callable[[Path], ToolRegistry]
@@ -533,6 +537,7 @@ class ThreadRuntime:
             reasoning_visibility=self._reasoning_visibility,
         )
         workspace_lease: WorkspaceLease | None = None
+        provider: LLMProvider | None = None
         try:
             # A restored Thread remains readable when its root disappeared,
             # but a new Turn must fail before provider/tool execution and must
@@ -562,7 +567,6 @@ class ThreadRuntime:
             if record.status is ThreadStatus.CLOSED or record.closing:
                 raise ThreadClosedError(f"thread is closed: {thread_id}")
             provider_capabilities = self._provider_capabilities_for(turn_config)
-            provider: LLMProvider | None = None
             if provider_capabilities is None:
                 # Legacy/in-memory resolvers may expose capabilities only on
                 # the provider object.  Keep that compatibility path while
@@ -601,6 +605,7 @@ class ThreadRuntime:
             events.emit("turn_rejected", self._preflight_rejection(error))
             if workspace_lease is not None:
                 self._workspace_leases.release(workspace_lease)
+            await self._release_turn_provider(provider)
             raise
         finally:
             if record.preflight_turn_id == turn_id:
@@ -682,16 +687,21 @@ class ThreadRuntime:
                     submission.future.cancel()
             raise
         finally:
-            record.status = (
-                ThreadStatus.CLOSED if record.closing else ThreadStatus.IDLE
-            )
-            record.active_turn = None
-            record.updated_at = utc_now()
-            self._persist_record(record)
-            assert workspace_lease is not None
-            self._workspace_leases.release(workspace_lease)
-            if record.closing:
-                await record.tools.aclose()
+            try:
+                record.status = (
+                    ThreadStatus.CLOSED if record.closing else ThreadStatus.IDLE
+                )
+                record.active_turn = None
+                record.updated_at = utc_now()
+                self._persist_record(record)
+            finally:
+                assert workspace_lease is not None
+                self._workspace_leases.release(workspace_lease)
+                try:
+                    if record.closing:
+                        await record.tools.aclose()
+                finally:
+                    await self._release_turn_provider(provider)
 
     async def aclose(self) -> None:
         """Await cleanup for every Thread-owned stateful tool capability."""
@@ -749,6 +759,18 @@ class ThreadRuntime:
             turn_config.model,
         )
         return capabilities if isinstance(capabilities, ProviderCapabilities) else None
+
+    @staticmethod
+    async def _release_turn_provider(provider: LLMProvider | None) -> None:
+        if provider is None:
+            return
+        try:
+            await provider.close()
+        except Exception:
+            # A transport pool remains the Host-level owner and will retry
+            # cleanup during shutdown; one adapter release must not corrupt a
+            # completed Turn transition.
+            logger.exception("Failed to release Turn-scoped model provider")
 
     @staticmethod
     def _runtime_context_for(
@@ -809,6 +831,10 @@ class ThreadRuntime:
                 event_type="turn_limit_reached",
             )
         except asyncio.CancelledError:
+            # Cancellation can arrive after a process-starting tool has returned,
+            # while the next model invocation is active.  Reap every session
+            # created by this Turn before sealing its event channel.
+            active_turn.tools.cancel_owned_sessions()
             return self._finish_turn(
                 record,
                 active_turn,

@@ -17,7 +17,10 @@ from agent.core.messages import (
     ToolCallBlock,
     ToolResultBlock,
 )
-from agent.model.openai_compatible import OpenAICompatibleProvider
+from agent.model.openai_compatible import (
+    OpenAICompatibleClientPool,
+    OpenAICompatibleProvider,
+)
 from agent.model.errors import LLMAuthenticationError, LLMConnectionError
 from agent.model.provider import LLMProvider
 from agent.model.types import (
@@ -1915,6 +1918,145 @@ def test_execution_deadline_cancels_a_slow_model_call(tmp_path) -> None:
     assert runtime.get_snapshot(thread.thread_id).status is ThreadStatus.IDLE
 
 
+def test_provider_resolution_is_skipped_for_context_limit_and_workspace_busy(
+    tmp_path,
+) -> None:
+    resolutions: list[tuple[str, str]] = []
+
+    def resolve(provider_id: str, model: str) -> LLMProvider:
+        resolutions.append((provider_id, model))
+        raise AssertionError("provider transport must not be created")
+
+    resolve.capabilities_for = lambda provider_id, model: ProviderCapabilities(  # type: ignore[attr-defined]
+        context_window_tokens=1
+    )
+    context_runtime = ThreadRuntime(
+        provider_resolver=resolve,
+        default_settings=ModelSettings(
+            provider_config_id="test-provider",
+            model="test-model",
+        ),
+        tool_registry_factory=empty_tools,
+    )
+    context_thread = context_runtime.create_thread(tmp_path)
+
+    with pytest.raises(ContextLimitError):
+        asyncio.run(context_runtime.run_turn(context_thread.thread_id, "too large"))
+
+    busy_runtime = ThreadRuntime(
+        provider_resolver=resolve,
+        default_settings=ModelSettings(
+            provider_config_id="test-provider",
+            model="test-model",
+        ),
+        tool_registry_factory=empty_tools,
+    )
+    busy_thread = busy_runtime.create_thread(tmp_path)
+    held = busy_runtime._workspace_leases.acquire(tmp_path)
+    try:
+        with pytest.raises(WorkspaceBusyError):
+            asyncio.run(busy_runtime.run_turn(busy_thread.thread_id, "blocked"))
+    finally:
+        busy_runtime._workspace_leases.release(held)
+
+    assert resolutions == []
+
+
+@pytest.mark.parametrize("model_error", [False, True])
+def test_turn_releases_provider_adapter_after_success_or_model_error(
+    tmp_path,
+    model_error: bool,
+) -> None:
+    class CloseTrackingProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def chat(self, request: LLMRequest) -> LLMResponse:
+            if model_error:
+                raise LLMConnectionError("failed", retryable=False)
+            return final_response("done")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    provider = CloseTrackingProvider()
+    runtime = runtime_for_provider(provider)
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "run"))
+
+    assert summary.status is (TurnStatus.FAILED if model_error else TurnStatus.COMPLETED)
+    assert provider.close_calls == 1
+
+
+def test_many_turns_reuse_one_production_transport(monkeypatch, tmp_path) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(
+                completions=RecordingCompletions(
+                    [sdk_response("done") for _ in range(20)]
+                )
+            )
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    clients: list[Client] = []
+
+    def create_client(config: ProviderConfig) -> Client:
+        del config
+        client = Client()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        OpenAICompatibleProvider,
+        "_create_client",
+        staticmethod(create_client),
+    )
+    pool = OpenAICompatibleClientPool()
+
+    def resolve(provider_id: str, model: str) -> LLMProvider:
+        return pool.resolve(
+            ProviderConfig(
+                provider=provider_id,
+                base_url="https://example.invalid/v1",
+                api_key="test-key",
+                model=model,
+            )
+        )
+
+    resolve.capabilities_for = lambda provider_id, model: ProviderCapabilities(  # type: ignore[attr-defined]
+        context_window_tokens=32_000
+    )
+    runtime = ThreadRuntime(
+        provider_resolver=resolve,
+        default_settings=ModelSettings(
+            provider_config_id="deepseek",
+            model="model-a",
+        ),
+        tool_registry_factory=empty_tools,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    async def scenario() -> list[TurnSummary]:
+        summaries = [
+            await runtime.run_turn(thread.thread_id, f"turn {index}")
+            for index in range(20)
+        ]
+        assert pool.client_count == 1
+        await runtime.aclose()
+        await pool.aclose()
+        return summaries
+
+    summaries = asyncio.run(scenario())
+
+    assert all(summary.status is TurnStatus.COMPLETED for summary in summaries)
+    assert len(clients) == 1
+    assert clients[0].close_calls == 1
+
+
 def test_approval_pause_rearms_an_already_active_execution_deadline() -> None:
     async def scenario() -> str:
         controller = RunController(AgentLimits(max_execution_seconds=0.03))
@@ -1956,6 +2098,30 @@ def test_cancelling_an_active_model_call_returns_a_cancelled_summary(tmp_path) -
     ]
 
 
+def test_cancelling_model_call_releases_turn_provider_adapter(tmp_path) -> None:
+    class CloseTrackingProvider(PausingProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    async def scenario() -> tuple[TurnSummary, CloseTrackingProvider]:
+        provider = CloseTrackingProvider()
+        runtime = runtime_for_provider(provider)
+        thread = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(runtime.run_turn(thread.thread_id, "cancel"))
+        await provider.started.wait()
+        assert runtime.cancel_turn(thread.thread_id)
+        return await active, provider
+
+    summary, provider = asyncio.run(scenario())
+
+    assert summary.status is TurnStatus.CANCELLED
+    assert provider.close_calls == 1
+
+
 def test_cancelling_run_command_terminates_its_process_group(tmp_path) -> None:
     async def scenario():
         provider = ScriptedProvider(
@@ -1995,6 +2161,71 @@ def test_cancelling_run_command_terminates_its_process_group(tmp_path) -> None:
     assert summary.status is TurnStatus.CANCELLED
     with pytest.raises(ProcessLookupError):
         os.kill(process_id, 0)
+
+
+def test_cancelling_turn_during_next_model_call_reaps_its_persistent_session(
+    tmp_path,
+) -> None:
+    class ProcessThenPauseProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+            self.second_call_started = asyncio.Event()
+
+        async def chat(self, request: LLMRequest) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                return tool_response(
+                    ToolCallBlock(
+                        id="persistent-command",
+                        name="exec_command",
+                        arguments={
+                            "command": (
+                                "printf '%s' $$ > persistent.pid; read line"
+                            ),
+                            "yield_time_ms": 0,
+                            "timeout_ms": 60_000,
+                        },
+                    )
+                )
+            self.second_call_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def scenario():
+        provider = ProcessThenPauseProvider()
+        runtime = runtime_for_provider(
+            provider,
+            tool_registry_factory=create_test_tool_registry,
+            tool_policy=AllowAllPolicy(),
+        )
+        thread = runtime.create_thread(tmp_path)
+        active = asyncio.create_task(runtime.run_turn(thread.thread_id, "Run."))
+        await asyncio.wait_for(provider.second_call_started.wait(), timeout=2)
+        pid_file = tmp_path / "persistent.pid"
+        for _ in range(100):
+            if pid_file.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert pid_file.exists()
+        process_id = int(pid_file.read_text(encoding="utf-8"))
+
+        assert runtime.cancel_turn(thread.thread_id) is True
+        summary = await active
+        process_alive = True
+        for _ in range(100):
+            try:
+                os.kill(process_id, 0)
+            except ProcessLookupError:
+                process_alive = False
+                break
+            await asyncio.sleep(0.01)
+        await runtime.aclose()
+        return summary, process_alive
+
+    summary, process_alive = asyncio.run(scenario())
+
+    assert summary.status is TurnStatus.CANCELLED
+    assert process_alive is False
 
 
 def test_cancelling_a_sync_file_tool_keeps_lease_until_changes_are_tracked(
@@ -2535,6 +2766,7 @@ def test_external_approval_resumes_with_execution_or_policy_denial(
         assert snapshot.pending_approval["approval_id"]
         assert snapshot.pending_approval["tool_call"]["id"] == "approval-call"
         assert snapshot.pending_approval["reason_code"]
+        assert snapshot.pending_approval["execution_profile"] == "workspace_write"
         approval_event = next(
             event
             for event in runtime.get_events(thread.thread_id).events

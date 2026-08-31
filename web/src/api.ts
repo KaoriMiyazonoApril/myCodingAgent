@@ -140,6 +140,7 @@ export type PendingApproval = {
   tool_call: Record<string, unknown> | null;
   timeout_seconds?: number;
   decision?: string;
+  execution_profile?: string;
   reason_code: string;
   message: string;
 };

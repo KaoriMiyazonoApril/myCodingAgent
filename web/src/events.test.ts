@@ -118,6 +118,7 @@ test("hydrates a pending approval from a snapshot without replaying its event", 
         tool_call: { id: "call-snapshot", name: "run_command" },
         timeout_seconds: 300,
         decision: "require_approval",
+        execution_profile: "workspace_write_network",
         reason_code: "NETWORK_COMMAND",
         message: "command requires approval",
       },
@@ -129,6 +130,7 @@ test("hydrates a pending approval from a snapshot without replaying its event", 
     tool_call: { id: "call-snapshot", name: "run_command" },
     timeout_seconds: 300,
     decision: "require_approval",
+    execution_profile: "workspace_write_network",
     reason_code: "NETWORK_COMMAND",
     message: "command requires approval",
   });
@@ -311,6 +313,7 @@ test("keeps policy reason in the approval state until runtime resolves it", () =
     state,
     event("approval_requested", {
       approval_id: "approval-1",
+      execution_profile: "workspace_write",
       reason_code: "DESTRUCTIVE_COMMAND",
       message: "command requires approval",
       tool_call: { id: "call-rm", name: "exec_command", arguments: { command: "rm -rf build" } },
@@ -318,6 +321,7 @@ test("keeps policy reason in the approval state until runtime resolves it", () =
   );
   expect(state.approval).toEqual({
     approval_id: "approval-1",
+    execution_profile: "workspace_write",
     reason_code: "DESTRUCTIVE_COMMAND",
     message: "command requires approval",
     tool_call: { id: "call-rm", name: "exec_command", arguments: { command: "rm -rf build" } },

@@ -35,3 +35,8 @@ hardening may narrow that window; this repository does not claim race-free conta
 Normal replacement writes use a same-directory temporary and replacement operation. Writes to
 existing hard-linked files update the original inode in place so aliases remain linked, with a
 different crash-durability guarantee documented by the local-tool specification.
+
+Provider transports are pooled below the provider abstraction by endpoint, provider, credential
+identity and transport options. A Turn-scoped adapter lease prevents LRU eviction from closing an
+in-flight client; only idle entries may be retired, and Host shutdown attempts every client and
+ThreadStore cleanup even when one close operation fails.

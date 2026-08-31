@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 import hashlib
 import json
-from collections.abc import AsyncIterator
 import inspect
 from typing import Any
 
@@ -61,6 +62,7 @@ class OpenAICompatibleProvider(LLMProvider):
         client: Any | None = None,
         *,
         owns_client: bool | None = None,
+        release_client: Callable[[], object] | None = None,
     ) -> None:
         self.config = config
         self.capabilities = config.capabilities
@@ -68,6 +70,8 @@ class OpenAICompatibleProvider(LLMProvider):
         # Injected clients remain owned by a standalone adapter for backwards
         # compatibility; pooled adapters explicitly pass owns_client=False.
         self._owns_client = True if owns_client is None else owns_client
+        self._release_client = release_client
+        self._closed = False
 
     @staticmethod
     def _create_client(config: ProviderConfig) -> Any:
@@ -98,8 +102,16 @@ class OpenAICompatibleProvider(LLMProvider):
         return self._parse_response(raw_response)
 
     async def close(self) -> None:
-        """Release the owned SDK client when a Host lifecycle ends."""
+        """Release a pooled Turn lease or this adapter's owned SDK client."""
 
+        if self._closed:
+            return
+        self._closed = True
+        if self._release_client is not None:
+            result = self._release_client()
+            if inspect.isawaitable(result):
+                await result
+            return
         if not self._owns_client:
             return
         close = getattr(self._client, "close", None)
@@ -108,7 +120,6 @@ class OpenAICompatibleProvider(LLMProvider):
         result = close()
         if inspect.isawaitable(result):
             await result
-
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMEvent]:
         """Convert SDK Chat Completions chunks into provider-independent events."""
@@ -534,6 +545,12 @@ class OpenAICompatibleProvider(LLMProvider):
         )
 
 
+@dataclass(slots=True)
+class _PooledClient:
+    client: Any
+    leases: int = 0
+
+
 class OpenAICompatibleClientPool:
     """Bounded transport pool for lightweight per-Turn provider adapters.
 
@@ -551,9 +568,9 @@ class OpenAICompatibleClientPool:
         ):
             raise ValueError("max_clients must be a positive integer")
         self._max_clients = max_clients
-        self._clients: OrderedDict[tuple[object, ...], Any] = OrderedDict()
-        self._retired_clients: list[Any] = []
+        self._clients: OrderedDict[tuple[object, ...], _PooledClient] = OrderedDict()
         self._retired_close_tasks: set[asyncio.Task[Any]] = set()
+        self._close_errors: deque[Exception] = deque(maxlen=max_clients)
         self._closed = False
 
     @property
@@ -568,17 +585,37 @@ class OpenAICompatibleClientPool:
         if self._closed:
             raise LLMConfigurationError("Provider client pool is closed")
         key = self._transport_key(config)
-        client = self._clients.get(key)
-        if client is None:
-            client = OpenAICompatibleProvider._create_client(config)
-            self._clients[key] = client
+        entry = self._clients.get(key)
+        if entry is None:
+            if len(self._clients) >= self._max_clients:
+                idle = next(
+                    (
+                        (candidate_key, candidate)
+                        for candidate_key, candidate in self._clients.items()
+                        if candidate.leases == 0
+                    ),
+                    None,
+                )
+                if idle is None:
+                    raise LLMConfigurationError(
+                        "Provider client pool capacity reached while all transports "
+                        "are in use"
+                    )
+                retired_key, retired = idle
+                self._clients.pop(retired_key)
+                self._schedule_close(retired.client)
+            entry = _PooledClient(OpenAICompatibleProvider._create_client(config))
+            self._clients[key] = entry
             self._clients.move_to_end(key)
-            while len(self._clients) > self._max_clients:
-                _, retired = self._clients.popitem(last=False)
-                self._schedule_close(retired)
         else:
             self._clients.move_to_end(key)
-        return OpenAICompatibleProvider(config, client=client, owns_client=False)
+        entry.leases += 1
+        return OpenAICompatibleProvider(
+            config,
+            client=entry.client,
+            owns_client=False,
+            release_client=lambda: self._release(key, entry),
+        )
 
     @staticmethod
     def _transport_key(config: ProviderConfig) -> tuple[object, ...]:
@@ -596,13 +633,36 @@ class OpenAICompatibleClientPool:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            self._retired_clients.append(client)
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    asyncio.run(result)
+            except Exception as error:
+                self._close_errors.append(error)
             return
-        result = close()
-        if inspect.isawaitable(result):
-            task = loop.create_task(result)
-            self._retired_close_tasks.add(task)
-            task.add_done_callback(self._retired_close_tasks.discard)
+        try:
+            result = close()
+        except Exception as error:
+            self._close_errors.append(error)
+            return
+        if not inspect.isawaitable(result):
+            return
+        task = loop.create_task(result)
+        self._retired_close_tasks.add(task)
+
+        def completed(done: asyncio.Task[Any]) -> None:
+            self._retired_close_tasks.discard(done)
+            try:
+                done.result()
+            except Exception as error:
+                self._close_errors.append(error)
+
+        task.add_done_callback(completed)
+
+    def _release(self, key: tuple[object, ...], entry: _PooledClient) -> None:
+        current = self._clients.get(key)
+        if current is entry and entry.leases > 0:
+            entry.leases -= 1
 
     async def aclose(self) -> None:
         """Close every retained transport exactly once."""
@@ -610,15 +670,30 @@ class OpenAICompatibleClientPool:
         if self._closed:
             return
         self._closed = True
-        clients = tuple(self._clients.values()) + tuple(self._retired_clients)
+        clients = tuple(entry.client for entry in self._clients.values())
         self._clients.clear()
-        self._retired_clients.clear()
+        errors = list(self._close_errors)
+        self._close_errors.clear()
+        pending_closes: list[Any] = []
         for client in clients:
             close = getattr(client, "close", None)
             if not callable(close):
                 continue
-            result = close()
-            if inspect.isawaitable(result):
-                await result
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    pending_closes.append(result)
+            except Exception as error:
+                errors.append(error)
         if self._retired_close_tasks:
-            await asyncio.gather(*self._retired_close_tasks, return_exceptions=True)
+            pending_closes.extend(tuple(self._retired_close_tasks))
+            self._retired_close_tasks.clear()
+        if pending_closes:
+            results = await asyncio.gather(*pending_closes, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception) and not any(
+                    result is existing for existing in errors
+                ):
+                    errors.append(result)
+        if errors:
+            raise ExceptionGroup("failed to close provider clients", errors)

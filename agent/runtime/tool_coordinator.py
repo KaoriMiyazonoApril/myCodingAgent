@@ -31,6 +31,7 @@ class _PendingApproval:
     decision: str
     reason_code: str
     message: str
+    execution_profile: str
 
 
 class ToolCoordinator:
@@ -79,8 +80,14 @@ class ToolCoordinator:
                 "decision": pending.decision,
                 "reason_code": pending.reason_code,
                 "message": pending.message,
+                "execution_profile": pending.execution_profile,
             }
         )
+
+    def cancel_owned_sessions(self) -> None:
+        """Terminate persistent process sessions created by this Turn."""
+
+        self._registry.cancel_active_sessions(self._turn_id)
 
     async def execute(self, calls: list[ToolCallBlock]) -> None:
         for index, call in enumerate(calls):
@@ -219,7 +226,7 @@ class ToolCoordinator:
             )
             result = await self._controller.wait(execution)
         except (TurnLimitReached, asyncio.CancelledError):
-            self._registry.cancel_active_sessions(self._turn_id)
+            self.cancel_owned_sessions()
             self._change_tracker.execution_interrupted(call)
             raise
         self._change_tracker.after_execution(call, result)
@@ -241,6 +248,7 @@ class ToolCoordinator:
             decision=policy_result.decision.value,
             reason_code=policy_result.reason_code,
             message=policy_result.message,
+            execution_profile=policy_result.profile.value,
         )
         self._controller.pause_deadline()
         self._set_waiting(True)
@@ -253,6 +261,7 @@ class ToolCoordinator:
                 "decision": policy_result.decision.value,
                 "reason_code": policy_result.reason_code,
                 "message": policy_result.message,
+                "execution_profile": policy_result.profile.value,
             },
         )
         resolution = "cancelled"

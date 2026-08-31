@@ -126,6 +126,106 @@ def test_provider_client_pool_reuses_transport_across_model_adapters(monkeypatch
     assert clients[0].close_calls == 1
 
 
+def test_provider_pool_never_evicts_an_in_flight_transport(monkeypatch) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    clients: list[Client] = []
+
+    def create_client(config):
+        del config
+        client = Client()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        OpenAICompatibleProvider,
+        "_create_client",
+        staticmethod(create_client),
+    )
+    pool = OpenAICompatibleClientPool(max_clients=1)
+    first = pool.resolve(
+        ProviderConfig(
+            provider="deepseek",
+            base_url="https://one.invalid/v1",
+            api_key="key-one",
+            model="model-a",
+        )
+    )
+
+    with pytest.raises(LLMConfigurationError, match="capacity"):
+        pool.resolve(
+            ProviderConfig(
+                provider="deepseek",
+                base_url="https://two.invalid/v1",
+                api_key="key-two",
+                model="model-b",
+            )
+        )
+    assert clients[0].close_calls == 0
+
+    asyncio.run(first.close())
+    second = pool.resolve(
+        ProviderConfig(
+            provider="deepseek",
+            base_url="https://two.invalid/v1",
+            api_key="key-two",
+            model="model-b",
+        )
+    )
+    assert clients[0].close_calls == 1
+    asyncio.run(second.close())
+    asyncio.run(pool.aclose())
+
+
+def test_provider_pool_shutdown_closes_every_client_after_one_close_fails(
+    monkeypatch,
+) -> None:
+    class Client:
+        def __init__(self, *, fail: bool) -> None:
+            self.fail = fail
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.fail:
+                raise RuntimeError("close failed")
+
+    clients = [Client(fail=True), Client(fail=False)]
+    monkeypatch.setattr(
+        OpenAICompatibleProvider,
+        "_create_client",
+        staticmethod(lambda config: clients.pop(0)),
+    )
+    pool = OpenAICompatibleClientPool(max_clients=2)
+    first_client = pool.resolve(
+        ProviderConfig(
+            provider="deepseek",
+            base_url="https://one.invalid/v1",
+            api_key="key-one",
+            model="model",
+        )
+    )._client
+    second_client = pool.resolve(
+        ProviderConfig(
+            provider="deepseek",
+            base_url="https://two.invalid/v1",
+            api_key="key-two",
+            model="model",
+        )
+    )._client
+
+    with pytest.raises(BaseExceptionGroup, match="provider clients"):
+        asyncio.run(pool.aclose())
+
+    assert first_client.close_calls == 1
+    assert second_client.close_calls == 1
+
+
 def response(*, content: str | None, tool_calls=None, usage=None):
     message = SimpleNamespace(
         role="assistant",

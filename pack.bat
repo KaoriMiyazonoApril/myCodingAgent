@@ -40,7 +40,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "      $dst = Join-Path $temp $relative; New-Item -ItemType Directory -Path (Split-Path $dst) -Force | Out-Null; Copy-Item -LiteralPath $file.FullName -Destination $dst -Force" ^
     "    }" ^
     "  }" ^
-    "  Compress-Archive -Path (Join-Path $temp '*') -DestinationPath $zip -CompressionLevel Optimal -Force" ^
+    "  Add-Type -AssemblyName System.IO.Compression.FileSystem;" ^
+    "  [IO.Compression.ZipFile]::CreateFromDirectory($temp, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)" ^
     "} finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }"
 
 if errorlevel 1 (

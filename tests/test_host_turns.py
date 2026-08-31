@@ -6,6 +6,7 @@ import threading
 import time
 
 from fastapi.testclient import TestClient
+import pytest
 
 from agent.core.messages import Message, TextBlock, ToolCallBlock
 from agent.host.app import create_app
@@ -14,8 +15,9 @@ from agent.host.provider_config import ProviderStore
 from agent.host.workspace import WorkspaceBrowser
 from agent.model.provider import LLMProvider
 from agent.model.types import LLMRequest, LLMResponse, Usage
-from agent.runtime import AllowAllPolicy, ModelSettings, ThreadRuntime
+from agent.runtime import AllowAllPolicy, ModelSettings, PolicyDecision, ThreadRuntime
 from agent.tools.registry import ToolRegistry
+from agent.tools.types import ToolDefinition, ToolResult
 from tests.sandbox_support import create_test_tool_registry
 
 
@@ -184,6 +186,118 @@ def test_idle_cancel_returns_a_stable_conflict(tmp_path) -> None:
 
         assert response.status_code == 409
         assert response.json()["error"]["code"] == "NO_ACTIVE_TURN"
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_pending_approval_survives_host_snapshot_reload_and_cursor_reconnect(
+    tmp_path,
+    approved: bool,
+) -> None:
+    class RequireApprovalPolicy:
+        def decide(self, call: ToolCallBlock) -> PolicyDecision:
+            del call
+            return PolicyDecision.REQUIRE_APPROVAL
+
+    executions: list[str] = []
+    provider = _ScriptedProvider(
+        [
+            _tool_response(
+                ToolCallBlock(
+                    id="reload-approval",
+                    name="record",
+                    arguments={"value": "approved"},
+                )
+            ),
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[TextBlock(text="Approval resolved")],
+                ),
+                finish_reason="stop",
+                usage=Usage(),
+            ),
+        ]
+    )
+    store = ProviderStore(tmp_path / "providers.json")
+    store.save_provider(
+        "deepseek",
+        api_key="test-key",
+        selected_model="deepseek-chat",
+    )
+    store.set_default("deepseek", model="deepseek-chat")
+
+    def tools(_: Path) -> ToolRegistry:
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="record",
+                description="record",
+                parameters={
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            ),
+            lambda arguments: (
+                executions.append(str(arguments["value"]))
+                or ToolResult(content="recorded", metadata={})
+            ),
+        )
+        return registry
+
+    def runtime_factory(default_settings: ModelSettings) -> ThreadRuntime:
+        return ThreadRuntime(
+            tool_registry_factory=tools,
+            provider_resolver=lambda provider_id, model: provider,
+            default_settings=default_settings,
+            tool_policy=RequireApprovalPolicy(),
+        )
+
+    app = create_app(
+        provider_store=store,
+        model_catalog=_Catalog(),
+        workspace_browser=WorkspaceBrowser([tmp_path]),
+        runtime_factory=runtime_factory,
+    )
+    with TestClient(app) as client:
+        thread_id = _create_thread(client, tmp_path)
+        accepted = client.post(
+            f"/api/threads/{thread_id}/turns",
+            json={"message": "Ask first"},
+        )
+        assert accepted.status_code == 202
+        for _ in range(100):
+            reloaded = client.get(f"/api/threads/{thread_id}").json()["thread"]
+            if reloaded["snapshot"]["pending_approval"] is not None:
+                break
+            time.sleep(0.01)
+
+        pending = reloaded["snapshot"]["pending_approval"]
+        assert pending["approval_id"]
+        assert pending["tool_call"]["id"] == "reload-approval"
+        assert pending["execution_profile"] == "workspace_write"
+        runtime = app.state.thread_host.runtime
+        assert runtime is not None
+        approval_event = next(
+            event
+            for event in runtime.get_events(thread_id).events
+            if event.type == "approval_requested"
+        )
+        assert runtime.get_events(
+            thread_id,
+            after_event_id=approval_event.event_id,
+        ).events == []
+
+        resolved = client.post(
+            f"/api/threads/{thread_id}/approvals/{pending['approval_id']}",
+            json={"approved": approved},
+        )
+        terminal = _wait_for_idle(client, thread_id)
+
+    assert resolved.status_code == 200
+    assert terminal["snapshot"]["pending_approval"] is None
+    assert executions == (["approved"] if approved else [])
 
 
 def test_closing_an_active_host_thread_cancels_and_reaches_closed(tmp_path) -> None:

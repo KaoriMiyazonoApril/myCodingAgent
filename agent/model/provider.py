@@ -22,3 +22,8 @@ class LLMProvider(ABC):
         """Yield local streaming events when a future provider supports it."""
         raise LLMStreamingNotImplementedError("Streaming is not implemented yet")
         yield  # Makes this an async generator for the declared interface.
+
+    async def close(self) -> None:
+        """Release one Turn-scoped provider lease when the adapter owns one."""
+
+        return None

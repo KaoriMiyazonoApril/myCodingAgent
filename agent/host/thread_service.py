@@ -378,10 +378,12 @@ class ProductionRuntimeFactory:
         )
 
     async def close(self) -> None:
-        await self._provider_pool.aclose()
-        close_store = getattr(self._thread_store, "close", None)
-        if callable(close_store):
-            close_store()
+        try:
+            await self._provider_pool.aclose()
+        finally:
+            close_store = getattr(self._thread_store, "close", None)
+            if callable(close_store):
+                close_store()
 
 
 def production_runtime_factory(

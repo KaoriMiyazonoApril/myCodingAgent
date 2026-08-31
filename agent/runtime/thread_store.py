@@ -283,7 +283,7 @@ class LocalThreadStore:
             return None if row is None else self._load_row(row[0])
 
     def save_thread(self, state: ThreadState) -> None:
-        self._save_state(state, new_events=state.events)
+        self._save_state(state, new_events=state.events, replace_events=True)
 
     def save_thread_transition(
         self,
@@ -291,13 +291,14 @@ class LocalThreadStore:
         *,
         new_events: Sequence[AgentEvent] = (),
     ) -> None:
-        self._save_state(state, new_events=new_events)
+        self._save_state(state, new_events=new_events, replace_events=False)
 
     def _save_state(
         self,
         state: ThreadState,
         *,
         new_events: Sequence[AgentEvent],
+        replace_events: bool,
     ) -> None:
         _validate_state(state)
         state_json = _encode(_state_to_dict(state, include_events=False, include_idempotency=False))
@@ -331,6 +332,11 @@ class LocalThreadStore:
                     """,
                     (state.thread_id, state_json, state.created_at, state.updated_at),
                 )
+                if replace_events:
+                    self._connection.execute(
+                        "DELETE FROM thread_events WHERE thread_id = ?",
+                        (state.thread_id,),
+                    )
                 self._connection.executemany(
                     """
                     INSERT OR IGNORE INTO thread_events(thread_id, event_id, sequence, event_json)
