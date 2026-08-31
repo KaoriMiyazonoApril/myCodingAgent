@@ -1,5 +1,17 @@
 import type { ThreadView } from "./api";
 
+const SNAPSHOT_REFRESH_EVENT_TYPES = new Set([
+  "turn_completed",
+  "turn_cancelled",
+  "turn_failed",
+  "turn_limit_reached",
+  "turn_rejected",
+]);
+
+export function eventRequiresSnapshotRefresh(type: string): boolean {
+  return SNAPSHOT_REFRESH_EVENT_TYPES.has(type);
+}
+
 export type AgentEvent = {
   schema_version: number;
   event_id: string;

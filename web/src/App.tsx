@@ -23,15 +23,13 @@ import {
   type WorkspaceListing,
 } from "./api";
 import { ThreadEventClient } from "./eventClient";
-import { applyAgentEvent, hydrateThread, type ApprovalRequest } from "./events";
+import {
+  applyAgentEvent,
+  eventRequiresSnapshotRefresh,
+  hydrateThread,
+  type ApprovalRequest,
+} from "./events";
 import "./styles.css";
-
-const TERMINAL_EVENT_TYPES = new Set([
-  "turn_completed",
-  "turn_cancelled",
-  "turn_failed",
-  "turn_limit_reached",
-]);
 
 export function App() {
   const [providers, setProviders] = useState<ProviderView[]>([]);
@@ -1294,7 +1292,7 @@ function ActiveThreadView({
           }
           setState((current) => applyAgentEvent(current, event));
           setStreamError(null);
-          if (TERMINAL_EVENT_TYPES.has(event.type)) {
+          if (eventRequiresSnapshotRefresh(event.type)) {
             void getThread(threadId)
               .then((next) => {
                 if (mountedRef.current) {

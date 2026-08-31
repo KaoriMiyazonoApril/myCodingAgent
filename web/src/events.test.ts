@@ -1,7 +1,12 @@
 import { expect, test } from "vitest";
 
 import type { ThreadView } from "./api";
-import { applyAgentEvent, hydrateThread, type AgentEvent } from "./events";
+import {
+  applyAgentEvent,
+  eventRequiresSnapshotRefresh,
+  hydrateThread,
+  type AgentEvent,
+} from "./events";
 
 function view(): ThreadView {
   return {
@@ -179,6 +184,7 @@ test("applies live messages and safe rejection errors", () => {
     status: "rejected",
     error: { code: "UNSAFE_WORKSPACE", message: "Turn could not start" },
   });
+  expect(eventRequiresSnapshotRefresh("turn_rejected")).toBe(true);
 });
 
 test("hydrates a safe Host background failure as a terminal error", () => {
