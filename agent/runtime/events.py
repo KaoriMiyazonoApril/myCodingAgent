@@ -324,7 +324,7 @@ class EventBuffer:
 
         return self._sequence_watermark
 
-    def next_sequence(self) -> int:
+    def next_sequence(self, *, checkpoint: bool = True) -> int:
         """Allocate one monotonic sequence for any Thread event emitter."""
 
         if self._sequence_checkpoint is not None and (
@@ -336,11 +336,12 @@ class EventBuffer:
                 self._sequence_watermark,
             ) + self._sequence_reservation_size
             self._sequence_watermark = watermark
-            try:
-                self._sequence_checkpoint(watermark)
-            except BaseException:
-                self._sequence_watermark = previous_watermark
-                raise
+            if checkpoint:
+                try:
+                    self._sequence_checkpoint(watermark)
+                except BaseException:
+                    self._sequence_watermark = previous_watermark
+                    raise
         self._thread_sequence += 1
         if self._sequence_checkpoint is None:
             self._sequence_watermark = max(
@@ -446,13 +447,19 @@ class TurnEventEmitter:
         self._buffer = buffer
         self._reasoning_visibility = reasoning_visibility
 
-    def emit(self, event_type: str, payload: dict[str, Any]) -> AgentEvent:
+    def emit(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        checkpoint: bool = True,
+    ) -> AgentEvent:
         event = AgentEvent(
             schema_version=SCHEMA_VERSION,
             event_id=str(uuid4()),
             thread_id=self._thread_id,
             turn_id=self._turn_id,
-            sequence=self._buffer.next_sequence(),
+            sequence=self._buffer.next_sequence(checkpoint=checkpoint),
             type=event_type,
             timestamp=utc_now(),
             payload=json_safe(payload),

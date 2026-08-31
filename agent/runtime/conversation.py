@@ -69,10 +69,15 @@ class Conversation:
             self.append_tool_result(
                 ToolResultBlock(
                     tool_call_id=call_id,
-                    content="tool call interrupted by Runtime restart",
+                    content=(
+                        "tool call was interrupted by Runtime restart; execution "
+                        "outcome is unknown and side effects may already have "
+                        "occurred. Inspect workspace/state before retrying."
+                    ),
                     metadata={
-                        "executed": False,
+                        "execution_status": "unknown",
                         "reason_code": "RUNTIME_RESTARTED",
+                        "side_effects_possible": True,
                     },
                     error_code="RUNTIME_RESTARTED",
                 )

@@ -278,11 +278,65 @@ class ThreadRuntime:
                 lambda _watermark, current=record: self._persist_record(current)
             )
             self._threads[record.thread_id] = record
-            if state.active_turn is not None or state.status in {
+            if self._is_coherently_terminal(state):
+                # A terminal summary/event may have committed just before an
+                # older runtime cleared its active marker. Repair that stale
+                # marker without creating a second terminal outcome.
+                record.status = (
+                    ThreadStatus.CLOSED
+                    if state.status is ThreadStatus.CLOSED
+                    else ThreadStatus.IDLE
+                )
+                record.active_turn = None
+                self._persist_record(record)
+            elif state.active_turn is not None or state.status in {
                 ThreadStatus.RUNNING,
                 ThreadStatus.WAITING_APPROVAL,
             }:
                 self._recover_active_record(record, state.active_turn)
+
+    @staticmethod
+    def _is_coherently_terminal(state: ThreadState) -> bool:
+        """Recognize a terminal transition whose active marker is merely stale."""
+
+        active = state.active_turn
+        summary = state.latest_turn
+        if active is None or summary is None or summary.turn_id != active.turn_id:
+            return False
+        if summary.status in {TurnStatus.QUEUED, TurnStatus.RUNNING}:
+            return False
+        if state.completed_turns < 1 or not any(
+            turn.turn_id == summary.turn_id and turn.status == summary.status
+            for turn in state.turns
+        ):
+            return False
+        terminal_event_types = {
+            "turn_completed",
+            "turn_failed",
+            "turn_cancelled",
+            "turn_limit_reached",
+        }
+        for event in state.events:
+            if event.turn_id != summary.turn_id or event.type not in terminal_event_types:
+                continue
+            event_summary = event.payload.get("summary")
+            if not isinstance(event_summary, dict):
+                continue
+            if (
+                event_summary.get("turn_id") != summary.turn_id
+                or event_summary.get("status") != summary.status.value
+            ):
+                continue
+            if active.idempotency_key is None:
+                return True
+            submission = state.idempotency.get(active.idempotency_key)
+            return bool(
+                submission is not None
+                and submission.summary is not None
+                and submission.summary.turn_id == summary.turn_id
+                and submission.summary.status == summary.status
+            )
+        return False
 
     def _tools_for_restored_workspace(self, workspace: Path) -> ToolRegistry:
         """Rebuild ephemeral tools when possible; history survives a missing root."""
@@ -343,7 +397,11 @@ class ThreadRuntime:
             buffer=record.events,
             reasoning_visibility=self._reasoning_visibility,
         )
-        emitter.emit("turn_failed", {"summary": summary.to_dict()})
+        emitter.emit(
+            "turn_failed",
+            {"summary": summary.to_dict()},
+            checkpoint=False,
+        )
         self._persist_record(record)
 
     def _on_durable_event(self, record: _ThreadRecord, event: AgentEvent) -> None:
@@ -856,5 +914,21 @@ class ThreadRuntime:
         record.latest_turn = deepcopy(summary)
         record.turns.append(deepcopy(summary))
         record.updated_at = summary.ended_at
-        active_turn.events.emit(event_type, {"summary": summary.to_dict()})
+        if active_turn.idempotency_key is not None:
+            submission = record.idempotent_submissions.get(active_turn.idempotency_key)
+            if submission is not None:
+                # Set the durable replay value before emitting the terminal
+                # event.  The event sink then commits all terminal fields in a
+                # single semantic ThreadStore transition.
+                submission.summary = deepcopy(summary)
+                submission.interrupted = False
+        record.status = (
+            ThreadStatus.CLOSED if record.closing else ThreadStatus.IDLE
+        )
+        record.active_turn = None
+        active_turn.events.emit(
+            event_type,
+            {"summary": summary.to_dict()},
+            checkpoint=False,
+        )
         return summary

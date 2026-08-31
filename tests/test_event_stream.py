@@ -12,7 +12,7 @@ from agent.host.model_catalog import ModelDiscovery
 from agent.host.provider_config import ProviderStore
 from agent.host.workspace import WorkspaceBrowser
 from agent.runtime import ModelSettings, ThreadRuntime
-from agent.runtime.events import EventBuffer
+from agent.runtime.events import EventBuffer, TurnEventEmitter
 from agent.tools.registry import ToolRegistry
 
 
@@ -318,6 +318,28 @@ def test_event_buffer_reserves_sequence_ranges_across_transient_restart() -> Non
     assert recovered.sequence > transient[-1].sequence
     assert recovered.sequence == 9
     assert checkpoints == [8, 16]
+
+
+def test_terminal_event_can_commit_with_state_without_a_pre_append_checkpoint() -> None:
+    checkpoints: list[int] = []
+    buffer = EventBuffer(8, sequence_reservation_size=1)
+    buffer.set_sequence_checkpoint(checkpoints.append)
+    emitter = TurnEventEmitter(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        buffer=buffer,
+        reasoning_visibility="hidden",
+    )
+
+    event = emitter.emit(
+        "turn_completed",
+        {"summary": {"status": "completed"}},
+        checkpoint=False,
+    )
+
+    assert event.sequence == 1
+    assert checkpoints == []
+    assert buffer.read().events == [event]
 
 
 def test_sse_route_maps_query_and_header_cursors_with_streaming_headers(

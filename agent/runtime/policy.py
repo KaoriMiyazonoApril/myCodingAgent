@@ -176,8 +176,24 @@ def _classify_tokens(tokens: list[str], *, depth: int = 0) -> ExecClassification
             if target is None
             else _classify_tokens(target, depth=depth + 1)
         )
+    if executable in {
+        "command",
+        "exec",
+        "nice",
+        "timeout",
+        "nohup",
+        "stdbuf",
+    }:
+        target = _transparent_wrapper_target(executable, tokens[1:])
+        return (
+            ExecClassification.UNKNOWN
+            if target is None
+            else _classify_tokens(target, depth=depth + 1)
+        )
     if executable in {"python", "python3"}:
         return _classify_python(tokens, depth=depth)
+    if executable in {"node", "ruby", "perl", "php"}:
+        return _classify_script_interpreter(tokens)
     if executable == "xargs":
         target = _xargs_target(tokens[1:])
         return (
@@ -189,11 +205,247 @@ def _classify_tokens(tokens: list[str], *, depth: int = 0) -> ExecClassification
     return _classify_direct(tokens)
 
 
+def _transparent_wrapper_target(
+    executable: str,
+    args: list[str],
+) -> list[str] | None:
+    """Return a wrapper's command only when every prefix option is known.
+
+    These wrappers do not change the command's intent, but their option
+    grammars differ.  Keeping a small parser per wrapper means an unknown or
+    malformed option cannot accidentally turn a destructive command into an
+    ordinary one.
+    """
+
+    if executable == "command":
+        return _command_target(args)
+    if executable == "exec":
+        return _exec_target(args)
+    if executable == "nice":
+        return _nice_target(args)
+    if executable == "timeout":
+        return _timeout_target(args)
+    if executable == "nohup":
+        return _nohup_target(args)
+    if executable == "stdbuf":
+        return _stdbuf_target(args)
+    return None
+
+
+def _command_target(args: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            index += 1
+            break
+        if token.startswith("-") and token != "-":
+            if len(token) == 2 and token in {"-p", "-v", "-V"}:
+                index += 1
+                continue
+            if len(token) > 2 and all(char in "pvV" for char in token[1:]):
+                index += 1
+                continue
+            return None
+        break
+    return args[index:] or None
+
+
+def _exec_target(args: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            index += 1
+            break
+        if token in {"-c", "-l"}:
+            index += 1
+            continue
+        if len(token) > 2 and token.startswith("-") and all(
+            character in "cl" for character in token[1:]
+        ):
+            index += 1
+            continue
+        if token == "-a":
+            if index + 1 >= len(args):
+                return None
+            index += 2
+            continue
+        if token.startswith("-a") and len(token) > 2:
+            index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            return None
+        break
+    return args[index:] or None
+
+
+def _nice_target(args: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            index += 1
+            break
+        if token in {"-n", "--adjustment"}:
+            if index + 1 >= len(args):
+                return None
+            if not _is_nice_adjustment(args[index + 1]):
+                return None
+            index += 2
+            continue
+        if token.startswith("--adjustment="):
+            if not _is_nice_adjustment(token.removeprefix("--adjustment=")):
+                return None
+            index += 1
+            continue
+        if re.fullmatch(r"-[0-9]+", token):
+            index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            if token.startswith("-n") and len(token) > 2:
+                if not _is_nice_adjustment(token[2:]):
+                    return None
+                index += 1
+                continue
+            return None
+        break
+    return args[index:] or None
+
+
+def _is_nice_adjustment(value: str) -> bool:
+    return bool(re.fullmatch(r"[+-]?\d+", value))
+
+
+_TIMEOUT_FLAG_OPTIONS = frozenset(
+    {"--preserve-status", "--foreground", "--verbose"}
+)
+_TIMEOUT_VALUE_OPTIONS = frozenset({"-k", "--kill-after", "-s", "--signal"})
+
+
+def _timeout_target(args: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            index += 1
+            break
+        if token in _TIMEOUT_FLAG_OPTIONS:
+            index += 1
+            continue
+        if token in _TIMEOUT_VALUE_OPTIONS:
+            if index + 1 >= len(args):
+                return None
+            if token in {"-k", "--kill-after"}:
+                if not _is_timeout_duration(args[index + 1]):
+                    return None
+            elif not _is_timeout_signal(args[index + 1]):
+                return None
+            index += 2
+            continue
+        if token.startswith("--kill-after="):
+            if not _is_timeout_duration(token.removeprefix("--kill-after=")):
+                return None
+            index += 1
+            continue
+        if token.startswith("--signal="):
+            if not _is_timeout_signal(token.removeprefix("--signal=")):
+                return None
+            index += 1
+            continue
+        if token.startswith("-k") and len(token) > 2:
+            if not _is_timeout_duration(token[2:]):
+                return None
+            index += 1
+            continue
+        if token.startswith("-s") and len(token) > 2:
+            if not _is_timeout_signal(token[2:]):
+                return None
+            index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            return None
+        break
+    # GNU timeout always has a duration followed by a command.  Treating the
+    # first non-option as the duration is enough for bounded intent parsing;
+    # the actual duration syntax remains the utility's responsibility.
+    if index + 1 >= len(args) or not _is_timeout_duration(args[index]):
+        return None
+    target = args[index + 1 :]
+    if target and target[0] == "--":
+        target = target[1:]
+    return target or None
+
+
+def _is_timeout_duration(value: str) -> bool:
+    return bool(re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", value))
+
+
+def _is_timeout_signal(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:SIG)?[A-Za-z0-9]+", value))
+
+
+def _nohup_target(args: list[str]) -> list[str] | None:
+    if not args:
+        return None
+    if args[0] == "--":
+        return args[1:] or None
+    if args[0].startswith("-"):
+        return None
+    return args
+
+
+_STDBUF_VALUE_OPTIONS = frozenset(
+    {"-i", "--input", "-o", "--output", "-e", "--error"}
+)
+
+
+def _stdbuf_target(args: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            index += 1
+            break
+        if token in _STDBUF_VALUE_OPTIONS:
+            if index + 1 >= len(args) or not args[index + 1]:
+                return None
+            if not _is_stdbuf_mode(args[index + 1]):
+                return None
+            index += 2
+            continue
+        if any(token.startswith(option) and len(token) > len(option)
+               for option in ("-i", "-o", "-e")):
+            if not _is_stdbuf_mode(token[2:]):
+                return None
+            index += 1
+            continue
+        if token.startswith(("--input=", "--output=", "--error=")):
+            _, _, value = token.partition("=")
+            if not _is_stdbuf_mode(value):
+                return None
+            index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            return None
+        break
+    return args[index:] or None
+
+
+def _is_stdbuf_mode(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:0|L|\d+[kKmMgG]?)", value))
+
+
 def _classify_python(tokens: list[str], *, depth: int) -> ExecClassification:
     """Recognize Python's dynamic modes and classify ``-m`` targets."""
 
     args = [token.lower() for token in tokens[1:]]
-    if any(argument == "-c" for argument in args):
+    if any(
+        argument in {"-c", "--command"}
+        or argument.startswith("-c")
+        or argument.startswith("--command=")
+        for argument in args
+    ):
         return ExecClassification.DYNAMIC_INTERPRETER
     # ``python -`` reads source from stdin.  It is dynamic even when options
     # precede the stdin marker, so do not reduce it to ordinary execution.
@@ -219,6 +471,38 @@ def _classify_python(tokens: list[str], *, depth: int) -> ExecClassification:
             # contains a shell-control token (which the outer source scan
             # already catches for unquoted operators).
             return ExecClassification.ORDINARY_SANDBOXED
+    return _classify_direct(tokens)
+
+
+_DYNAMIC_INTERPRETER_FLAGS = {
+    "node": frozenset({"-e", "--eval", "-p", "--print"}),
+    "ruby": frozenset({"-e", "--eval"}),
+    "perl": frozenset({"-e", "--execute", "--eval"}),
+    "php": frozenset({"-r", "--run", "--process-code"}),
+}
+
+
+def _classify_script_interpreter(tokens: list[str]) -> ExecClassification:
+    """Classify inline-code modes without inspecting the embedded source."""
+
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    flags = _DYNAMIC_INTERPRETER_FLAGS[executable]
+    for token in tokens[1:]:
+        if token in flags:
+            return ExecClassification.DYNAMIC_INTERPRETER
+        if any(
+            token.startswith(flag) and len(token) > len(flag)
+            for flag in flags
+            if flag.startswith("-") and not flag.startswith("--")
+        ):
+            # Supports compact forms such as ``ruby -eputs`` and ``php -r...``.
+            return ExecClassification.DYNAMIC_INTERPRETER
+        if any(
+            token.startswith(f"{flag}=") and len(token) > len(flag) + 1
+            for flag in flags
+            if flag.startswith("--")
+        ):
+            return ExecClassification.DYNAMIC_INTERPRETER
     return _classify_direct(tokens)
 
 

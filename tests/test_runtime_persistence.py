@@ -9,6 +9,7 @@ from agent.core.messages import Message, TextBlock, ToolCallBlock
 from agent.model.provider import LLMProvider
 from agent.model.types import LLMRequest, LLMResponse, Usage
 from agent.runtime import (
+    AgentEvent,
     AllowAllPolicy,
     ApprovalMode,
     IdempotencyConflictError,
@@ -17,6 +18,7 @@ from agent.runtime import (
     ThreadRuntime,
     ThreadStatus,
     TurnStatus,
+    TurnSummary,
     WorkspaceUnavailableError,
 )
 from agent.runtime.thread_store import (
@@ -283,6 +285,11 @@ def test_restart_recovers_active_turn_as_failed_without_rerunning_it(tmp_path) -
     assert provider.requests == []
     assert snapshot.messages[-1]["role"] == "tool"
     assert snapshot.messages[-1]["content"][0]["error_code"] == "RUNTIME_RESTARTED"
+    interrupted = snapshot.messages[-1]["content"][0]
+    assert interrupted["metadata"]["execution_status"] == "unknown"
+    assert interrupted["metadata"]["side_effects_possible"] is True
+    assert "executed" not in interrupted["metadata"]
+    assert "Inspect workspace/state before retrying" in interrupted["content"]
 
     with pytest.raises(IdempotencyInterruptedError):
         asyncio.run(
@@ -297,6 +304,94 @@ def test_restart_recovers_active_turn_as_failed_without_rerunning_it(tmp_path) -
     assert [event.sequence for event in events] == sorted(
         event.sequence for event in events
     )
+    store.close()
+
+
+def test_restart_does_not_duplicate_coherently_terminal_turn_with_stale_marker(
+    tmp_path: Path,
+) -> None:
+    store = LocalThreadStore(tmp_path / "state" / "threads.db")
+    summary = TurnSummary(
+        schema_version=1,
+        turn_id="turn-terminal",
+        thread_id="terminal-thread",
+        status=TurnStatus.COMPLETED,
+        stop_reason="completed",
+        final_text="already done",
+        iterations=1,
+        tool_calls=0,
+        started_at="2026-01-01T00:00:00Z",
+        ended_at="2026-01-01T00:00:01Z",
+    )
+    event = AgentEvent(
+        schema_version=1,
+        event_id="terminal-event",
+        thread_id="terminal-thread",
+        turn_id="turn-terminal",
+        sequence=1,
+        type="turn_completed",
+        timestamp="2026-01-01T00:00:01Z",
+        payload={"summary": summary.to_dict()},
+    )
+    from agent.runtime import ThreadSettings
+
+    settings = ThreadSettings.from_model_settings(
+        ModelSettings(provider_config_id="provider", model="model"),
+        version=0,
+    )
+    store.save_thread(
+        ThreadState(
+            thread_id="terminal-thread",
+            workspace=str(tmp_path),
+            # Simulate the crash window: all terminal fields/event are durable,
+            # but the old active marker and running status were not cleared.
+            status=ThreadStatus.RUNNING,
+            settings=settings,
+            messages=[
+                Message(role="system", content=[TextBlock(text="system")]),
+                Message(role="user", content=[TextBlock(text="already done")]),
+            ],
+            completed_turns=1,
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:01Z",
+            latest_turn=summary,
+            turns=[summary],
+            events=[event],
+            event_sequence=1,
+            active_turn=StoredActiveTurn(
+                turn_id="turn-terminal",
+                started_at="2026-01-01T00:00:00Z",
+                idempotency_key="terminal-key",
+            ),
+            idempotency={
+                "terminal-key": StoredIdempotency(
+                    user_text="already done", settings_override=None, summary=summary
+                )
+            },
+        )
+    )
+
+    provider = _Provider("must not run")
+    runtime = _runtime(store, provider)
+    snapshot = runtime.get_snapshot("terminal-thread")
+
+    assert snapshot.status is ThreadStatus.IDLE
+    assert snapshot.active_turn_id is None
+    assert snapshot.completed_turns == 1
+    assert snapshot.turns == [summary]
+    assert [item.type for item in runtime.get_events("terminal-thread").events] == [
+        "turn_completed"
+    ]
+    repaired = store.get_thread("terminal-thread")
+    assert repaired is not None
+    assert repaired.active_turn is None
+    assert repaired.status is ThreadStatus.IDLE
+    assert asyncio.run(
+        runtime.run_turn(
+            "terminal-thread", "already done", idempotency_key="terminal-key"
+        )
+    ) == summary
+    assert provider.requests == []
     store.close()
 
 
