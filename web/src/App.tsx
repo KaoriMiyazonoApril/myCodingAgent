@@ -9,17 +9,17 @@ import {
   getProviders,
   getThread,
   getThreads,
-  getNativePickerCapability,
   getWorkspaces,
+  HostError,
   saveProvider,
   selectProviderDefault,
   startTurn,
-  selectNativeWorkspace,
+  selectWorkspace,
   resolveApproval,
   updateThreadSettings,
   type ProviderView,
-  type NativePickerCapability,
   type ThreadView,
+  type WorkspaceRecord,
   type WorkspaceListing,
 } from "./api";
 import { ThreadEventClient } from "./eventClient";
@@ -39,7 +39,7 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState<string | null>(null);
   const [showProviderSettings, setShowProviderSettings] = useState(false);
-  const [workspace, setWorkspace] = useState<string | null>(null);
+  const [workspace, setWorkspace] = useState<WorkspaceRecord | null>(null);
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false);
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
@@ -165,7 +165,7 @@ export function App() {
             providers={providers}
             providerReady={providerReady}
             workspace={workspace}
-            onWorkspaceRecovered={setWorkspace}
+        onWorkspaceRecovered={setWorkspace}
             selectedProviderId={effectiveProviderId}
             selectedModel={effectiveModel}
             onOpenProject={() => setWorkspaceDialogOpen(true)}
@@ -191,8 +191,8 @@ export function App() {
       <WorkspaceDialog
         open={workspaceDialogOpen}
         onClose={() => setWorkspaceDialogOpen(false)}
-        onSelect={(path) => {
-          setWorkspace(path);
+        onSelect={(selectedWorkspace) => {
+          setWorkspace(selectedWorkspace);
           setWorkspaceDialogOpen(false);
         }}
       />
@@ -204,11 +204,12 @@ function ProjectSelector({
   workspace,
   onOpenProject,
 }: {
-  workspace: string | null;
+  workspace: WorkspaceRecord | null;
   onOpenProject: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const name = workspace ? projectName(workspace) : "选择项目";
+  const selectorRef = useRef<HTMLButtonElement>(null);
+  const name = workspace ? workspace.display_name : "选择项目";
 
   useEffect(() => {
     if (!open) {
@@ -228,11 +229,12 @@ function ProjectSelector({
       <button
         type="button"
         className="topbar-selector project-selector"
+        ref={selectorRef}
         aria-label={workspace ? `当前项目：${name}` : "选择项目"}
         aria-expanded={open}
         aria-haspopup="menu"
         onClick={() => setOpen((current) => !current)}
-        title={workspace ?? "打开一个项目开始工作"}
+        title={workspace?.path ?? "打开一个项目开始工作"}
       >
         <span className="topbar-selector-label">项目</span>
         <span className="topbar-selector-value">{name}</span>
@@ -251,7 +253,7 @@ function ProjectSelector({
               onClick={() => setOpen(false)}
             >
               <span>{name}</span>
-              <small>{workspace}</small>
+              <small>{workspace.path}</small>
             </button>
           ) : (
             <p className="menu-empty">暂无最近项目</p>
@@ -262,6 +264,10 @@ function ProjectSelector({
             className="menu-item menu-item-action"
             onClick={() => {
               setOpen(false);
+              // The menu item is removed in the same React commit that opens
+              // the dialog. Focus the durable trigger first so the dialog's
+              // focus-return contract does not fall back to <body>.
+              selectorRef.current?.focus();
               onOpenProject();
             }}
           >
@@ -376,75 +382,85 @@ function WorkspaceDialog({
 }: {
   open: boolean;
   onClose: () => void;
-  onSelect: (path: string) => void;
+  onSelect: (workspace: WorkspaceRecord) => void;
 }) {
   const [listing, setListing] = useState<WorkspaceListing | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [nativeBusy, setNativeBusy] = useState(false);
-  const [nativeMessage, setNativeMessage] = useState<string | null>(null);
-  const nativeBusyRef = useRef(false);
-  const onSelectRef = useRef(onSelect);
-
-  useEffect(() => {
-    onSelectRef.current = onSelect;
-  }, [onSelect]);
+  const [selecting, setSelecting] = useState(false);
+  const requestGeneration = useRef(0);
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
 
   const load = useCallback(async (path?: string) => {
+    const generation = ++requestGeneration.current;
+    if (path === undefined) {
+      setListing(null);
+      setSelected(null);
+      setSelecting(false);
+    }
     setLoading(true);
     setError(null);
     try {
-      setListing(await getWorkspaces(path));
+      const next = await getWorkspaces(path);
+      if (!open || generation !== requestGeneration.current) {
+        return;
+      }
+      setListing(next);
     } catch (reason: unknown) {
-      setError(reason instanceof Error ? reason.message : "项目目录请求失败");
+      if (!open || generation !== requestGeneration.current) {
+        return;
+      }
+      setError(formatWorkspaceError(reason, "项目目录请求失败"));
     } finally {
-      setLoading(false);
+      if (open && generation === requestGeneration.current) {
+        setLoading(false);
+      }
     }
-  }, []);
+  }, [open]);
 
-  const startNativePicker = useCallback(async () => {
-    if (nativeBusyRef.current) {
+  const selectCurrent = useCallback(async () => {
+    if (listing === null || selecting) {
       return;
     }
-    nativeBusyRef.current = true;
-    setNativeBusy(true);
-    setLoading(true);
-    setNativeMessage(null);
+    const generation = requestGeneration.current;
+    setSelecting(true);
+    setError(null);
     try {
-      const capability: NativePickerCapability = await getNativePickerCapability();
-      if (!capability.available) {
-        await load();
-        return;
+      const workspace = await selectWorkspace(listing.path);
+      if (open && generation === requestGeneration.current) {
+        setSelected(workspace.path);
+        onSelect(workspace);
       }
-      const selection = await selectNativeWorkspace();
-      if (selection.status === "selected" && selection.workspace) {
-        onSelectRef.current(selection.workspace);
-        return;
+    } catch (reason: unknown) {
+      if (open && generation === requestGeneration.current) {
+        setError(formatWorkspaceError(reason, "项目选择失败"));
       }
-      await load();
-    } catch {
-      setNativeMessage("Windows 文件夹选择暂不可用，可浏览 Host 文件系统。");
-      await load();
     } finally {
-      nativeBusyRef.current = false;
-      setNativeBusy(false);
+      if (open && generation === requestGeneration.current) {
+        setSelecting(false);
+      }
     }
-  }, [load]);
+  }, [listing, onSelect, open, selecting]);
 
   useEffect(() => {
-    if (!open) {
+    if (open) {
+      returnFocusRef.current = document.activeElement as HTMLElement | null;
+      // Defer the request one microtask so opening the modal does not perform
+      // a synchronous state transition from inside the effect itself.
+      const scheduledGeneration = requestGeneration.current;
+      queueMicrotask(() => {
+        if (open && requestGeneration.current === scheduledGeneration) {
+          void load();
+        }
+      });
+      dialogRef.current?.focus();
       return;
     }
-    const timer = window.setTimeout(() => {
-      setListing(null);
-      setSelected(null);
-      setError(null);
-      setNativeMessage(null);
-      void startNativePicker();
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, [open, startNativePicker]);
+    requestGeneration.current += 1;
+    returnFocusRef.current?.focus();
+  }, [load, open]);
 
   useEffect(() => {
     if (!open) {
@@ -470,7 +486,9 @@ function WorkspaceDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="workspace-heading"
-        aria-busy={nativeBusy || loading}
+        aria-busy={selecting || loading}
+        tabIndex={-1}
+        ref={dialogRef}
       >
         <div className="dialog-heading">
           <div>
@@ -483,25 +501,10 @@ function WorkspaceDialog({
             className="icon-button"
             aria-label="关闭项目对话框"
             onClick={onClose}
-            disabled={nativeBusy}
           >
             ×
           </button>
         </div>
-
-        {nativeMessage ? (
-          <div className="native-picker-notice" role="status">
-            <span>{nativeMessage}</span>
-            <button
-              type="button"
-              className="quiet-button"
-              onClick={() => void startNativePicker()}
-              disabled={nativeBusy}
-            >
-              重试 Windows 选择
-            </button>
-          </div>
-        ) : null}
 
         {error ? (
           <div className="error-banner" role="alert">
@@ -513,9 +516,7 @@ function WorkspaceDialog({
           </div>
         ) : null}
         {loading && listing === null ? (
-          <p className="status-line">
-            {nativeBusy ? "正在打开 Windows 文件夹选择…" : "正在加载项目目录…"}
-          </p>
+          <p className="status-line">正在加载 Host 项目目录…</p>
         ) : null}
 
         {listing ? (
@@ -571,20 +572,13 @@ function WorkspaceDialog({
                 type="button"
                 className="primary-button"
                 onClick={() => {
-                  setSelected(listing.path);
-                  onSelect(listing.path);
+                  void selectCurrent();
                 }}
+                disabled={selecting || loading}
               >
                 使用此项目
               </button>
-              <button
-                type="button"
-                className="quiet-button"
-                onClick={() => void load()}
-                disabled={nativeBusy}
-              >
-                浏览 Host 文件系统
-              </button>
+              {selecting ? <p className="status-line">正在保存 Workspace…</p> : null}
               {selected ? <p className="success-line">已选择 · {selected}</p> : null}
             </div>
           </div>
@@ -596,7 +590,14 @@ function WorkspaceDialog({
 
 function projectName(path: string): string {
   const normalized = path.replace(/[\\/]$/, "");
-  return normalized.split(/[\\/]/).at(-1) || normalized;
+  return normalized.split(/[\\/]/).at(-1) || normalized || "/";
+}
+
+function formatWorkspaceError(reason: unknown, fallback: string): string {
+  if (reason instanceof HostError) {
+    return `${reason.code} · ${reason.message}`;
+  }
+  return reason instanceof Error ? reason.message : fallback;
 }
 
 function titleFromText(value: string): string {
@@ -807,8 +808,8 @@ function ProviderRow({
 type ThreadPanelProps = {
   providers: ProviderView[];
   providerReady: boolean;
-  workspace: string | null;
-  onWorkspaceRecovered: (workspace: string) => void;
+  workspace: WorkspaceRecord | null;
+  onWorkspaceRecovered: (workspace: WorkspaceRecord) => void;
   selectedProviderId: string | null;
   selectedModel: string;
   onOpenProject: () => void;
@@ -856,8 +857,8 @@ function ThreadPanel({
         if (mounted) {
           setThreads(response);
           setActiveId((current) => current ?? response[0]?.snapshot.thread_id ?? null);
-          if (response[0]) {
-            onWorkspaceRecovered(response[0].snapshot.workspace);
+          if (response[0]?.workspace) {
+            onWorkspaceRecovered(response[0].workspace);
           }
           setError(null);
         }
@@ -876,6 +877,12 @@ function ThreadPanel({
       mounted = false;
     };
   }, [onWorkspaceRecovered]);
+
+  useEffect(() => {
+    if (active?.workspace) {
+      onWorkspaceRecovered(active.workspace);
+    }
+  }, [active, onWorkspaceRecovered]);
 
   const replaceThread = useCallback((next: ThreadView) => {
     setThreads((current) =>
@@ -914,7 +921,7 @@ function ThreadPanel({
       if (creationProvider === null || !creationModel.trim()) {
         throw new Error("请选择已配置的模型服务商和模型");
       }
-      const next = await createThread(workspace, {
+      const next = await createThread(workspace.workspace_id, {
         provider_config_id: creationProvider.provider_id,
         model: creationModel.trim(),
       });
@@ -1206,8 +1213,13 @@ function ActiveThreadView({
   );
   const [initialCursor] = useState(thread.event_cursor);
   const [approvalBusy, setApprovalBusy] = useState(false);
+  const mountedRef = useRef(true);
   const threadId = thread.snapshot.thread_id;
   const submissionActive = thread.submission !== null;
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+  }, []);
 
   useEffect(() => {
     const wasDisconnected = previousConnection.current === "disconnected";
@@ -1277,26 +1289,44 @@ function ActiveThreadView({
       initialCursor,
       {
         onEvent: (event) => {
+          if (!mountedRef.current) {
+            return;
+          }
           setState((current) => applyAgentEvent(current, event));
           setStreamError(null);
           if (TERMINAL_EVENT_TYPES.has(event.type)) {
-            void getThread(threadId).then(onThread).catch((reason: unknown) => {
-              setStreamError(
-                reason instanceof Error
-                  ? `恢复对话快照失败 · ${reason.message}`
-                  : "恢复对话快照失败",
-              );
-            });
+            void getThread(threadId)
+              .then((next) => {
+                if (mountedRef.current) {
+                  onThread(next);
+                }
+              })
+              .catch((reason: unknown) => {
+                if (mountedRef.current) {
+                  setStreamError(
+                    reason instanceof Error
+                      ? `恢复对话快照失败 · ${reason.message}`
+                      : "恢复对话快照失败",
+                  );
+                }
+              });
           }
         },
         onSnapshot: (next) => {
+          if (!mountedRef.current) {
+            return;
+          }
           onThread(next);
           setState(initialThreadState(next));
           setStreamError(null);
         },
         onConnection: setConnection,
         recover: () => getThread(threadId),
-        onError: setStreamError,
+        onError: (message) => {
+          if (mountedRef.current) {
+            setStreamError(message);
+          }
+        },
       },
     );
     client.start();

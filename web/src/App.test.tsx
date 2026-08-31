@@ -11,6 +11,16 @@ beforeEach(() => {
       json: async () =>
         String(input) === "/api/threads"
           ? { schema_version: 1, threads: [] }
+        : String(input) === "/api/workspaces/select"
+          ? {
+              schema_version: 1,
+              workspace: {
+                workspace_id: "workspace-1",
+                path: "/workspace",
+                canonical_path: "/workspace",
+                display_name: "workspace",
+              },
+            }
           : String(input).startsWith("/api/workspaces")
           ? {
               schema_version: 1,
@@ -85,6 +95,20 @@ test("saves a key, discovers models, and selects a default", async () => {
           ok: true,
           json: async () => ({ schema_version: 1, threads: [] }),
         };
+      }
+      if (path === "/api/workspaces/select" && method === "POST") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            workspace: {
+              workspace_id: "workspace-project",
+              path: "/home/student/project",
+              canonical_path: "/home/student/project",
+              display_name: "project",
+            },
+          }),
+        } as Response;
       }
       if (path.startsWith("/api/workspaces")) {
         return {
@@ -274,12 +298,26 @@ test("navigates Host workspaces and selects the current directory", async () => 
   const workspaceRequests: string[] = [];
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (input: RequestInfo | URL) => {
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);
       if (path === "/api/threads") {
         return {
           ok: true,
           json: async () => ({ schema_version: 1, threads: [] }),
+        } as Response;
+      }
+      if (path === "/api/workspaces/select" && init?.method === "POST") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            workspace: {
+              workspace_id: "workspace-project",
+              path: "/home/student/project",
+              canonical_path: "/home/student/project",
+              display_name: "project",
+            },
+          }),
         } as Response;
       }
       if (path.startsWith("/api/workspaces")) {
@@ -329,135 +367,12 @@ test("navigates Host workspaces and selects the current directory", async () => 
   await waitFor(() => expect(workspaceRequests.length).toBeGreaterThan(1));
   expect(await screen.findByText("/home/student/project")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "使用此项目" }));
-  expect(screen.getByRole("button", { name: "当前项目：project" })).toBeInTheDocument();
+  expect(
+    await screen.findByRole("button", { name: "当前项目：project" }),
+  ).toBeInTheDocument();
   expect(screen.queryByText("/home/student/project")).not.toBeInTheDocument();
   expect(workspaceRequests).toContain(
     "/api/workspaces?path=%2Fhome%2Fstudent%2Fproject",
-  );
-});
-
-test("prefers the native Windows picker and uses its validated WSL workspace", async () => {
-  const requests: string[] = [];
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const path = String(input);
-      requests.push(`${init?.method ?? "GET"} ${path}`);
-      if (path === "/api/threads") {
-        return {
-          ok: true,
-          json: async () => ({ schema_version: 1, threads: [] }),
-        } as Response;
-      }
-      if (path === "/api/native-picker/capability") {
-        return {
-          ok: true,
-          json: async () => ({
-            schema_version: 1,
-            available: true,
-            reason_code: null,
-          }),
-        } as Response;
-      }
-      if (path === "/api/native-picker/select") {
-        return {
-          ok: true,
-          json: async () => ({
-            schema_version: 1,
-            status: "selected",
-            workspace: "/mnt/c/项目 with spaces",
-          }),
-        } as Response;
-      }
-      return {
-        ok: true,
-        json: async () => ({
-          schema_version: 1,
-          default_provider_id: null,
-          providers: [],
-        }),
-      } as Response;
-    }),
-  );
-
-  render(<App />);
-  fireEvent.click(screen.getByRole("button", { name: "选择项目" }));
-  fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
-
-  await waitFor(() =>
-    expect(
-      screen.getByRole("button", { name: "当前项目：项目 with spaces" }),
-    ).toBeInTheDocument(),
-  );
-  expect(requests).toContain("GET /api/native-picker/capability");
-  expect(requests).toContain("POST /api/native-picker/select");
-  expect(requests.some((request) => request.includes("/api/workspaces"))).toBe(
-    false,
-  );
-});
-
-test("falls back to Host browser quietly when the native picker is cancelled", async () => {
-  const requests: string[] = [];
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const path = String(input);
-      requests.push(`${init?.method ?? "GET"} ${path}`);
-      if (path === "/api/threads") {
-        return {
-          ok: true,
-          json: async () => ({ schema_version: 1, threads: [] }),
-        } as Response;
-      }
-      if (path === "/api/native-picker/capability") {
-        return {
-          ok: true,
-          json: async () => ({
-            schema_version: 1,
-            available: true,
-            reason_code: null,
-          }),
-        } as Response;
-      }
-      if (path === "/api/native-picker/select") {
-        return {
-          ok: true,
-          json: async () => ({ schema_version: 1, status: "cancelled" }),
-        } as Response;
-      }
-      if (path.startsWith("/api/workspaces")) {
-        return {
-          ok: true,
-          json: async () => ({
-            schema_version: 1,
-            path: "/workspace",
-            parent: null,
-            roots: ["/workspace"],
-            entries: [],
-            truncated: false,
-          }),
-        } as Response;
-      }
-      return {
-        ok: true,
-        json: async () => ({
-          schema_version: 1,
-          default_provider_id: null,
-          providers: [],
-        }),
-      } as Response;
-    }),
-  );
-
-  render(<App />);
-  fireEvent.click(screen.getByRole("button", { name: "选择项目" }));
-  fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
-
-  expect((await screen.findAllByText("/workspace")).length).toBeGreaterThan(0);
-  expect(screen.queryByText("Windows 文件夹选择暂不可用")).not.toBeInTheDocument();
-  expect(requests).toContain("POST /api/native-picker/select");
-  expect(requests.some((request) => request.includes("GET /api/workspaces"))).toBe(
-    true,
   );
 });
 
@@ -477,7 +392,7 @@ test("keeps workspace errors visible with a reload action", async () => {
           status: 403,
           json: async () => ({
             error: {
-              code: "WORKSPACE_NOT_ACCESSIBLE",
+              code: "PERMISSION_DENIED",
               message: "Workspace path is not accessible",
               details: {},
             },
@@ -500,8 +415,22 @@ test("keeps workspace errors visible with a reload action", async () => {
   fireEvent.click(screen.getByRole("button", { name: "选择项目" }));
   fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
   expect(await screen.findByText("项目不可用")).toBeInTheDocument();
-  expect(screen.getByText("Workspace path is not accessible")).toBeInTheDocument();
+  expect(screen.getByText(/Workspace path is not accessible/)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "重新加载根目录" })).toBeInTheDocument();
+});
+
+test("returns focus to the project selector after closing its dialog", async () => {
+  render(<App />);
+
+  const opener = screen.getByRole("button", { name: "选择项目" });
+  fireEvent.click(opener);
+  fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
+
+  const dialog = await screen.findByRole("dialog");
+  expect(dialog).toHaveFocus();
+  fireEvent.click(within(dialog).getByRole("button", { name: "关闭项目对话框" }));
+
+  await waitFor(() => expect(document.activeElement).toBe(opener));
 });
 
 test("creates switches refreshes and closes Host threads", async () => {
@@ -597,6 +526,12 @@ test("creates switches refreshes and closes Host threads", async () => {
     },
     event_cursor: null,
     submission: null,
+    workspace: {
+      workspace_id: `workspace-${id}`,
+      path: workspace,
+      canonical_path: workspace,
+      display_name: workspace.split("/").at(-1) || "/",
+    },
   });
   vi.stubGlobal(
     "fetch",
@@ -620,6 +555,20 @@ test("creates switches refreshes and closes Host threads", async () => {
                 is_default: true,
               },
             ],
+          }),
+        } as Response;
+      }
+      if (path === "/api/workspaces/select" && method === "POST") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            workspace: {
+              workspace_id: "workspace-project",
+              path: "/home/student/project",
+              canonical_path: "/home/student/project",
+              display_name: "project",
+            },
           }),
         } as Response;
       }
@@ -774,6 +723,7 @@ test("creates switches refreshes and closes Host threads", async () => {
   fireEvent.click(screen.getByRole("button", { name: "当前项目：old" }));
   fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
   fireEvent.click(await screen.findByRole("button", { name: "使用此项目" }));
+  await screen.findByRole("button", { name: "当前项目：project" });
   fireEvent.click(screen.getByRole("button", { name: "新对话" }));
 
   expect(
@@ -818,7 +768,7 @@ test("creates switches refreshes and closes Host threads", async () => {
         path: "/api/threads",
         method: "POST",
         body: JSON.stringify({
-          workspace: "/home/student/project",
+          workspace_id: "workspace-project",
           provider_config_id: "deepseek",
           model: "deepseek-chat",
         }),
@@ -893,6 +843,12 @@ test("submits multiline work and stops through Host commands", async () => {
     },
     event_cursor: null,
     submission: null,
+    workspace: {
+      workspace_id: "workspace-1",
+      path: "/workspace",
+      canonical_path: "/workspace",
+      display_name: "workspace",
+    },
   };
   vi.stubGlobal(
     "fetch",

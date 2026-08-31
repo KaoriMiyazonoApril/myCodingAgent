@@ -15,11 +15,31 @@ export type ProvidersResponse = {
 
 export type ErrorEnvelope = {
   error: {
+    status?: number;
     code: string;
     message: string;
     details: Record<string, unknown>;
   };
 };
+
+export class HostError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly details: Record<string, unknown>;
+
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    details: Record<string, unknown> = {},
+  ) {
+    super(message);
+    this.name = "HostError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
 
 type ProviderMutationResponse = {
   schema_version: number;
@@ -48,16 +68,16 @@ export type WorkspaceListing = {
   truncated: boolean;
 };
 
-export type NativePickerCapability = {
-  schema_version: number;
-  available: boolean;
-  reason_code: string | null;
+export type WorkspaceRecord = {
+  workspace_id: string;
+  path: string;
+  canonical_path: string;
+  display_name: string;
 };
 
-export type NativePickerSelectionResponse = {
+export type WorkspaceSelectionResponse = {
   schema_version: number;
-  status: "selected" | "cancelled";
-  workspace?: string;
+  workspace: WorkspaceRecord;
 };
 
 export type ThreadSettings = {
@@ -105,7 +125,13 @@ export type ThreadView = {
   };
   event_cursor: string | null;
   submission: TurnSubmission | null;
-  host_error?: { code: string; message: string } | null;
+  workspace?: WorkspaceRecord;
+  host_error?: {
+    status?: number;
+    code: string;
+    message: string;
+    details?: Record<string, unknown>;
+  } | null;
 };
 
 type ThreadsResponse = {
@@ -133,14 +159,68 @@ export async function getWorkspaces(path?: string): Promise<WorkspaceListing> {
   return requestJson<WorkspaceListing>(`/api/workspaces${query}`);
 }
 
-export async function getNativePickerCapability(): Promise<NativePickerCapability> {
-  return requestJson<NativePickerCapability>("/api/native-picker/capability");
+export async function selectWorkspace(path: string): Promise<WorkspaceRecord> {
+  return (
+    await requestJson<WorkspaceSelectionResponse>("/api/workspaces/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    })
+  ).workspace;
 }
 
-export async function selectNativeWorkspace(): Promise<NativePickerSelectionResponse> {
-  return requestJson<NativePickerSelectionResponse>("/api/native-picker/select", {
-    method: "POST",
-  });
+export async function createThread(
+  workspaceId: string,
+  selection?: { provider_config_id: string; model: string },
+): Promise<ThreadView> {
+  return (
+    await requestJson<ThreadResponse>("/api/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: workspaceId, ...selection }),
+    })
+  ).thread;
+}
+
+/*
+ * Keep the lower-level request helper private so all API errors retain the
+ * Host envelope rather than being flattened into an untyped Error string.
+ */
+async function requestJson<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<T> {
+  const response = await fetch(path, init);
+  if (!response.ok) {
+    throw await hostError(response);
+  }
+  return (await response.json()) as T;
+}
+
+async function hostError(response: Response): Promise<HostError> {
+  try {
+    const payload = (await response.json()) as ErrorEnvelope;
+    const error = payload.error;
+    if (
+      error &&
+      typeof error.code === "string" &&
+      typeof error.message === "string"
+    ) {
+      return new HostError(
+        typeof error.status === "number" ? error.status : response.status,
+        error.code,
+        error.message,
+        error.details ?? {},
+      );
+    }
+  } catch {
+    // Fall through to a stable transport-level HostError below.
+  }
+  return new HostError(
+    response.status,
+    "HOST_ERROR",
+    `Host request failed (${response.status})`,
+  );
 }
 
 export async function getThreads(): Promise<ThreadView[]> {
@@ -151,18 +231,6 @@ export async function getThread(threadId: string): Promise<ThreadView> {
   return (await requestJson<ThreadResponse>(`/api/threads/${threadId}`)).thread;
 }
 
-export async function createThread(
-  workspace: string,
-  selection?: { provider_config_id: string; model: string },
-): Promise<ThreadView> {
-  return (
-    await requestJson<ThreadResponse>("/api/threads", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workspace, ...selection }),
-    })
-  ).thread;
-}
 
 export async function updateThreadSettings(
   threadId: string,
@@ -281,24 +349,4 @@ export async function clearProviderCredential(
     { method: "DELETE" },
   );
   return response.provider;
-}
-
-async function requestJson<T>(
-  path: string,
-  init?: RequestInit,
-): Promise<T> {
-  const response = await fetch(path, init);
-  if (!response.ok) {
-    throw await hostError(response);
-  }
-  return (await response.json()) as T;
-}
-
-async function hostError(response: Response): Promise<Error> {
-  try {
-    const payload = (await response.json()) as ErrorEnvelope;
-    return new Error(payload.error.message);
-  } catch {
-    return new Error(`Host request failed (${response.status})`);
-  }
 }

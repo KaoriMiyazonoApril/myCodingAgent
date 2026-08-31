@@ -262,6 +262,7 @@ def test_provider_api_returns_stable_safe_errors(tmp_path) -> None:
     assert rejected.status_code == 400
     assert rejected.json() == {
         "error": {
+            "status": 400,
             "code": "PROVIDER_AUTHENTICATION_FAILED",
             "message": "Provider rejected the configured credential",
             "details": {},
@@ -283,6 +284,7 @@ def test_unknown_host_error_is_stable_and_redacts_internal_details(tmp_path) -> 
     assert response.status_code == 500
     assert response.json() == {
         "error": {
+            "status": 500,
             "code": "INTERNAL_ERROR",
             "message": "Agent Host request failed",
             "details": {},

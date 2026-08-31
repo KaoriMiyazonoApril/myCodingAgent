@@ -45,7 +45,9 @@ def build_web_app(
 ):
     """Compose a development or production app without starting a socket."""
 
-    roots = list(workspace_roots) or [str(Path.cwd())]
+    # No configured roots means the Host browser starts at its filesystem
+    # root. The process startup cwd is not an authorization boundary.
+    roots = list(workspace_roots)
     static_dir = None if dev else production_static_dir()
     return create_app(
         provider_store=ProviderStore(),

@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 import inspect
 import logging
+from typing import TYPE_CHECKING
 
 from agent.core.messages import ToolCallBlock
 from agent.tools.filesystem import ToolOperationError
@@ -15,11 +16,15 @@ from agent.tools.types import (
     ToolResult,
 )
 
+if TYPE_CHECKING:
+    from agent.runtime.policy import ExecutionProfile
+
 
 ToolExecutor = Callable[[dict[str, object]], ToolResult]
 AsyncToolExecutor = Callable[[dict[str, object]], Awaitable[ToolResult]]
 CloseCallback = Callable[[], object]
 EventSink = Callable[[str, dict[str, object]], object]
+ExecutionProfileSetter = Callable[[object | None], None]
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,7 @@ class ToolRegistry:
         self._closed = False
         self._event_sink_setters: list[Callable[[EventSink | None], None]] = []
         self._session_cancellers: list[Callable[[], None]] = []
+        self._execution_profile_setters: list[ExecutionProfileSetter] = []
 
     def bind_event_sink(
         self, setter: Callable[[EventSink | None], None]
@@ -59,6 +65,15 @@ class ToolRegistry:
         """Bind Turn-cancellation cleanup for stateful capabilities."""
 
         self._session_cancellers.append(canceller)
+
+    def bind_execution_profile_setter(self, setter: ExecutionProfileSetter) -> None:
+        """Bind the sandbox profile seam for command-capable tools."""
+
+        self._execution_profile_setters.append(setter)
+
+    def set_execution_profile(self, profile: ExecutionProfile | None) -> None:
+        for setter in self._execution_profile_setters:
+            setter(profile)
 
     def cancel_active_sessions(self) -> None:
         """Request cleanup of running session capabilities owned by this Thread."""
@@ -113,9 +128,15 @@ class ToolRegistry:
         registered = self._tools.get(name)
         return None if registered is None else registered[0]
 
-    def execute(self, call: ToolCallBlock) -> ToolResult:
+    def execute(
+        self,
+        call: ToolCallBlock,
+        *,
+        execution_profile: ExecutionProfile | None = None,
+    ) -> ToolResult:
         if self._closed:
             return self._closed_result(call)
+        self.set_execution_profile(execution_profile)
         registered = self._tools.get(call.name)
         if registered is None:
             return ToolResult(
@@ -156,13 +177,25 @@ class ToolRegistry:
                 error_code="INTERNAL_ERROR",
             )
 
-    async def execute_async(self, call: ToolCallBlock) -> ToolResult:
+    async def execute_async(
+        self,
+        call: ToolCallBlock,
+        *,
+        execution_profile: ExecutionProfile | None = None,
+    ) -> ToolResult:
         """Dispatch without blocking an async Agent Loop or UI event loop."""
         if self._closed:
             return self._closed_result(call)
+        self.set_execution_profile(execution_profile)
         registered = self._tools.get(call.name)
         if registered is None or registered[2] is None:
-            worker = asyncio.create_task(asyncio.to_thread(self.execute, call))
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    self.execute,
+                    call,
+                    execution_profile=execution_profile,
+                )
+            )
             cancellation_seen = False
             while not worker.done():
                 try:

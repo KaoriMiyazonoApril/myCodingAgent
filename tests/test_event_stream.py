@@ -310,7 +310,13 @@ def test_sse_route_maps_query_and_header_cursors_with_streaming_headers(
         event_stream_adapter=stream,  # type: ignore[arg-type]
     )
     with TestClient(app) as client:
-        created = client.post("/api/threads", json={"workspace": str(tmp_path)})
+        selected = client.post("/api/workspaces/select", json={"path": str(tmp_path)})
+        assert selected.status_code == 201
+        created = client.post(
+            "/api/threads",
+            json={"workspace_id": selected.json()["workspace"]["workspace_id"]},
+        )
+        assert created.status_code == 201
         thread_id = created.json()["thread"]["snapshot"]["thread_id"]
         query = client.get(
             f"/api/threads/{thread_id}/events",

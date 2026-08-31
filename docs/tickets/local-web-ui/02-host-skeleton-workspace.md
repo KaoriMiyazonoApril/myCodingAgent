@@ -8,9 +8,11 @@ Linux/WSL workspace。Host 以稳定 JSON 和错误 envelope 返回目录信息�
 
 **Status:** completed
 
-- [x] Host 接受一个或多个规范化 workspace roots，未提供时使用启动工作目录。
+- [x] Host 接受一个或多个规范化 workspace roots，未提供时从 `/` 开始浏览；启动 cwd 不
+  具备授权含义。
 - [x] Workspace command 每次只列一层目录，目录优先、按名称排序、包含隐藏目录，并在 500 项处返回 `truncated`。
-- [x] Picker 不跟随或返回 symlink，不返回普通文件，也不读取任何文件内容。
+- [x] Browser 不返回普通文件，也不读取任何文件内容；工作区内的目录 symlink 可按其
+  canonical target 导航，越出允许根的 alias 会被忽略或拒绝。
 - [x] containment 检查正确拒绝 `..`、绝对 sibling、共同字符串前缀和其他 root escape。
 - [x] 不存在、不可访问和 root 外路径使用不同稳定 error code，前端均显示可操作错误。
 - [x] React workspace picker 支持 roots、parent、entry navigation、当前选择和重新加载。

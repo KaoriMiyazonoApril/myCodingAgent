@@ -6,10 +6,8 @@ import asyncio
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable
-import ctypes
-import ctypes.util
 from dataclasses import dataclass
-import errno
+import inspect
 import os
 import pty
 from pathlib import Path
@@ -19,10 +17,14 @@ import subprocess
 import sys
 import time
 from typing import Any
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem
 from agent.tools.types import ToolResult
+
+if TYPE_CHECKING:
+    from agent.runtime.policy import ExecutionProfile
 
 
 OUTPUT_LIMIT_BYTES = 100 * 1024
@@ -72,6 +74,7 @@ class CommandSandboxBackend(ABC):
         workspace_root: Path,
         command: str,
         relative_cwd: str,
+        execution_profile: "ExecutionProfile | None" = None,
     ) -> list[str]:
         """Return the isolated process invocation for one command."""
 
@@ -83,13 +86,15 @@ class CommandSandboxBackend(ABC):
         relative_cwd: str,
         command: str,
         timeout_ms: int,
+        execution_profile: "ExecutionProfile | None" = None,
     ) -> SandboxExecution:
         """Execute one command; cancellation terminates its process group."""
 
-        invocation = self._build_command(
+        invocation = self._build_invocation(
             workspace_root=workspace_root,
             command=command,
             relative_cwd=relative_cwd,
+            execution_profile=execution_profile,
         )
         start = time.monotonic()
         try:
@@ -153,14 +158,17 @@ class CommandSandboxBackend(ABC):
         relative_cwd: str,
         command: str,
         tty: bool,
+        execution_profile: "ExecutionProfile | None" = None,
     ) -> _SpawnedProcess:
         """Start a persistent sandboxed process using the existing invocation seam."""
 
-        invocation = self._build_command(
+        invocation = self._build_invocation(
             workspace_root=workspace_root,
             command=command,
             relative_cwd=relative_cwd,
+            execution_profile=execution_profile,
         )
+
         if not tty:
             try:
                 process = await asyncio.create_subprocess_exec(
@@ -226,6 +234,36 @@ class CommandSandboxBackend(ABC):
             stdin_fd=master_fd,
             output_transport=transport,
             merged_output=True,
+        )
+
+    def _build_invocation(
+        self,
+        *,
+        workspace_root: Path,
+        command: str,
+        relative_cwd: str,
+        execution_profile: "ExecutionProfile | None",
+    ) -> list[str]:
+        """Call old injected backends while exposing the profile to new ones."""
+
+        try:
+            parameters = inspect.signature(self._build_command).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "execution_profile" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            return self._build_command(
+                workspace_root=workspace_root,
+                command=command,
+                relative_cwd=relative_cwd,
+                execution_profile=execution_profile,
+            )
+        return self._build_command(
+            workspace_root=workspace_root,
+            command=command,
+            relative_cwd=relative_cwd,
         )
 
     def _pass_fds(self) -> tuple[int, ...]:
@@ -328,18 +366,11 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
             raise CommandSandboxUnavailableError(
                 "bubblewrap is required for workspace command isolation"
             )
-        try:
-            self._seccomp_fd = self._create_link_blocking_filter()
-        except (OSError, ValueError) as error:
-            raise CommandSandboxUnavailableError(
-                f"workspace link-blocking seccomp is unavailable: {error}"
-            ) from error
         probe_command = self._command(
             executable=executable,
             workspace_root=workspace_root,
             command="true",
             relative_cwd=".",
-            seccomp_fd=self._seccomp_fd,
         )
         try:
             probe = subprocess.run(
@@ -364,42 +395,6 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
             raise CommandSandboxUnavailableError(
                 f"bubblewrap capability probe failed with status {probe.returncode}{suffix}"
             )
-        enforcement_probe = self._command(
-            executable=executable,
-            workspace_root=workspace_root,
-            command=(
-                "touch /tmp/link-target; "
-                "ln -s link-target /tmp/symbolic-probe 2>/dev/null && exit 99; "
-                "ln /tmp/link-target /tmp/hard-probe 2>/dev/null && exit 99; "
-                "exit 0"
-            ),
-            relative_cwd=".",
-            seccomp_fd=self._seccomp_fd,
-        )
-        try:
-            enforcement = subprocess.run(
-                enforcement_probe,
-                cwd=workspace_root,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=3,
-                check=False,
-                pass_fds=self._pass_fds(),
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            self._reset_capability()
-            raise CommandSandboxUnavailableError(
-                f"workspace link-blocking capability probe failed: {error}"
-            ) from error
-        if enforcement.returncode != 0:
-            details = enforcement.stderr.decode("utf-8", errors="replace").strip()
-            suffix = f": {details}" if details else ""
-            self._reset_capability()
-            raise CommandSandboxUnavailableError(
-                "workspace link-blocking capability probe failed"
-                f" with status {enforcement.returncode}{suffix}"
-            )
         self._executable = executable
 
     def _build_command(
@@ -408,6 +403,7 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
         workspace_root: Path,
         command: str,
         relative_cwd: str,
+        execution_profile: "ExecutionProfile | None" = None,
     ) -> list[str]:
         if self._executable is None:
             raise CommandSandboxUnavailableError(
@@ -418,6 +414,7 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
             workspace_root=workspace_root,
             command=command,
             relative_cwd=relative_cwd,
+            execution_profile=execution_profile,
             seccomp_fd=self._seccomp_fd,
         )
 
@@ -436,20 +433,24 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
         workspace_root: Path,
         command: str,
         relative_cwd: str,
-        seccomp_fd: int,
+        seccomp_fd: int | None = None,
+        execution_profile: "ExecutionProfile | None" = None,
     ) -> list[str]:
         sandbox_cwd = "/workspace"
         if relative_cwd != ".":
             sandbox_cwd = f"/workspace/{relative_cwd}"
-        return [
+        profile_value = getattr(execution_profile, "value", execution_profile)
+        if profile_value is None:
+            profile_value = "workspace_write"
+        writable = profile_value != "read_only"
+        network = profile_value == "workspace_write_network"
+        invocation = [
             executable,
             "--unshare-all",
             "--die-with-parent",
             "--new-session",
             "--cap-drop",
             "ALL",
-            "--seccomp",
-            str(seccomp_fd),
             "--ro-bind",
             "/usr",
             "/usr",
@@ -473,7 +474,7 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
             "/tmp",
             "--dir",
             "/home",
-            "--bind",
+            "--bind" if writable else "--ro-bind",
             str(workspace_root),
             "/workspace",
             "--chdir",
@@ -491,64 +492,40 @@ class BubblewrapSandboxBackend(CommandSandboxBackend):
             "-c",
             command,
         ]
+        if network:
+            # ``--unshare-all`` isolates network by default. Share only the
+            # network namespace for the explicit network profile and expose
+            # the minimum read-only resolver/TLS configuration it needs.
+            share_index = invocation.index("--die-with-parent") + 1
+            invocation[share_index:share_index] = ["--share-net"]
+            chdir_index = invocation.index("--chdir")
+            invocation[chdir_index:chdir_index] = [
+                "--dir",
+                "/etc",
+                "--ro-bind",
+                "/etc/resolv.conf",
+                "/etc/resolv.conf",
+                "--ro-bind",
+                "/etc/hosts",
+                "/etc/hosts",
+                "--ro-bind",
+                "/etc/ssl",
+                "/etc/ssl",
+            ]
+        if seccomp_fd is not None:
+            # Older integrations may still provide a seccomp descriptor. It
+            # is intentionally optional because link creation is not the
+            # workspace containment seam; existing internal aliases remain
+            # valid and are checked by the filesystem at access time.
+            seccomp_index = invocation.index("--cap-drop") + 2
+            invocation[seccomp_index:seccomp_index] = ["--seccomp", str(seccomp_fd)]
+        return invocation
 
     def _reset_capability(self) -> None:
         self._executable = None
         if self._seccomp_fd is not None:
             os.close(self._seccomp_fd)
             self._seccomp_fd = None
-
-    @staticmethod
-    def _create_link_blocking_filter() -> int:
-        library_name = ctypes.util.find_library("seccomp")
-        if library_name is None:
-            raise ValueError("libseccomp is required")
-        library = ctypes.CDLL(library_name, use_errno=True)
-        library.seccomp_init.argtypes = [ctypes.c_uint32]
-        library.seccomp_init.restype = ctypes.c_void_p
-        library.seccomp_release.argtypes = [ctypes.c_void_p]
-        library.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
-        library.seccomp_syscall_resolve_name.restype = ctypes.c_int
-        library.seccomp_rule_add.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_int,
-            ctypes.c_uint,
-        ]
-        library.seccomp_rule_add.restype = ctypes.c_int
-        library.seccomp_export_bpf.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        library.seccomp_export_bpf.restype = ctypes.c_int
-
-        seccomp_allow = 0x7FFF0000
-        seccomp_errno = 0x00050000 | errno.EPERM
-        context = library.seccomp_init(seccomp_allow)
-        if not context:
-            raise OSError(ctypes.get_errno(), "seccomp_init failed")
-        descriptor = os.memfd_create("agent-link-seccomp", flags=0)
-        try:
-            for syscall_name in (b"symlink", b"symlinkat", b"link", b"linkat"):
-                syscall_number = library.seccomp_syscall_resolve_name(syscall_name)
-                if syscall_number < 0:
-                    continue
-                result = library.seccomp_rule_add(
-                    context,
-                    seccomp_errno,
-                    syscall_number,
-                    0,
-                )
-                if result < 0:
-                    raise OSError(-result, f"could not block {syscall_name.decode()}")
-            result = library.seccomp_export_bpf(context, descriptor)
-            if result < 0:
-                raise OSError(-result, "could not export seccomp filter")
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            return descriptor
-        except Exception:
-            os.close(descriptor)
-            raise
-        finally:
-            library.seccomp_release(context)
-
 
 class _BoundedOutput:
     """Retain bounded head/tail output while continuously draining a stream."""
@@ -598,6 +575,7 @@ class CommandRunner:
             else BubblewrapSandboxBackend()
         )
         self._sandbox.check_available(self._filesystem.root)
+        self._execution_profile: "ExecutionProfile | None" = None
 
     def close(self) -> None:
         """Release resources owned by the configured sandbox backend."""
@@ -610,12 +588,32 @@ class CommandRunner:
 
         return self._sandbox
 
-    def run(self, command: str, cwd: str, timeout_ms: int) -> ToolResult:
+    def set_execution_profile(self, profile: "ExecutionProfile | None") -> None:
+        """Set the profile used by the next one-shot command."""
+
+        self._execution_profile = profile
+
+    def run(
+        self,
+        command: str,
+        cwd: str,
+        timeout_ms: int,
+        execution_profile: "ExecutionProfile | None" = None,
+    ) -> ToolResult:
         """Synchronous entry point for CLI code and synchronous tests."""
 
-        return asyncio.run(self.run_async(command, cwd, timeout_ms))
+        return asyncio.run(
+            self.run_async(command, cwd, timeout_ms, execution_profile=execution_profile)
+        )
 
-    async def run_async(self, command: str, cwd: str, timeout_ms: int) -> ToolResult:
+    async def run_async(
+        self,
+        command: str,
+        cwd: str,
+        timeout_ms: int,
+        *,
+        execution_profile: "ExecutionProfile | None" = None,
+    ) -> ToolResult:
         """Run a command with cancellable process-group ownership."""
 
         working_directory, relative_cwd = self._filesystem.resolve(cwd)
@@ -630,6 +628,11 @@ class CommandRunner:
             command=command,
             relative_cwd=relative_cwd,
             timeout_ms=timeout_ms,
+            execution_profile=(
+                self._execution_profile
+                if execution_profile is None
+                else execution_profile
+            ),
         )
         metadata = {
             "cwd": relative_cwd,
@@ -644,6 +647,13 @@ class CommandRunner:
                 not execution.timed_out and execution.exit_code == 0
             ),
             "sandboxed": True,
+            "execution_profile": getattr(
+                execution_profile
+                if execution_profile is not None
+                else self._execution_profile,
+                "value",
+                execution_profile if execution_profile is not None else self._execution_profile,
+            ) or "workspace_write",
         }
         if execution.timed_out:
             status = f"command timed out after {timeout_ms} ms"
@@ -681,6 +691,7 @@ class ProcessSession:
         on_terminal: Callable[[str], None] | None,
         idle_timeout_seconds: float,
         timeout_ms: int,
+        execution_profile: "ExecutionProfile | None" = None,
     ) -> None:
         self.session_id = session_id
         self.command = command
@@ -692,6 +703,7 @@ class ProcessSession:
         self._on_terminal = on_terminal
         self._idle_timeout_seconds = idle_timeout_seconds
         self._timeout_ms = timeout_ms
+        self.execution_profile = execution_profile
         self._pending: deque[_PendingOutput] = deque()
         self._pending_bytes = {"stdout": 0, "stderr": 0}
         self._pending_truncated = {"stdout": False, "stderr": False}
@@ -702,6 +714,7 @@ class ProcessSession:
         self._idle_timed_out = False
         self._closed = False
         self._last_interaction = time.monotonic()
+        self._interaction_lock = asyncio.Lock()
         self._output_tasks: list[asyncio.Task[None]] = []
         self._wait_task = asyncio.create_task(self._watch_process())
         self._timeout_task = asyncio.create_task(self._watch_timeout())
@@ -724,7 +737,23 @@ class ProcessSession:
 
     async def read(self, yield_time_ms: int) -> ToolResult:
         """Return only output accumulated since the previous read."""
+        async with self._interaction_lock:
+            return await self._read_unlocked(yield_time_ms)
 
+    async def interact(self, chars: str, yield_time_ms: int) -> ToolResult:
+        """Serialize one optional stdin write and its output poll.
+
+        Keeping the write and read under one lock prevents two concurrent
+        ``write_stdin`` requests from crossing wires (for example, one call
+        reading output produced by another call's input).
+        """
+
+        async with self._interaction_lock:
+            if chars:
+                await self._write_unlocked(chars)
+            return await self._read_unlocked(yield_time_ms)
+
+    async def _read_unlocked(self, yield_time_ms: int) -> ToolResult:
         self._last_interaction = time.monotonic()
         deadline = time.monotonic() + yield_time_ms / 1000
         while self.running and yield_time_ms > 0 and time.monotonic() < deadline:
@@ -738,9 +767,9 @@ class ProcessSession:
                 )
             except TimeoutError:
                 break
-        # A child may have produced its last bytes just before wait() made the
-        # return code observable. Give the watcher one scheduling turn so the
-        # terminal event is ordered after the final output delta.
+        # A child may have produced its last bytes just before wait() made
+        # the return code observable. Give the watcher one scheduling turn
+        # so the terminal event is ordered after final output.
         await asyncio.sleep(0)
         if self._process.returncode is not None and not self._exited:
             try:
@@ -751,7 +780,10 @@ class ProcessSession:
 
     async def write(self, chars: str) -> None:
         """Write raw stdin, treating a standalone Ctrl-C as SIGINT."""
+        async with self._interaction_lock:
+            await self._write_unlocked(chars)
 
+    async def _write_unlocked(self, chars: str) -> None:
         if not isinstance(chars, str):
             raise ToolOperationError("INVALID_ARGUMENTS", "chars must be a string")
         self._last_interaction = time.monotonic()
@@ -839,6 +871,11 @@ class ProcessSession:
                 "session_id": self.session_id,
                 "cwd": self.cwd,
                 "command": self.command,
+                "execution_profile": getattr(
+                    self.execution_profile,
+                    "value",
+                    self.execution_profile,
+                ) or "workspace_write",
                 "stdout": stdout,
                 "stderr": stderr,
                 "stdout_delta": stdout,
@@ -1026,15 +1063,32 @@ class ProcessManager:
         self._idle_timeout_seconds = idle_timeout_seconds
         self._event_sink = event_sink
         self._sessions: dict[str, ProcessSession] = {}
+        # Naturally exited sessions are kept separately from active sessions
+        # so one final output/exit poll can be collected without counting
+        # against the active-session limit.
+        self._exited_sessions: dict[str, ProcessSession] = {}
+        # Keep a small in-memory tombstone for sessions whose one final poll
+        # has already been consumed. This distinguishes a known dead session
+        # from a typo/unknown id without retaining process resources.
+        self._dead_sessions: set[str] = set()
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._sandbox_released = False
         self._closed = False
+        self._execution_profile: "ExecutionProfile | None" = None
+
+    def set_execution_profile(self, profile: "ExecutionProfile | None") -> None:
+        """Set the profile for newly created sessions."""
+
+        self._execution_profile = profile
 
     def _on_terminal(self, session_id: str) -> None:
         session = self._sessions.pop(session_id, None)
         if session is not None:
-            session.close_sync()
-            self._schedule_cleanup(session)
+            if self._closed:
+                session.close_sync()
+                self._schedule_cleanup(session)
+            else:
+                self._exited_sessions[session_id] = session
 
     def _schedule_cleanup(self, session: ProcessSession) -> None:
         """Retain asynchronous session cleanup until its reader tasks are drained."""
@@ -1051,7 +1105,7 @@ class ProcessManager:
         self, event_sink: Callable[[str, dict[str, Any]], object] | None
     ) -> None:
         self._event_sink = event_sink
-        for session in self._sessions.values():
+        for session in [*self._sessions.values(), *self._exited_sessions.values()]:
             session._event_sink = event_sink
 
     async def exec(
@@ -1072,12 +1126,14 @@ class ProcessManager:
         if sum(session.running for session in self._sessions.values()) >= self._max_sessions:
             raise ToolOperationError("SESSION_LIMIT", "active session limit reached")
         session_id = str(uuid4())
+        execution_profile = self._execution_profile
         spawned = await self._sandbox.start_session(
             workspace_root=self._filesystem.root,
             working_directory=working_directory,
             relative_cwd=relative_cwd,
             command=command,
             tty=tty,
+            execution_profile=execution_profile,
         )
         session = ProcessSession(
             session_id=session_id,
@@ -1089,6 +1145,7 @@ class ProcessManager:
             on_terminal=self._on_terminal,
             idle_timeout_seconds=self._idle_timeout_seconds,
             timeout_ms=timeout_ms,
+            execution_profile=execution_profile,
         )
         self._sessions[session_id] = session
         self._emit(
@@ -1098,16 +1155,25 @@ class ProcessManager:
                 "command": command,
                 "cwd": relative_cwd,
                 "tty": tty,
+                "execution_profile": getattr(
+                    execution_profile,
+                    "value",
+                    execution_profile,
+                ) or "workspace_write",
             },
         )
         try:
             result = await session.read(yield_time_ms)
         except asyncio.CancelledError:
-            self._sessions.pop(session_id, None)
+            self._drop_session(session_id)
             await session.close()
             raise
         if result.metadata.get("status") == "exited":
-            self._sessions.pop(session_id, None)
+            # The watcher may have moved this record to _exited_sessions. The
+            # initial call already collected its final bytes, so it is safe to
+            # retire it immediately; a process that exits after returning a
+            # running result remains available for one final poll.
+            self._drop_session(session_id)
             await session.close()
         return result
 
@@ -1121,24 +1187,31 @@ class ProcessManager:
             raise ToolOperationError("PROCESS_MANAGER_CLOSED", "process manager is closed")
         session = self._sessions.get(session_id)
         if session is None:
+            session = self._exited_sessions.get(session_id)
+        if session is None:
+            if session_id in self._dead_sessions:
+                raise ToolOperationError("SESSION_DEAD", "process session has exited")
             raise ToolOperationError("SESSION_NOT_FOUND", "unknown process session")
         try:
-            if chars:
-                await session.write(chars)
-            result = await session.read(yield_time_ms)
+            if chars and not session.running:
+                raise ToolOperationError("SESSION_DEAD", "process session has exited")
+            result = await session.interact(chars, yield_time_ms)
         except asyncio.CancelledError:
-            self._sessions.pop(session_id, None)
+            self._drop_session(session_id)
             await session.close()
             raise
         if result.metadata.get("status") == "exited":
-            self._sessions.pop(session_id, None)
+            self._drop_session(session_id)
             await session.close()
         return result
 
     def cancel_active(self) -> None:
         """Terminate all still-running sessions without waiting on the caller."""
 
-        sessions = list(self._sessions.values())
+        sessions = [*self._sessions.values(), *self._exited_sessions.values()]
+        self._sessions.clear()
+        self._exited_sessions.clear()
+        self._dead_sessions.update(session.session_id for session in sessions)
         for session in sessions:
             session.close_sync()
         for session in sessions:
@@ -1150,8 +1223,9 @@ class ProcessManager:
         if self._closed:
             return
         self._closed = True
-        sessions = list(self._sessions.values())
+        sessions = [*self._sessions.values(), *self._exited_sessions.values()]
         self._sessions.clear()
+        self._exited_sessions.clear()
         for session in sessions:
             session.close_sync()
         for session in sessions:
@@ -1161,12 +1235,18 @@ class ProcessManager:
     async def aclose(self) -> None:
         """Awaitable close for Host lifecycles that can drain child tasks."""
 
-        if self._closed and not self._sessions and not self._cleanup_tasks:
+        if (
+            self._closed
+            and not self._sessions
+            and not self._exited_sessions
+            and not self._cleanup_tasks
+        ):
             self._release_sandbox()
             return
         self._closed = True
-        sessions = list(self._sessions.values())
+        sessions = [*self._sessions.values(), *self._exited_sessions.values()]
         self._sessions.clear()
+        self._exited_sessions.clear()
         await asyncio.gather(*(session.close() for session in sessions), return_exceptions=True)
         cleanup_tasks = tuple(self._cleanup_tasks)
         if cleanup_tasks:
@@ -1178,6 +1258,12 @@ class ProcessManager:
             return
         self._sandbox_released = True
         self._sandbox.close()
+
+    def _drop_session(self, session_id: str) -> None:
+        removed = self._sessions.pop(session_id, None)
+        removed = self._exited_sessions.pop(session_id, removed)
+        if removed is not None:
+            self._dead_sessions.add(session_id)
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         if self._event_sink is not None:

@@ -39,20 +39,6 @@ def content_fingerprint(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def existing_path_components(path: Path) -> Iterator[tuple[Path, os.stat_result]]:
-    """Inspect each existing absolute path component without following links."""
-
-    absolute = Path(path).absolute()
-    current = Path(absolute.anchor)
-    for part in absolute.parts[1:]:
-        current = current / part
-        try:
-            metadata = os.stat(current, follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        yield current, metadata
-
-
 class ToolOperationError(Exception):
     """An expected local-tool failure with a stable, model-visible code."""
 
@@ -74,18 +60,13 @@ class WorkspaceFilesystem:
     """Resolve and validate paths below one configured workspace root."""
 
     def __init__(self, workspace_root: Path) -> None:
-        candidate = Path(workspace_root).absolute()
+        candidate = Path(workspace_root).expanduser()
         try:
-            for component, metadata in existing_path_components(candidate):
-                if stat.S_ISLNK(metadata.st_mode):
-                    raise ValueError(
-                        "workspace_root path components must not be symbolic links: "
-                        f"{component.as_posix()}"
-                    )
-            metadata = os.stat(candidate, follow_symlinks=False)
-        except OSError as error:
+            canonical = candidate.resolve(strict=True)
+            metadata = os.stat(canonical, follow_symlinks=True)
+        except (OSError, RuntimeError) as error:
             raise ValueError("workspace_root must be an existing directory") from error
-        self.root = candidate.resolve(strict=True)
+        self.root = canonical
         if not stat.S_ISDIR(metadata.st_mode):
             raise ValueError("workspace_root must be an existing directory")
 
@@ -99,24 +80,25 @@ class WorkspaceFilesystem:
         if ".." in candidate.parts:
             raise ToolOperationError("WORKSPACE_ESCAPE", "path escapes the workspace")
 
-        relative = Path(*[part for part in candidate.parts if part not in {"", "."}])
+        parts = [part for part in candidate.parts if part not in {"", "."}]
+        relative = Path(*parts) if parts else Path(".")
         target = self.root / relative
         try:
-            components = existing_path_components(target)
-            for component, metadata in components:
-                if stat.S_ISLNK(metadata.st_mode):
-                    raise ToolOperationError(
-                        "WORKSPACE_LINK", "workspace symbolic links are forbidden"
-                    )
-                if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
-                    raise ToolOperationError(
-                        "WORKSPACE_LINK", "workspace hard links are forbidden"
-                    )
-        except ToolOperationError:
-            raise
-        except OSError as error:
+            # ``strict=False`` resolves all existing symlink components and
+            # the nearest existing parent for a new target. The effective
+            # target, rather than its lexical spelling, is the security seam.
+            effective = target.resolve(strict=False)
+            effective.relative_to(self.root)
+        except ValueError as error:
+            if "embedded null" in str(error).lower():
+                raise ToolOperationError("INVALID_ARGUMENTS", "path is invalid") from error
+            raise ToolOperationError(
+                "WORKSPACE_ESCAPE", "path resolves outside the workspace"
+            ) from error
+        except (OSError, RuntimeError) as error:
             raise ToolOperationError("IO_ERROR", "could not inspect path") from error
-        return target, relative.as_posix()
+        effective_relative = effective.relative_to(self.root).as_posix()
+        return effective, effective_relative or "."
 
     def _resolve_text_file(
         self, raw_path: object, *, max_bytes: int | None = None
@@ -256,11 +238,32 @@ class WorkspaceFilesystem:
             raise ToolOperationError("NOT_A_FILE", f"not a regular file: {relative}")
 
         existing_mode: int | None = None
+        preserve_links = False
         if target.exists():
             self.read_text_file(raw_path)
-            existing_mode = stat.S_IMODE(target.stat().st_mode)
+            target_metadata = target.stat()
+            existing_mode = stat.S_IMODE(target_metadata.st_mode)
+            # Replacing a hard-linked inode would silently detach the other
+            # names from the write.  Hard links are valid workspace aliases,
+            # so update the existing inode in place when more than one name
+            # refers to it.  The old bytes are retained for the unlikely
+            # partial-write path so callers still get an all-or-nothing
+            # operation.
+            preserve_links = target_metadata.st_nlink > 1
 
         try:
+            if preserve_links:
+                previous = target.read_bytes()
+                try:
+                    with target.open("wb") as destination:
+                        destination.write(content.encode("utf-8"))
+                except OSError:
+                    try:
+                        target.write_bytes(previous)
+                    except OSError:
+                        pass
+                    raise
+                return relative, content_bytes
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", dir=target.parent, delete=False
             ) as temporary:
@@ -287,8 +290,6 @@ class WorkspaceFilesystem:
             raise ToolOperationError("IO_ERROR", f"could not inspect file: {relative}") from error
         if not stat.S_ISREG(metadata.st_mode):
             return FileSnapshot(exists=True, content=None, mode=stat.S_IMODE(metadata.st_mode))
-        if metadata.st_nlink > 1:
-            raise ToolOperationError("WORKSPACE_LINK", "workspace hard links are forbidden")
         if metadata.st_size > MAX_TEXT_FILE_BYTES:
             raise ToolOperationError(
                 "FILE_TOO_LARGE",
@@ -352,6 +353,15 @@ class WorkspaceFilesystem:
             raise ToolOperationError("IO_ERROR", f"snapshot is not a regular file: {relative}")
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
+            preserve_links = False
+            if target.exists():
+                preserve_links = target.stat().st_nlink > 1
+            if preserve_links:
+                with target.open("wb") as destination:
+                    destination.write(snapshot.content)
+                if snapshot.mode is not None:
+                    os.chmod(target, snapshot.mode)
+                return relative
             with tempfile.NamedTemporaryFile(mode="wb", dir=target.parent, delete=False) as temporary:
                 temporary.write(snapshot.content)
                 temporary_path = Path(temporary.name)
@@ -373,7 +383,28 @@ class WorkspaceFilesystem:
         if not selected.is_dir():
             raise ToolOperationError("NOT_A_FILE", f"not a directory: {relative}")
 
-        def walk(directory: Path) -> Iterator[tuple[Path, str]]:
+        # Preserve the caller's workspace-relative spelling in search results
+        # while using the resolved target for every access check. This keeps an
+        # internal directory alias useful to a model (``alias/file.py``) and
+        # still denies an alias whose effective target leaves the workspace.
+        if isinstance(raw_path, str):
+            lexical_parts = [part for part in Path(raw_path).parts if part not in {"", "."}]
+            logical_selected = Path(*lexical_parts).as_posix() if lexical_parts else "."
+        else:
+            logical_selected = relative
+        visited_directories: set[tuple[int, int]] = set()
+
+        def walk(directory: Path, logical_directory: str) -> Iterator[tuple[Path, str]]:
+            try:
+                directory_metadata = os.stat(directory, follow_symlinks=True)
+                directory_key = (directory_metadata.st_dev, directory_metadata.st_ino)
+            except OSError as error:
+                raise ToolOperationError(
+                    "IO_ERROR", f"could not inspect directory: {directory}"
+                ) from error
+            if directory_key in visited_directories:
+                return
+            visited_directories.add(directory_key)
             try:
                 entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
             except OSError as error:
@@ -382,30 +413,37 @@ class WorkspaceFilesystem:
                 ) from error
             for entry in entries:
                 try:
-                    metadata = entry.stat(follow_symlinks=False)
                     candidate = Path(entry.path)
-                    if stat.S_ISLNK(metadata.st_mode):
-                        raise ToolOperationError(
-                            "WORKSPACE_LINK",
-                            f"workspace symbolic link is forbidden: {candidate.name}",
-                        )
-                    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
-                        raise ToolOperationError(
-                            "WORKSPACE_LINK",
-                            f"workspace hard link is forbidden: {candidate.name}",
-                        )
+                    # Resolve every entry before inspecting its effective
+                    # type. External aliases are ignored, not allowed to
+                    # invalidate the whole search.
+                    effective = candidate.resolve(strict=True)
+                    try:
+                        effective.relative_to(self.root)
+                    except ValueError:
+                        continue
+                    metadata = os.stat(effective, follow_symlinks=True)
                     if stat.S_ISDIR(metadata.st_mode):
                         if entry.name not in DEFAULT_IGNORED_DIRECTORIES:
-                            yield from walk(candidate)
+                            child_logical = (
+                                f"{logical_directory}/{entry.name}"
+                                if logical_directory != "."
+                                else entry.name
+                            )
+                            yield from walk(effective, child_logical)
                         continue
-                except ToolOperationError:
-                    raise
+                except (FileNotFoundError, RuntimeError):
+                    continue
                 except OSError as error:
                     raise ToolOperationError(
                         "IO_ERROR", f"could not inspect workspace entry: {entry.name}"
                     ) from error
                 if stat.S_ISREG(metadata.st_mode):
-                    workspace_relative = candidate.relative_to(self.root).as_posix()
-                    yield candidate, workspace_relative
+                    workspace_relative = (
+                        f"{logical_directory}/{entry.name}"
+                        if logical_directory != "."
+                        else entry.name
+                    )
+                    yield effective, workspace_relative
 
-        yield from walk(selected)
+        yield from walk(selected, logical_selected)

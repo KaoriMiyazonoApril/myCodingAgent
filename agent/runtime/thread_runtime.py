@@ -264,6 +264,10 @@ class ThreadRuntime:
                 record.tools.definitions(),
             )
             workspace_lease = self._workspace_leases.acquire(record.workspace)
+            # Re-check only the selected root without walking its contents.
+            # Access-time containment remains the filesystem module's job;
+            # moving this lightweight stat/scandir check off the event loop
+            # keeps cancellation and Host responsiveness intact.
             await asyncio.to_thread(
                 self._workspace_validator.validate,
                 record.workspace,

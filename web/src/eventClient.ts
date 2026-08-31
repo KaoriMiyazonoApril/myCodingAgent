@@ -33,6 +33,11 @@ const EVENT_TYPES = [
   "tool_requested",
   "tool_started",
   "tool_finished",
+  "approval_requested",
+  "approval_resolved",
+  "command_started",
+  "command_output_delta",
+  "command_completed",
   "file_changed",
   "settings_updated",
   "turn_cancel_requested",
@@ -49,6 +54,7 @@ export class ThreadEventClient {
   private source: EventSourceLike | null = null;
   private timer: number | null = null;
   private stopped = false;
+  private generation = 0;
   private attempts = 0;
   private cursor: string | null;
   private readonly factory: (url: string) => EventSourceLike;
@@ -76,6 +82,7 @@ export class ThreadEventClient {
 
   stop() {
     this.stopped = true;
+    this.generation += 1;
     this.source?.close();
     this.source = null;
     if (this.timer !== null) {
@@ -91,36 +98,88 @@ export class ThreadEventClient {
     const query =
       this.cursor === null ? "" : `?after_event_id=${encodeURIComponent(this.cursor)}`;
     const source = this.factory(`/api/threads/${this.threadId}/events${query}`);
+    const generation = ++this.generation;
     this.source = source;
     source.onopen = () => {
+      if (this.stopped || this.source !== source || generation !== this.generation) {
+        return;
+      }
       this.attempts = 0;
       this.callbacks.onConnection("connected");
     };
     EVENT_TYPES.forEach((type) => {
-      source.addEventListener(type, (message) => this.receive(type, message));
+      source.addEventListener(type, (message) =>
+        this.receive(type, message, source, generation),
+      );
     });
     source.onerror = () => {
-      if (this.stopped) {
+      if (
+        this.stopped ||
+        this.source !== source ||
+        generation !== this.generation
+      ) {
         return;
       }
       source.close();
+      // Invalidate this EventSource immediately. The browser may still flush
+      // callbacks queued by a closed source while Snapshot recovery and the
+      // reconnect timer are in flight; those callbacks must not mutate the
+      // newer Thread generation.
+      this.source = null;
+      const recoveryGeneration = ++this.generation;
       this.callbacks.onConnection("disconnected");
-      void this.callbacks
-        .recover()
-        .then((thread) => {
-          if (!this.stopped) {
-            this.cursor = thread.event_cursor;
-            this.callbacks.onSnapshot(thread);
-          }
-        })
-        .catch(() => this.callbacks.onError("Unable to recover Thread snapshot"));
-      const delay = Math.min(500 * 2 ** this.attempts, 8_000);
-      this.attempts += 1;
-      this.timer = this.setTimer(() => this.open(), delay);
+      void this.recoverThenReconnect(recoveryGeneration);
     };
   }
 
-  private receive(type: string, message: MessageEvent<string>) {
+  private async recoverThenReconnect(recoveryGeneration: number) {
+    try {
+      const thread = await this.callbacks.recover();
+      if (!this.recoveryIsCurrent(recoveryGeneration)) {
+        return;
+      }
+      this.cursor = thread.event_cursor;
+      this.callbacks.onSnapshot(thread);
+    } catch {
+      if (!this.recoveryIsCurrent(recoveryGeneration)) {
+        return;
+      }
+      this.callbacks.onError("Unable to recover Thread snapshot");
+    }
+    if (!this.recoveryIsCurrent(recoveryGeneration)) {
+      return;
+    }
+    const delay = Math.min(500 * 2 ** this.attempts, 8_000);
+    this.attempts += 1;
+    this.timer = this.setTimer(() => {
+      this.timer = null;
+      if (this.recoveryIsCurrent(recoveryGeneration)) {
+        this.open();
+      }
+    }, delay);
+  }
+
+  private recoveryIsCurrent(recoveryGeneration: number) {
+    return (
+      !this.stopped &&
+      this.source === null &&
+      recoveryGeneration === this.generation
+    );
+  }
+
+  private receive(
+    type: string,
+    message: MessageEvent<string>,
+    source: EventSourceLike,
+    generation: number,
+  ) {
+    if (
+      this.stopped ||
+      this.source !== source ||
+      generation !== this.generation
+    ) {
+      return;
+    }
     try {
       const payload = JSON.parse(message.data) as Record<string, unknown>;
       if (type === "snapshot") {

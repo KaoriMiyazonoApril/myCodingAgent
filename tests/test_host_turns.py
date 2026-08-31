@@ -84,7 +84,10 @@ def _app(tmp_path: Path, provider: LLMProvider):
 
 
 def _create_thread(client: TestClient, workspace: Path) -> str:
-    response = client.post("/api/threads", json={"workspace": str(workspace)})
+    selected = client.post("/api/workspaces/select", json={"path": str(workspace)})
+    assert selected.status_code == 201
+    workspace_id = selected.json()["workspace"]["workspace_id"]
+    response = client.post("/api/threads", json={"workspace_id": workspace_id})
     assert response.status_code == 201
     return response.json()["thread"]["snapshot"]["thread_id"]
 

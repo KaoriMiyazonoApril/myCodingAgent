@@ -7,7 +7,6 @@ from contextlib import asynccontextmanager
 import inspect
 import logging
 from pathlib import Path
-from collections.abc import Mapping
 from typing import Any, Protocol
 
 from fastapi import FastAPI, Request
@@ -37,19 +36,6 @@ from .model_catalog import (
     ProviderResponseError,
 )
 from .event_stream import EventStreamAdapter, select_event_cursor
-from .native_picker import (
-    NativePickerAdapter,
-    NativePickerBusyError,
-    NativePickerCapability,
-    NativePickerError,
-    NativePickerInvalidResultError,
-    NativePickerProcessError,
-    NativePickerSelection,
-    NativePickerUnsupportedError,
-    NativeWindowsFolderPicker,
-    WindowsInteropUnavailableError,
-    WslPathTranslationError,
-)
 from .provider_config import (
     ProviderConfigurationError,
     ProviderNotConfiguredError,
@@ -73,6 +59,7 @@ from .turn_tasks import (
 from .workspace import (
     WorkspaceBrowser,
     WorkspaceBrowseError,
+    WorkspaceInvalidPathError,
     WorkspaceNotAccessibleError,
     WorkspaceNotFoundError,
 )
@@ -103,10 +90,16 @@ class ProviderDefaultUpdate(BaseModel):
 class ThreadCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    workspace: str
+    workspace_id: str
     provider_config_id: str | None = None
     model: str | None = None
     approval_mode: ApprovalMode = ApprovalMode.ON_REQUEST
+
+
+class WorkspaceSelect(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
 
 
 class ThinkingUpdate(BaseModel):
@@ -173,7 +166,6 @@ def create_app(
     provider_store: ProviderStore,
     model_catalog: ModelCatalog,
     workspace_browser: WorkspaceBrowser | None = None,
-    native_picker: NativePickerAdapter | None = None,
     runtime_factory: RuntimeFactory | None = None,
     event_stream_adapter: EventStreamAdapter | None = None,
     dev_mode: bool = False,
@@ -183,7 +175,6 @@ def create_app(
     """Compose the local Host at its highest HTTP test seam."""
 
     browser = workspace_browser or WorkspaceBrowser()
-    picker = native_picker if native_picker is not None else NativeWindowsFolderPicker()
     runtime_builder = runtime_factory or production_runtime_factory(provider_store)
     threads = ThreadHost(
         provider_store=provider_store,
@@ -192,16 +183,11 @@ def create_app(
     )
     turn_tasks = TurnTaskManager(threads)
     event_stream = event_stream_adapter or EventStreamAdapter(threads, turn_tasks)
-    native_selection_active = False
-
     async def shutdown_resources() -> None:
         try:
             await turn_tasks.shutdown()
         finally:
-            try:
-                await _maybe_await(picker.close())
-            finally:
-                await threads.shutdown()
+            await threads.shutdown()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -229,7 +215,6 @@ def create_app(
     app.state.provider_store = provider_store
     app.state.model_catalog = model_catalog
     app.state.workspace_browser = browser
-    app.state.native_picker = picker
     app.state.thread_host = threads
     app.state.turn_tasks = turn_tasks
     app.state.event_stream = event_stream
@@ -313,61 +298,19 @@ def create_app(
     ) -> JSONResponse:
         return _error_response(403, error.code, "Workspace path is not accessible")
 
+    @app.exception_handler(WorkspaceInvalidPathError)
+    async def workspace_invalid_path(
+        request: Request,
+        error: WorkspaceInvalidPathError,
+    ) -> JSONResponse:
+        return _error_response(400, error.code, "Workspace path is invalid")
+
     @app.exception_handler(WorkspaceBrowseError)
     async def invalid_workspace(
         request: Request,
         error: WorkspaceBrowseError,
     ) -> JSONResponse:
         return _error_response(400, error.code, "Workspace path is not allowed")
-
-    @app.exception_handler(NativePickerUnsupportedError)
-    async def native_picker_unsupported(
-        request: Request,
-        error: NativePickerUnsupportedError,
-    ) -> JSONResponse:
-        return _error_response(409, error.code, "Native Windows folder picker is unsupported")
-
-    @app.exception_handler(WindowsInteropUnavailableError)
-    async def native_picker_interop_unavailable(
-        request: Request,
-        error: WindowsInteropUnavailableError,
-    ) -> JSONResponse:
-        return _error_response(409, error.code, "Windows folder picker interop is unavailable")
-
-    @app.exception_handler(NativePickerBusyError)
-    async def native_picker_busy(
-        request: Request,
-        error: NativePickerBusyError,
-    ) -> JSONResponse:
-        return _error_response(409, error.code, "Native folder picker is already open")
-
-    @app.exception_handler(NativePickerInvalidResultError)
-    async def native_picker_invalid_result(
-        request: Request,
-        error: NativePickerInvalidResultError,
-    ) -> JSONResponse:
-        return _error_response(502, error.code, "Native folder picker returned an invalid result")
-
-    @app.exception_handler(NativePickerProcessError)
-    async def native_picker_process_failed(
-        request: Request,
-        error: NativePickerProcessError,
-    ) -> JSONResponse:
-        return _error_response(502, error.code, "Native folder picker failed")
-
-    @app.exception_handler(WslPathTranslationError)
-    async def native_picker_translation_failed(
-        request: Request,
-        error: WslPathTranslationError,
-    ) -> JSONResponse:
-        return _error_response(502, error.code, "Windows path translation failed")
-
-    @app.exception_handler(NativePickerError)
-    async def native_picker_failed(
-        request: Request,
-        error: NativePickerError,
-    ) -> JSONResponse:
-        return _error_response(502, error.code, "Native folder picker failed")
 
     @app.exception_handler(ConfigurationRequiredError)
     async def configuration_required(
@@ -488,35 +431,13 @@ def create_app(
             "truncated": listing.truncated,
         }
 
-    @app.get("/api/native-picker/capability")
-    async def native_picker_capability() -> dict[str, object]:
-        capability = await _maybe_await(picker.capability())
-        return _native_capability_payload(capability)
-
-    @app.post("/api/native-picker/select")
-    async def select_native_workspace() -> dict[str, object]:
-        nonlocal native_selection_active
-        if native_selection_active:
-            raise NativePickerBusyError("A native picker request is already active")
-        native_selection_active = True
-        try:
-            selection = await _maybe_await(picker.select())
-            status, windows_path = _native_selection_values(selection)
-            if status == "cancelled":
-                return {"schema_version": SCHEMA_VERSION, "status": "cancelled"}
-            if status != "selected" or not windows_path:
-                raise NativePickerInvalidResultError("Native picker selection is invalid")
-            translated = await _maybe_await(picker.translate(windows_path))
-            if not isinstance(translated, str) or not translated:
-                raise WslPathTranslationError("Native picker translation is invalid")
-            validated_workspace = browser.validate(translated)
-            return {
-                "schema_version": SCHEMA_VERSION,
-                "status": "selected",
-                "workspace": validated_workspace,
-            }
-        finally:
-            native_selection_active = False
+    @app.post("/api/workspaces/select", status_code=201)
+    async def select_workspace(request: WorkspaceSelect) -> dict[str, object]:
+        workspace = browser.select(request.path)
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "workspace": workspace.to_dict(),
+        }
 
     @app.get("/api/threads")
     async def list_threads() -> dict[str, object]:
@@ -528,7 +449,7 @@ def create_app(
     @app.post("/api/threads", status_code=201)
     async def create_thread(request: ThreadCreate) -> dict[str, object]:
         thread = threads.create_thread(
-            request.workspace,
+            request.workspace_id,
             provider_config_id=request.provider_config_id,
             model=request.model,
             approval_mode=request.approval_mode,
@@ -764,61 +685,20 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-def _native_selection_values(value: Any) -> tuple[str | None, str | None]:
-    if isinstance(value, NativePickerSelection):
-        return value.status, value.windows_path
-    if isinstance(value, Mapping):
-        status = value.get("status")
-        windows_path = value.get("windows_path", value.get("path"))
-        if isinstance(status, str) and (
-            windows_path is None or isinstance(windows_path, str)
-        ):
-            return status, windows_path
-    raise NativePickerInvalidResultError("Native picker selection is invalid")
-
-
-def _native_capability_payload(value: Any) -> dict[str, object]:
-    if isinstance(value, NativePickerCapability):
-        payload = value.to_dict()
-    elif isinstance(value, Mapping):
-        payload = dict(value)
-    else:
-        raise NativePickerInvalidResultError("Native picker capability is invalid")
-
-    schema_version = payload.get("schema_version")
-    available = payload.get("available")
-    reason_code = payload.get("reason_code")
-    if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
-        raise NativePickerInvalidResultError("Native picker capability schema is invalid")
-    if type(available) is not bool:
-        raise NativePickerInvalidResultError("Native picker capability flag is invalid")
-    if available:
-        if reason_code is not None:
-            raise NativePickerInvalidResultError("Available picker has an error reason")
-    elif reason_code not in {
-        "NATIVE_PICKER_UNSUPPORTED",
-        "WINDOWS_INTEROP_UNAVAILABLE",
-    }:
-        raise NativePickerInvalidResultError("Native picker capability reason is invalid")
-    return {
-        "schema_version": schema_version,
-        "available": available,
-        "reason_code": reason_code,
-    }
-
-
 def _error_response(
     status_code: int,
     code: str,
     message: str,
+    details: dict[str, object] | None = None,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={
             "error": {
+                "status": status_code,
                 "code": code,
                 "message": message,
-                "details": {},
+                "details": details or {},
             }
         },
     )

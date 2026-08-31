@@ -159,7 +159,7 @@ def test_apply_patch_rejects_unsafe_path(tmp_path, path) -> None:
     assert captured.value.code == "PATCH_INVALID"
 
 
-def test_apply_patch_rejects_final_parent_symlinks_and_hardlinks(tmp_path) -> None:
+def test_apply_patch_allows_internal_symlinks_and_hardlinks(tmp_path) -> None:
     real_directory = tmp_path / "real"
     real_directory.mkdir()
     (tmp_path / "linked").symlink_to(real_directory, target_is_directory=True)
@@ -167,25 +167,28 @@ def test_apply_patch_rejects_final_parent_symlinks_and_hardlinks(tmp_path) -> No
     (tmp_path / "linked-file").symlink_to(tmp_path / "real.txt")
     (tmp_path / "hard-file").hardlink_to(tmp_path / "real.txt")
 
-    for path, operation in (
-        (
-            "linked/new.txt",
-            "*** Add File: linked/new.txt\n+x\n",
-        ),
-        (
-            "linked-file",
-            "*** Update File: linked-file\n@@\n-old\n+new\n",
-        ),
-        (
-            "hard-file",
-            "*** Update File: hard-file\n@@\n-old\n+new\n",
-        ),
-    ):
-        with pytest.raises(ToolOperationError) as captured:
-            apply_patch(fs(tmp_path), f"*** Begin Patch\n{operation}*** End Patch\n")
-        assert captured.value.code == "WORKSPACE_LINK"
-        assert not (tmp_path / "linked" / "new.txt").exists()
-        assert path
+    result = apply_patch(
+        fs(tmp_path),
+        "*** Begin Patch\n*** Add File: linked/new.txt\n+x\n*** End Patch\n",
+    )
+    assert result.affected_paths == ["linked/new.txt"]
+    assert (real_directory / "new.txt").read_text(encoding="utf-8") == "x\n"
+
+    (tmp_path / "real.txt").write_text("old\n", encoding="utf-8")
+    result = apply_patch(
+        fs(tmp_path),
+        "*** Begin Patch\n*** Update File: linked-file\n@@\n-old\n+new\n*** End Patch\n",
+    )
+    assert result.affected_paths == ["linked-file"]
+    assert (tmp_path / "real.txt").read_text(encoding="utf-8") == "new\n"
+
+    (tmp_path / "real.txt").write_text("old\n", encoding="utf-8")
+    result = apply_patch(
+        fs(tmp_path),
+        "*** Begin Patch\n*** Update File: hard-file\n@@\n-old\n+new\n*** End Patch\n",
+    )
+    assert result.affected_paths == ["hard-file"]
+    assert (tmp_path / "real.txt").read_text(encoding="utf-8") == "new\n"
 
 
 def test_registry_exposes_apply_patch_as_a_filesystem_tool(tmp_path) -> None:

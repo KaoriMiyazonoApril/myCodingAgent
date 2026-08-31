@@ -1,4 +1,9 @@
-"""Fail-closed validation for one persistent workspace tree."""
+"""Selection-time validation for one canonical workspace root.
+
+The validator intentionally does not walk the workspace.  File tools perform
+effective-target containment checks for each access, while this module only
+ensures that a selected root remains a readable directory.
+"""
 
 from __future__ import annotations
 
@@ -8,13 +13,15 @@ from pathlib import Path
 import stat
 import time
 
-from agent.tools.filesystem import existing_path_components
-
 from .errors import UnsafeWorkspaceError, WorkspaceValidationLimitError
 
 
 def mounted_paths() -> frozenset[Path]:
-    """Read Linux mount points without treating escaped spaces as separators."""
+    """Read Linux mount points for compatibility with older callers.
+
+    Mount inspection is no longer part of Turn preflight; this helper remains
+    available for integrations that explicitly need to inspect the host.
+    """
 
     paths: set[Path] = set()
     try:
@@ -38,7 +45,7 @@ def mounted_paths() -> frozenset[Path]:
 
 
 class WorkspaceValidator:
-    """Reject links, nested mounts and incomplete validation scans."""
+    """Validate only the selected root; authorize descendants at access time."""
 
     def __init__(
         self,
@@ -47,6 +54,8 @@ class WorkspaceValidator:
         max_seconds: float = 10,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        # Keep constructor compatibility for callers that still provide the
+        # old scan budgets. They are deliberately unused by validation.
         if (
             isinstance(max_entries, bool)
             or not isinstance(max_entries, int)
@@ -69,78 +78,32 @@ class WorkspaceValidator:
 
     @staticmethod
     def normalize_root(workspace: Path) -> Path:
-        candidate = Path(workspace).absolute()
+        candidate = Path(workspace).expanduser()
         try:
-            for component, metadata in existing_path_components(candidate):
-                if stat.S_ISLNK(metadata.st_mode):
-                    raise UnsafeWorkspaceError(
-                        "workspace path component must not be a symbolic link: "
-                        f"{component.as_posix()}"
-                    )
-            metadata = os.stat(candidate, follow_symlinks=False)
-        except OSError as error:
+            canonical = candidate.resolve(strict=True)
+            metadata = os.stat(canonical, follow_symlinks=True)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError("workspace must be an existing directory")
+            # Validate readability once at selection/thread creation time. No
+            # descendant is inspected and no recursive scan is performed.
+            with os.scandir(canonical):
+                pass
+            return canonical
+        except ValueError:
+            raise
+        except (FileNotFoundError, NotADirectoryError, OSError, RuntimeError) as error:
             raise ValueError("workspace must be an existing directory") from error
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError("workspace must be an existing directory")
-        return candidate.resolve(strict=True)
 
     def validate(self, workspace: Path) -> None:
-        started = self._clock()
-        root_metadata = self._lstat(workspace)
-        if not stat.S_ISDIR(root_metadata.st_mode):
-            raise UnsafeWorkspaceError("workspace root is not a regular directory")
-        nested_mounts = {
-            path
-            for path in mounted_paths()
-            if path != workspace and workspace in path.parents
-        }
-        entries_seen = 0
-        pending = [workspace]
-        while pending:
-            self._check_time(started)
-            directory = pending.pop()
-            try:
-                entries = os.scandir(directory)
-            except OSError as error:
-                raise UnsafeWorkspaceError(
-                    f"could not completely scan workspace: {directory.as_posix()}"
-                ) from error
-            with entries:
-                for entry in entries:
-                    entries_seen += 1
-                    if entries_seen > self._max_entries:
-                        raise WorkspaceValidationLimitError(
-                            "workspace entry validation budget exceeded"
-                        )
-                    self._check_time(started)
-                    path = Path(entry.path)
-                    metadata = self._lstat(path)
-                    if stat.S_ISLNK(metadata.st_mode):
-                        raise UnsafeWorkspaceError(
-                            f"workspace symbolic link is forbidden: {path.as_posix()}"
-                        )
-                    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
-                        raise UnsafeWorkspaceError(
-                            f"workspace hard link is forbidden: {path.as_posix()}"
-                        )
-                    if path in nested_mounts or os.path.ismount(path):
-                        raise UnsafeWorkspaceError(
-                            f"nested workspace mount is forbidden: {path.as_posix()}"
-                        )
-                    if stat.S_ISDIR(metadata.st_mode):
-                        pending.append(path)
+        """Check that the root still exists and is a directory.
 
-    def _check_time(self, started: float) -> None:
-        if self._clock() - started > self._max_seconds:
-            raise WorkspaceValidationLimitError(
-                "workspace time validation budget exceeded"
-            )
+        This method is retained as a lightweight compatibility seam. It does
+        not inspect children, symlinks, hard links, mounts, or repository size.
+        """
 
-    @staticmethod
-    def _lstat(path: Path) -> os.stat_result:
         try:
-            return os.stat(path, follow_symlinks=False)
+            metadata = os.stat(workspace, follow_symlinks=True)
         except OSError as error:
-            raise UnsafeWorkspaceError(
-                f"could not inspect workspace entry: {path.as_posix()}"
-            ) from error
+            raise UnsafeWorkspaceError("workspace root is not accessible") from error
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise UnsafeWorkspaceError("workspace root is not a regular directory")

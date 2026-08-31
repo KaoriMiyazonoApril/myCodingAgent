@@ -59,6 +59,12 @@ def _client(
     )
 
 
+def _workspace_id(client: TestClient, path: Path) -> str:
+    response = client.post("/api/workspaces/select", json={"path": str(path)})
+    assert response.status_code == 201
+    return response.json()["workspace"]["workspace_id"]
+
+
 def test_thread_creation_requires_configuration_without_blocking_setup_api(
     tmp_path,
 ) -> None:
@@ -66,7 +72,8 @@ def test_thread_creation_requires_configuration_without_blocking_setup_api(
     store = ProviderStore(tmp_path / "providers.json")
     client = _client(tmp_path, store, calls)
 
-    rejected = client.post("/api/threads", json={"workspace": str(tmp_path)})
+    workspace_id = _workspace_id(client, tmp_path)
+    rejected = client.post("/api/threads", json={"workspace_id": workspace_id})
 
     assert rejected.status_code == 409
     assert rejected.json()["error"]["code"] == "CONFIGURATION_REQUIRED"
@@ -86,9 +93,10 @@ def test_thread_create_list_and_get_use_runtime_snapshot_and_lazy_singleton(
     calls: list[ModelSettings] = []
     store = _configured_store(tmp_path / "providers.json")
     client = _client(tmp_path, store, calls)
+    first_workspace_id = _workspace_id(client, first_workspace)
 
     first = client.post(
-        "/api/threads", json={"workspace": str(first_workspace)}
+        "/api/threads", json={"workspace_id": first_workspace_id}
     )
     store.save_provider(
         "moonshot",
@@ -96,8 +104,9 @@ def test_thread_create_list_and_get_use_runtime_snapshot_and_lazy_singleton(
         selected_model="kimi-k2",
     )
     store.set_default("moonshot", model="kimi-k2")
+    second_workspace_id = _workspace_id(client, second_workspace)
     second = client.post(
-        "/api/threads", json={"workspace": str(second_workspace)}
+        "/api/threads", json={"workspace_id": second_workspace_id}
     )
 
     assert first.status_code == 201
@@ -134,7 +143,8 @@ def test_thread_settings_conflict_close_and_closed_mutation_are_stable(
         selected_model="glm-4.5",
     )
     client = _client(tmp_path, store, calls)
-    created = client.post("/api/threads", json={"workspace": str(workspace)})
+    workspace_id = _workspace_id(client, workspace)
+    created = client.post("/api/threads", json={"workspace_id": workspace_id})
     thread_id = created.json()["thread"]["snapshot"]["thread_id"]
 
     updated = client.patch(
@@ -187,12 +197,13 @@ def test_thread_api_maps_not_found_invalid_workspace_and_provider(tmp_path) -> N
 
     missing = client.get("/api/threads/not-real")
     escaped = client.post(
-        "/api/threads", json={"workspace": str(tmp_path.parent)}
+        "/api/workspaces/select", json={"path": str(tmp_path.parent)}
     )
+    workspace_id = _workspace_id(client, tmp_path)
     invalid_provider = client.post(
         "/api/threads",
         json={
-            "workspace": str(tmp_path),
+            "workspace_id": workspace_id,
             "provider_config_id": "glm",
             "model": "glm-4.5",
         },
@@ -201,7 +212,7 @@ def test_thread_api_maps_not_found_invalid_workspace_and_provider(tmp_path) -> N
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "THREAD_NOT_FOUND"
     assert escaped.status_code == 400
-    assert escaped.json()["error"]["code"] == "WORKSPACE_OUTSIDE_ROOT"
+    assert escaped.json()["error"]["code"] == "OUTSIDE_ALLOWED_ROOT"
     assert invalid_provider.status_code == 409
     assert invalid_provider.json()["error"]["code"] == "CONFIGURATION_REQUIRED"
 
@@ -213,7 +224,10 @@ def test_thread_creation_exposes_frozen_approval_mode(tmp_path) -> None:
 
     response = client.post(
         "/api/threads",
-        json={"workspace": str(tmp_path), "approval_mode": "never"},
+        json={
+            "workspace_id": _workspace_id(client, tmp_path),
+            "approval_mode": "never",
+        },
     )
 
     assert response.status_code == 201
@@ -226,7 +240,10 @@ def test_approval_resolution_uses_runtime_and_reports_stale_request(tmp_path) ->
     calls: list[ModelSettings] = []
     store = _configured_store(tmp_path / "providers.json")
     client = _client(tmp_path, store, calls)
-    created = client.post("/api/threads", json={"workspace": str(tmp_path)})
+    created = client.post(
+        "/api/threads",
+        json={"workspace_id": _workspace_id(client, tmp_path)},
+    )
     thread_id = created.json()["thread"]["snapshot"]["thread_id"]
 
     response = client.post(
@@ -253,7 +270,10 @@ def test_runtime_workspace_safety_error_is_not_parsed_from_message(tmp_path) -> 
         )
     )
 
-    response = client.post("/api/threads", json={"workspace": str(tmp_path)})
+    response = client.post(
+        "/api/threads",
+        json={"workspace_id": _workspace_id(client, tmp_path)},
+    )
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "UNSAFE_WORKSPACE"

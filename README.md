@@ -50,8 +50,10 @@ agent web \
   --workspace-root /mnt/c/code
 ```
 
-未指定 root 时使用启动命令所在目录。Workspace picker 只浏览这些 root 内的目录，不跟随
-symlink，也不替代 Runtime 原有 workspace/filesystem safety 校验。
+未指定 root 时从 Host 的 `/` 开始浏览；启动命令所在目录不再隐式成为授权边界。
+Workspace Dialog 通过 Host browser 列出、导航并显式选择目录，选择后 Host 创建带有
+`workspace_id`、规范化路径和显示名称的内存 Workspace 记录。目录中的内部 symlink
+按实际规范化目标处理，Agent 工具仍在每次访问时执行 workspace containment 校验。
 
 ## Provider Setup
 
@@ -70,18 +72,9 @@ agent web --workspace-root /home/user/projects
 ```
 
 Windows 浏览器通常可直接访问 `http://localhost:3080`。Host 在 WSL 中时，Agent 操作的是
-Linux/WSL 文件系统、shell 和进程环境；例如 Windows 盘需通过 `/mnt/c/...` 显式作为 Host
-workspace root。打开项目时，若 WSL 的 Windows interop、`powershell.exe` 和 `wslpath` 可用，
-Host 会优先打开原生 Windows 文件夹选择器；选择结果通过系统 `wslpath` 翻译为 WSL 路径，
-再由同一个 WorkspaceBrowser 校验 configured roots。Cancel、原生选择器不可用或失败时，
-对话框会保留 Host filesystem 浏览器作为 fallback。浏览器不会自行解释或转换 `C:\...` 路径。
-
-原生选择器的 capability 与 selection 只属于 Host transport（分别为
-`GET /api/native-picker/capability` 和 `POST /api/native-picker/select`）；Windows 路径不会
-进入 Runtime、Thread DTO、Snapshot、事件或日志。生产 Host 通过 argv 启动固定受信的
-PowerShell dialog script 和系统 `wslpath`，不使用 shell 拼接用户路径。
-
-Native Windows Host 不在当前 V1 的支持与完成声明中。
+Linux/WSL 文件系统、shell 和进程环境；例如 Windows 盘可通过 `/mnt/c` 直接在 Host browser
+中浏览和选择。浏览器不会自行解释或转换 `C:\...` 路径，也不会打开 Windows 原生文件夹
+窗口。
 
 ## Validation
 
@@ -105,8 +98,7 @@ Agent Host
     ├── stable JSON API
     ├── TurnTaskManager
     ├── EventStreamAdapter
-    ├── WorkspaceBrowser
-    ├── NativeWindowsFolderPicker (WSL optional)
+    ├── WorkspaceBrowser + Host Workspace records
     └── production static files
     │
     ▼
@@ -117,4 +109,5 @@ Agent loop ── Conversation ── local Tools / LLM client
 ```
 
 依赖方向始终为 `Web → Host → ThreadRuntime → Agent Core`。V1 不包含 approval UI、WebSocket、
-token streaming、认证、远程多用户服务、PTY、Electron/Tauri 或持久化 Thread 数据库。
+认证、远程多用户服务、Electron/Tauri 或持久化 Thread 数据库；既有 SSE/streaming 与 PTY
+能力保持在现有 Runtime/ProcessManager seam 内。

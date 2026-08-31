@@ -24,6 +24,14 @@ class PolicyDecision(str, Enum):
     REQUIRE_APPROVAL = "require_approval"
 
 
+class ExecutionProfile(str, Enum):
+    """Minimum sandbox capabilities granted to an approved command."""
+
+    READ_ONLY = "read_only"
+    WORKSPACE_WRITE = "workspace_write"
+    WORKSPACE_WRITE_NETWORK = "workspace_write_network"
+
+
 @dataclass(frozen=True, slots=True)
 class PolicyResult:
     """Immutable result of one policy decision."""
@@ -31,6 +39,7 @@ class PolicyResult:
     decision: PolicyDecision
     reason_code: str
     message: str
+    execution_profile: ExecutionProfile | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.decision, PolicyDecision):
@@ -39,6 +48,22 @@ class PolicyResult:
             raise ValueError("reason_code must be a non-empty string")
         if not isinstance(self.message, str) or not self.message:
             raise ValueError("message must be a non-empty string")
+        profile = self.execution_profile
+        if profile is None:
+            profile = _profile_for_reason(self.reason_code)
+            object.__setattr__(self, "execution_profile", profile)
+        elif not isinstance(profile, ExecutionProfile):
+            try:
+                object.__setattr__(self, "execution_profile", ExecutionProfile(profile))
+            except (TypeError, ValueError) as error:
+                raise ValueError("execution_profile must be an ExecutionProfile") from error
+
+    @property
+    def profile(self) -> ExecutionProfile:
+        """Short alias for integrations that call the field ``profile``."""
+
+        assert self.execution_profile is not None
+        return self.execution_profile
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +402,12 @@ class CommandAwarePolicy:
                 "sandboxed command allowed",
             )
         if classification in self._approval_required:
+            if classification is ExecClassification.PRIVILEGED:
+                return PolicyResult(
+                    PolicyDecision.DENY,
+                    "PRIVILEGED_COMMAND_UNSUPPORTED",
+                    "privileged capabilities are unavailable in the sandbox",
+                )
             if approval_mode is ApprovalMode.NEVER:
                 return PolicyResult(
                     PolicyDecision.DENY,
@@ -408,6 +439,16 @@ def _reason_code(classification: ExecClassification) -> str:
         ExecClassification.COMPLEX_SHELL: "COMPLEX_SHELL",
         ExecClassification.UNKNOWN: "UNKNOWN_COMMAND",
     }[classification]
+
+
+def _profile_for_reason(reason_code: str) -> ExecutionProfile:
+    """Map policy intent to the least-capable sandbox profile."""
+
+    if reason_code.startswith("SAFE_READ_ONLY") or reason_code == "NON_COMMAND_TOOL":
+        return ExecutionProfile.READ_ONLY
+    if reason_code in {"NETWORK_COMMAND", "PACKAGE_INSTALL"}:
+        return ExecutionProfile.WORKSPACE_WRITE_NETWORK
+    return ExecutionProfile.WORKSPACE_WRITE
 
 
 # Names used by the public Phase 1 seam and by older design notes.

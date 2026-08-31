@@ -137,8 +137,14 @@ def _glob(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> Tool
     if pattern_path.is_absolute() or ".." in pattern_path.parts:
         raise ToolOperationError("INVALID_ARGUMENTS", "pattern must be a relative glob")
     selected_path = arguments["path"]
-    selected, selected_relative = filesystem.resolve(selected_path)
-    selected_prefix = PurePosixPath(selected.relative_to(filesystem.root).as_posix())
+    _, selected_relative = filesystem.resolve(selected_path)
+    if isinstance(selected_path, str):
+        lexical_parts = [
+            part for part in PurePosixPath(selected_path).parts if part not in {"", "."}
+        ]
+        selected_prefix = PurePosixPath("/".join(lexical_parts))
+    else:
+        selected_prefix = PurePosixPath(selected_relative)
     matches: list[str] = []
     truncated = False
     for scanned_index, (_, relative) in enumerate(
@@ -147,7 +153,18 @@ def _glob(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> Tool
         if scanned_index >= MAX_SCANNED_FILES:
             truncated = True
             break
-        relative_to_selected = PurePosixPath(relative).relative_to(selected_prefix)
+        try:
+            relative_to_selected = (
+                PurePosixPath(relative)
+                if str(selected_prefix) in {"", "."}
+                else PurePosixPath(relative).relative_to(selected_prefix)
+            )
+        except ValueError:
+            # A canonical path can differ from the lexical alias used to
+            # select the subtree. It is already containment-checked by the
+            # filesystem seam, but cannot match a pattern relative to this
+            # lexical subtree.
+            continue
         if not _matches_relative_glob(relative_to_selected.as_posix(), pattern):
             continue
         if len(matches) >= MAX_RETURNED_MATCHES:
@@ -302,6 +319,8 @@ def create_local_tool_registry(
     )
     registry.bind_event_sink(process_manager.set_event_sink)
     registry.bind_session_canceller(process_manager.cancel_active)
+    registry.bind_execution_profile_setter(runner.set_execution_profile)
+    registry.bind_execution_profile_setter(process_manager.set_execution_profile)
     registry.register(
         ToolDefinition(
             name="read_file",

@@ -46,7 +46,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Ticket 01 的最小 tracer bullet 已完成：调用方可通过 `ThreadRuntime` 创建内存 Thread、
   提交一个 Turn，并让完整模型响应与现有工具注册表顺序循环，直至模型返回最终文本。
 - 当前公开结果已覆盖完整 Thread 生命周期、版本化安全设置、阶段事件、运行预算、跨
-  workspace 并发、Policy 与审批、文件 diff，以及严格 workspace 链接和挂载安全；
+  workspace 并发、Policy 与审批、文件 diff，以及选择时根校验和访问时 canonical containment；
   同时具备保守的上下文容量预检与 Turn 提交幂等。
 - `PromptBuilder` 已提供供应商无关的默认 coding-agent 约束，并把 Runtime 附加指令置于
   默认约束之后，避免调用方定制时覆盖 workspace 路径、文件工具、错误处理和验证要求。
@@ -67,7 +67,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Web Host 可在 `create_thread(..., settings=...)` 中冻结创建时选择的公开模型设置；省略
   参数时仍使用 Runtime 默认设置并保持 version 0，因此既有调用方语义不变。
 - Web Host 提交的 Turn 在同步状态写入前先建立 Turn emitter，并通过 worker thread 等待
-  workspace 完整验证。启动前的 context、lease、workspace、关闭或取消失败统一产生脱敏
+  轻量 workspace 根校验。启动前的 context、lease、workspace、关闭或取消失败统一产生脱敏
   `turn_rejected`，且不写入 Conversation；已取得的 workspace lease 在所有拒绝路径释放。
 - Ticket 04 已实现版本化公开状态与阶段事件：`ThreadSnapshot` 现在包含脱敏后的完整公开
   对话、时间戳和最近一次 `TurnSummary`，两者均通过 `to_dict()` 产生可直接 JSON 编码的
@@ -122,14 +122,11 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   delta 事件，`MessageAssembler` 按 index/id 组装 tool-call 并只在 MessageEnd 后构造
   canonical assistant message；EventBuffer 提供 wake-only async subscription，Host SSE
   优先实时订阅，前端 reducer 以 provisional state 展示尚未写入 Conversation 的 delta。
-- Ticket 09 已实现严格 workspace 安全：Thread 创建拒绝 symlink 根，每个 Turn 在模型调用前
-  完整扫描普通条目并拒绝 symbolic link、regular-file hard link 和嵌套 mount/bind mount；
-  扫描按条目数与单调时间双预算 fail closed 为 `WORKSPACE_VALIDATION_LIMIT`。文件工具路径
-  逐组件使用 no-follow metadata，Turn 验证后新出现的 symlink 或 hard link 也返回
-  `WORKSPACE_LINK`。生产 `BubblewrapSandboxBackend` 通过 libseccomp 导出 cBPF，阻止
-  `symlink`、`symlinkat`、`link` 和 `linkat`，并在组合时运行真实 link probe；libseccomp、
-  内核过滤或 link-blocking 能力不足均提前报告 sandbox unavailable，绝不降级。过滤只阻止
-  新建链接，可信只读系统树中的既有链接仍可供普通 Linux 命令解析。
+- Ticket 09 的 workspace 安全现由选择时根校验与每次访问的 canonical containment 组成：
+  Turn 启动不再递归扫描工作区，内部 symbolic/hard link 不会被一概拒绝，外部 alias 返回
+  `WORKSPACE_ESCAPE`，搜索遍历跳过工作区外目标并避免目录环。生产
+  `BubblewrapSandboxBackend` 通过 execution profile 控制 workspace 挂载、网络与只读系统
+  配置；它继续丢弃 capabilities，网络仅由已批准的 network profile 开启。
 - Ticket 10 已实现上下文容量预检与 Turn 提交幂等：`ModelInvoker` 在首次和每次后续模型
   请求前，按完整消息、content block、工具 schema 与输出 token 预留执行 tokenizer-free
   保守估算；模型 capability 可声明精确 context window，未声明时使用后端保守默认值。首个
@@ -146,9 +143,9 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   worker thread 中运行至静止，`RunController` 再把已完成的真实 `ToolResult` 交给
   `ToolCoordinator` 记录历史、diff 与事件，随后按原请求终止 Turn。workspace lease 只在该
   协调完成后释放，因此相交 Turn 不会与失去所有权的后台写线程并发。
-- Review Ticket 02 已将 no-follow 检查扩展到 workspace 绝对路径的每个既存组件，并由
-  Runtime 根规范化与文件工具共同复用；最终 workspace 本身是普通目录但任意父组件为
-  symbolic link 时同样 fail closed，不再由 `resolve()` 静默接受路径别名。
+- Review Ticket 02 已将 filesystem security seam 收口到 access-time canonical containment；
+  选择时只验证根目录，不递归检查后代。内部路径 alias 可用，canonical target 超出 workspace
+  时 fail closed，且不再以 `st_nlink > 1` 或 symlink 本身拒绝整个 workspace。
 - Review Ticket 03 已补齐命令 sandbox 的资源关闭链路：关闭空闲 Thread 时立即幂等关闭
   工具 registry；关闭活跃 Thread 时先完成 Turn 取消和 workspace lease 释放，再沿
   `ToolRegistry`、`CommandRunner`、`CommandSandboxBackend` 释放 seccomp descriptor，
@@ -225,14 +222,14 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 59. As a model, I want a `FILE_CHANGED` result after an optimistic version conflict, so that I can reread the file or abandon the edit.
 60. As a coding-agent user, I want diff completeness stated explicitly, so that command-driven file mutations are not falsely presented as fully captured.
 61. As a runtime author, I want source modifications encouraged through file tools, so that change tracking remains accurate and reviewable.
-62. As a workspace owner, I want workspace symbolic links rejected, so that path aliases cannot bypass workspace assumptions.
-63. As a workspace owner, I want regular files with multiple hard links rejected, so that path-disjoint workspaces cannot secretly share one inode.
-64. As a workspace owner, I want nested mounts and bind mounts rejected, so that a workspace cannot expose another filesystem tree.
-65. As a workspace owner, I want every traversed path component checked with non-following metadata operations, so that a link cannot be hidden in a parent directory.
-66. As a workspace owner, I want workspace validation to fail closed when its resource budget is exceeded, so that an incomplete scan is never accepted as safe.
-67. As a workspace owner, I want command execution prevented from creating workspace links, so that shell commands cannot bypass the file-tool rules.
-68. As an application author, I want sandbox link-blocking capability probed before a turn starts, so that unsupported hosts fail before model execution.
-69. As an application author, I want trusted read-only system links allowed in the sandbox runtime, so that ordinary Linux commands can still execute.
+62. As a workspace owner, I want every file-tool access checked against the effective canonical target, so that internal aliases work without allowing external escapes.
+63. As a workspace owner, I want external symlink targets rejected while internal symlinks and hard-linked files remain usable, so that normal repositories are not invalidated by a whole-tree preflight.
+64. As a workspace owner, I want recursive search to skip external aliases and link cycles, so that it remains contained and bounded by the requested operation.
+65. As an application author, I want command execution to receive the minimum profile required by Policy, so that read-only, writable, and approved-network operations have matching sandbox capabilities.
+66. As an application author, I want privileged commands denied when the sandbox cannot provide the capability, so that approval cannot imply unsupported authority.
+67. As an application author, I want trusted read-only system links allowed in the sandbox runtime, so that ordinary Linux commands can still execute.
+68. As an application author, I want approved network/package commands to receive an actual network-enabled profile, so that Policy and sandbox behavior agree.
+69. As a runtime author, I want persistent command sessions to retain their workspace/profile and cleanly expose final exit state, so that long-running tools remain predictable.
 70. As a frontend author, I want a complete `ThreadSnapshot`, so that a refreshed view can reconstruct the current conversation and status.
 71. As a frontend author, I want a structured `TurnSummary`, so that I can render the outcome without parsing model prose.
 72. As a frontend author, I want stage-level `AgentEvent` objects, so that I can display model responses, tool activity, settings updates, state changes, and file changes incrementally.
@@ -271,11 +268,10 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Thinking request fields are fail-closed against the selected model's `ThinkingCapabilities` before the first model request. Provider defaults may be refined by exact-model `ModelProfile` overrides; unsupported thinking, budget, or keep values return `UNSUPPORTED_MODEL_SETTING` rather than passing an unchecked private body to the provider.
 - The workspace reference is immutable after Thread creation. Selecting another folder requires another Thread so old message paths and diffs never change meaning.
 - `WorkspaceLeaseManager` normalizes real workspace roots and treats equal paths or ancestor/descendant relationships as overlapping. Multiple Threads may refer to overlapping roots, but only one overlapping Turn may hold a lease. A conflict fails immediately with `WORKSPACE_BUSY`; there is no implicit queue. A lease is held during `RUNNING` and `WAITING_APPROVAL` and released on every terminal path.
-- Before a Turn enters the loop, workspace validation rejects a symlink in any existing component of the selected root path, any symlink path entry, regular files whose hard-link count exceeds one, and nested mount or bind-mount points. Validation is complete within configured entry and time budgets; reaching either budget fails closed with `WORKSPACE_VALIDATION_LIMIT`.
-- Workspace validation is awaited through a worker thread so a large read-only scan does not block an async Host. A Turn emitter and ID exist before this preflight; any failure after allocation emits one sanitized `turn_rejected` event and leaves Conversation unchanged. Cancellation may stop awaiting the read-only validation worker, releases the lease, and does not authorize that worker to perform Agent writes.
-- File operations inspect path components without following links. The earlier behavior that allowed internal file symlinks is intentionally replaced by a strict workspace prohibition.
-- `CommandSandboxBackend` becomes a real seam because the strict production bubblewrap adapter and a deterministic test adapter both need to satisfy it. Its interface includes a capability probe and cancellable command execution. The production adapter must prevent workspace `symlink`, `symlinkat`, `link`, and `linkat` operations or report itself unavailable before the Turn starts.
-- The strict link prohibition applies to the persistent workspace. Trusted read-only links in the sandbox system runtime remain allowed so standard Linux executables work. Hostile external processes replacing workspace entries during a Turn are not claimed to be fully preventable by the application.
+- Before a Turn enters the loop, workspace validation checks only that the selected root still exists, is a readable directory, resolves canonically, and remains within the Host allowlist. It does not recursively scan the workspace or reject internal symlinks and hard-linked files. `WorkspaceLeaseManager` overlap/concurrency semantics remain unchanged.
+- File operations reject absolute paths and lexical traversal, resolve existing targets (or the nearest existing parent for new targets), and check effective canonical containment at access time. Internal symlinks are allowed when their effective target remains inside the workspace; external escapes are denied with `WORKSPACE_ESCAPE`. Recursive search follows the same rule and avoids external aliases and cycles.
+- `CommandSandboxBackend` remains the production/test seam for profile-aware command execution. The production bubblewrap adapter preserves process isolation, capability dropping, constrained mounts, ephemeral home/tmp, and process-group cleanup while selecting read-only, writable, or network-enabled mounts from the `ExecutionProfile`.
+- A hard-linked regular file does not invalidate the workspace. Atomic writes remain the default; when an existing hard-linked target is intentionally edited, the filesystem updates its inode in place so aliases observe the same content.
 - `ChangeTracker` records a file's original state before the first file-tool mutation in a Turn and its latest state after each successful mutation. A file modified repeatedly produces one original-to-final unified diff. New and deleted states are represented explicitly.
 - The tracker records a content fingerprint when a file is read or first prepared for writing. A later write that observes a different disk fingerprint returns `FILE_CHANGED`; the model may reread and retry. The tracker updates its known fingerprint after its own successful write.
 - Diff completeness is explicit. File-tool changes are tracked completely. Arbitrary source changes made inside `run_command` are not guaranteed to have a recoverable pre-command snapshot, so a Turn that may contain such changes reports `diff_complete = false`. The default prompt instructs the model to prefer file tools for source edits.
@@ -309,9 +305,9 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - Change tracking tests assert original-to-final diffs across repeated file-tool edits, new files, optimistic `FILE_CHANGED` conflicts, and explicit incomplete diff status after command execution.
 - Event tests assert schema version, IDs, scoped monotonic sequence, safe payloads, status order, settings-version consistency, bounded-buffer gap behavior, Snapshot recovery, and default reasoning suppression. Debug tests verify reasoning appears only in its dedicated event.
 - Settings tests assert immutable per-Turn snapshots, next-Turn application of mid-run updates, one-Turn overrides, version conflicts, model changes between Turns, hard server ceilings, and complete credential redaction.
-- Security tests assert rejection of workspace symlinks, symlinked path components, hard-linked regular files, nested mounts where test infrastructure permits, validation-budget exhaustion, and command sandbox link-creation attempts.
+- Security tests assert access-time rejection of absolute/traversal paths and external symlink escapes, allow internal symlinks and hard-linked files, and cover nested mounts where test infrastructure permits. They also verify profile-aware command sandbox behavior.
 - Existing provider tests are prior art for scripted provider responses and stable domain-type assertions. Existing local-tool tests are prior art for temporary workspace behavior, structured tool errors, command cancellation, and sandbox capability checks.
-- The acceptance suite covers at least: no-tool completion; read/edit/test/diff; failed-test reporting; invalid raw provider-argument preservation and structured recovery; explicit default budgets and four-Turn capacity; independent workspace concurrency; overlapping workspace rejection; a second Turn on one Thread; model switching between Turns; command cancellation; budget and repeated-failure termination; optimistic file conflicts; strict link/mount rejection; ordered events consistent with final tool history, Snapshot, and Summary; and absence of credentials, tracebacks, and default-hidden reasoning from public data.
+- The acceptance suite covers at least: no-tool completion; read/edit/test/diff; failed-test reporting; invalid raw provider-argument preservation and structured recovery; explicit default budgets and four-Turn capacity; independent workspace concurrency; overlapping workspace rejection; a second Turn on one Thread; model switching between Turns; command cancellation; budget and repeated-failure termination; optimistic file conflicts; effective-target link containment; ordered events consistent with final tool history, Snapshot, and Summary; and absence of credentials, tracebacks, and default-hidden reasoning from public data.
 - Tests should survive refactoring inside deep modules. A test that must inspect past `ThreadRuntime`, `LLMProvider`, `ToolRegistry`, or `CommandSandboxBackend` seams requires justification.
 
 ## Out of Scope

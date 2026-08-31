@@ -23,9 +23,8 @@ ToolCoordinator、具体 Provider 或具体工具实现；Host 不得复制 Agen
 
 提供 `agent web` 本地应用入口。Linux 或 WSL2 中启动 Host 后，用户通过浏览器访问
 `http://127.0.0.1:<port>`。Host 使用 FastAPI 与 Uvicorn 提供稳定 JSON command 接口、SSE
-事件、静态 React 资源、server-side workspace picker，以及 WSL 下可选的 native Windows
-folder picker。开发模式由独立 Vite server 代理 `/api`；生产模式由 Python Host 直接托管构建
-后的前端。
+事件、静态 React 资源以及 server-side Host workspace browser。开发模式由独立 Vite server
+代理 `/api`；生产模式由 Python Host 直接托管构建后的前端。
 
 首次启动允许 Runtime 尚未配置。用户在 Web 设置中为 DeepSeek、Moonshot/Kimi 或 GLM 填写
 API key，Host 将凭据原子地保存在本机用户配置目录，只向浏览器返回脱敏状态。保存后，前端让
@@ -70,7 +69,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 19. As a user, I want workspace browsing limited to configured roots, so that the picker cannot enumerate the entire Host filesystem.
 20. As a user, I want to navigate one directory level at a time, so that selecting a project remains simple and predictable.
 21. As a user, I want hidden directories available in the picker, so that dot-prefixed project directories remain selectable.
-22. As a user, I want symlinks excluded from navigation, so that directory selection does not weaken workspace safety rules.
+22. As a user, I want canonical symlink targets shown in navigation, so that internal aliases remain usable while external escapes are rejected.
 23. As a user, I want clear errors for a missing, inaccessible, or out-of-root directory, so that an invalid workspace is diagnosable.
 24. As a user, I want to create a Thread for a selected workspace, so that conversation paths retain one stable meaning.
 25. As a user, I want to choose Provider and model when creating a Thread, so that its initial settings do not depend on an obsolete Runtime default.
@@ -139,8 +138,8 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - The SSE adapter owns real-time EventBuffer subscription (with replay fallback), framing, heartbeat,
   cursor recovery, and disconnect cleanup behind one streaming interface. Runtime and routes do not
   contain React-specific event reduction.
-- Workspace browsing is hidden behind a root policy interface that normalizes configured roots, checks containment without following symlinks, lists one level, and returns transport-safe entries.
-- Native Windows selection is hidden behind an injected `NativePickerAdapter`. It detects WSL/interop capability, launches a fixed UTF-8 PowerShell dialog through argv, translates the selected Windows path with system `wslpath`, and exposes idempotent close/shutdown. The PowerShell process emits its Windows PID before opening the dialog, allowing shutdown to terminate both that process and a WSL `/init` launcher instead of leaving a detached native dialog. It never authorizes a workspace; the Host calls the same `WorkspaceBrowser.validate()` used by Thread creation.
+- Workspace browsing is hidden behind a root policy interface that normalizes configured roots, checks canonical containment, lists one level, and returns transport-safe entries.
+- Explicit selection creates or reuses an in-memory Host Workspace record. The record is the only authority used to create a Thread; the browser never sends an arbitrary path as Thread input.
 
 ### Provider configuration and model discovery
 
@@ -159,7 +158,10 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 ### Minimal Runtime changes
 
 - Thread creation gains an optional initial `ModelSettings` value. Existing callers that omit it retain the current default behavior. Web creation supplies the selected Provider and model directly, avoiding an artificial immediate settings update.
-- Workspace validation in `run_turn` runs in a worker thread and is awaited asynchronously. Validation rules, budgets, lease acquisition, history mutation ordering, and fail-closed behavior remain unchanged.
+- Workspace root validation in `run_turn` runs in a worker thread and is awaited asynchronously.
+  It verifies only that the immutable root still exists and is accessible; descendant containment
+  is enforced by `WorkspaceFilesystem` at each access, so Turn startup never performs a full-tree
+  scan. Lease acquisition and history mutation ordering remain unchanged.
 - A Turn ID and emitter are available before asynchronous preflight. Provider resolution, context checks, workspace lease/validation, or cancellation before `turn_started` produce a sanitized `turn_rejected` event and then preserve the existing exception contract.
 - Cancellation during preflight releases acquired resources and produces an observable rejection/cancellation code. Cancellation after `turn_started` continues through `RunController` and the existing terminal Summary/event behavior.
 - Runtime streaming remains behind the existing ThreadRuntime/provider seams; the Host only forwards
@@ -176,21 +178,18 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 
 ### Workspace browsing
 
-- `agent web` accepts repeatable workspace roots; the default is the process working directory. Browser navigation and Thread creation must remain within at least one normalized configured root.
-- `GET /api/native-picker/capability` reports whether WSL interop and the required executables are available. `POST /api/native-picker/select` waits asynchronously for one native Windows folder dialog, translates its result with `wslpath`, and validates the resulting Host POSIX path against configured roots before returning it.
-- The native adapter is a selection transport only: it does not perform root containment, symlink, accessibility, or directory authorization. A selected path is always passed through `WorkspaceBrowser.validate()`; the existing browser endpoint remains available for `/home/...`, native Linux, unavailable interop, cancellation, and failures.
-- The picker uses Host-native POSIX paths after translation. A WSL Host may therefore expose `/mnt/c/...`; no browser-side Windows-to-WSL path conversion exists. Concurrent native requests return `NATIVE_PICKER_BUSY`, and cancellation returns a normal `cancelled` result.
-- A request lists one level, directory-first and name-sorted, with at most 500 entries and an explicit `truncated` flag.
-- Hidden directories are included. Symlinks and non-directories are excluded, and metadata checks do not follow links.
-- Missing, inaccessible, and root-escape requests receive distinct stable errors. Picker authorization does not replace Runtime workspace validation; creating and starting a Thread still use existing strict workspace rules.
+- `agent web` accepts repeatable workspace roots; without roots the browser starts at `/`. Browser navigation and selection remain within at least one normalized configured root.
+- A request lists one level, directory-first and name-sorted, with at most 500 entries and an explicit `truncated` flag. Hidden directories are included.
+- Entries are canonicalized at access time. Internal directory aliases can be navigated, while aliases whose effective target escapes an allowed root are omitted or rejected.
+- `POST /api/workspaces/select` explicitly creates or reuses an in-memory Host Workspace record. The record contains an opaque id, canonical path, and display name; it is the only input accepted by Thread creation.
+- Missing, inaccessible, invalid, and root-escape requests receive distinct stable errors. Workspace selection does not replace Runtime lease and per-access filesystem checks.
 
 ### HTTP commands and DTOs
 
 - Health exposes process readiness and whether Runtime configuration is required without exposing credentials.
 - Provider commands list preset/configuration state, save a credential and selected model, clear a credential, discover models, and update the default Provider/model.
-- Workspace browsing is a read-only Host command scoped to configured roots.
-- Native workspace selection is exposed as a capability read (`GET /api/native-picker/capability`) and a selection command (`POST /api/native-picker/select`). Capability, interop, process, malformed-result, translation, and busy failures use stable JSON error codes; cancellation is not an error. Windows paths are never returned by the transport.
-- Thread commands list Thread views, create a Thread, get one hydratable Thread view, submit a Turn, cancel, close, and version-update settings.
+- Workspace browsing is a read-only Host command scoped to configured roots, plus the explicit Workspace selection command.
+- Thread commands list Thread views, create a Thread by Workspace id, get one hydratable Thread view, submit a Turn, cancel, close, and version-update settings.
 - Event transport is the sole SSE endpoint. Approval and destructive Thread deletion endpoints do not exist in V1.
 - Thread view is a stable transport DTO containing Runtime Snapshot, current Runtime event cursor, and optional Host submission lifecycle. It never serializes internal dataclasses or task objects directly.
 - Every JSON response is strict and versionable. Enums are strings, timestamps use the Runtime's UTC representation, paths are Host POSIX strings, and arbitrary Python reprs are rejected.
@@ -211,7 +210,6 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Runtime `AgentEvent` envelopes and payloads pass through without domain renaming. SSE `event` is the Runtime event type, `id` is `event_id`, and `data` is strict JSON.
 - The adapter subscribes to the Runtime EventBuffer for immediate delivery, retains polling-compatible
   replay/cursor recovery behavior for injected legacy runtimes, and sends a comment heartbeat every
-  15 seconds.
 - An explicit `after_event_id` query parameter takes precedence over the `Last-Event-ID` header. Both refer to Runtime event IDs rather than sequence values.
 - A normal connection emits retained events strictly in EventBuffer append order. Browser reducers deduplicate by event ID and stable tool-call IDs.
 - A hydratable Thread read captures the latest event cursor and Snapshot without yielding control between those reads, then returns both. The client builds canonical UI from Snapshot and connects after the cursor.
@@ -229,7 +227,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Provider settings use a password input with save, clear, masked configured state, automatic model discovery, explicit refresh, manual model entry, and default selection.
 - Host errors are never swallowed. The UI distinguishes disconnected Host, invalid workspace, missing Thread, Provider authentication/availability, rejected Turn, failed Turn, failed tool, failed settings update, and failed cancellation.
 - The SSE client reconnects automatically with bounded backoff, keeps current Snapshot-derived UI during disconnection, and refetches the hydratable Thread view when recovery cannot continue.
-- Opening the existing Project dialog queries native capability and, when available, starts the native picker from that user action. A selected validated WSL path becomes the current project; cancel or any unavailable/failure response falls back to the Host filesystem browser, with a retry action for recoverable native failures. Duplicate native requests are disabled in the dialog while the Host also enforces single-flight.
+- Opening the Workspace dialog immediately renders the Host filesystem browser. Selecting the current directory creates or reuses a Host Workspace record; no operating-system picker or browser-owned path conversion is involved.
 - At widths below 1024 pixels, Thread navigation becomes a toggleable sidebar and Activity becomes a drawer or tab. Conversation and Composer remain available. V1 is desktop-first rather than a separate mobile product.
 - Interactive controls support keyboard use and visible focus. Status meaning uses text/icon in addition to color, and failures are announced in persistent visible UI.
 
@@ -259,7 +257,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Runtime tests cover optional initial settings, asynchronous validation responsiveness, lease cleanup after preflight cancellation, and sanitized `turn_rejected` events for every pre-start failure class.
 - Provider store tests cover first load, schema version, atomic replacement, owner-only permissions, masking, replacement, clearing, default selection, malformed-file failure, and absence of secrets from repr/log/error surfaces.
 - Provider catalog tests cover successful ID reduction, deduplication, sorting, five-minute cache behavior, authentication failure, network failure, malformed payload, empty list, and manual-model fallback. Production URLs are asserted against preset-owned values rather than caller input.
-- Workspace browser tests cover default and multiple roots, one-level sorting, hidden directories, truncation, symlink exclusion, nonexistent paths, permissions, sibling-prefix escape, `..` escape, and WSL-style POSIX paths.
+- Workspace browser tests cover default and multiple roots, one-level sorting, hidden directories, truncation, canonical internal symlinks, external escapes, nonexistent paths, permissions, sibling-prefix escape, `..` escape, and WSL-style POSIX paths.
 - Thread API tests cover list, create with initial settings, not found, hydratable view, close idempotency, closed mutation, settings update, stale version, configuration required, and invalid workspace.
 - Turn API tests cover accepted response latency, starting state, duplicate conflict, Runtime transition, terminal cleanup, preflight cancellation, active cancellation, expected rejection, unexpected task failure, close during Turn, and shutdown cleanup.
 - SSE adapter tests cover event names, IDs, JSON data, append ordering, initial cursor, query/header precedence, disconnect/reconnect, heartbeat, active/idle polling selection, cursor expiry, snapshot recovery, empty-buffer cursor reset, terminal events, and no cancellation on disconnect.

@@ -12,7 +12,7 @@ from agent.runtime import ApprovalMode, ModelSettings, ThreadRuntime, ThreadSett
 from agent.tools import create_local_tool_registry
 
 from .provider_config import ProviderConfigurationError, ProviderStore
-from .workspace import WorkspaceBrowser
+from .workspace import WorkspaceBrowser, WorkspaceRecord
 
 
 class ConfigurationRequiredError(RuntimeError):
@@ -93,20 +93,21 @@ class ThreadHost:
         self._runtime_factory = runtime_factory
         self._runtime: RuntimeView | None = None
         self._thread_ids: list[str] = []
+        self._thread_workspaces: dict[str, WorkspaceRecord] = {}
 
     def list_threads(self) -> list[dict[str, object]]:
         return [self._view(thread_id) for thread_id in self._thread_ids]
 
     def create_thread(
         self,
-        workspace: str,
+        workspace_id: str,
         *,
         provider_config_id: str | None = None,
         model: str | None = None,
         approval_mode: ApprovalMode = ApprovalMode.ON_REQUEST,
     ) -> dict[str, object]:
         selected = self._selection(provider_config_id, model)
-        normalized_workspace = self._workspace_browser.validate(workspace)
+        workspace = self._workspace_browser.get(workspace_id)
         initial_settings = ModelSettings(
             provider_config_id=selected["provider_id"],
             model=selected["model"],
@@ -115,10 +116,11 @@ class ThreadHost:
         if self._runtime is None:
             self._runtime = self._runtime_factory(initial_settings)
         snapshot = self._runtime.create_thread(
-            Path(normalized_workspace),
+            Path(workspace.path),
             settings=initial_settings,
         )
         self._thread_ids.append(snapshot.thread_id)
+        self._thread_workspaces[snapshot.thread_id] = workspace
         return self._view(snapshot.thread_id)
 
     def get_thread(self, thread_id: str) -> dict[str, object]:
@@ -209,9 +211,17 @@ class ThreadHost:
         runtime = self._require_thread(thread_id)
         snapshot = runtime.get_snapshot(thread_id)
         events = runtime.get_events(thread_id)
+        workspace = self._thread_workspaces.get(thread_id)
+        if workspace is None:
+            # Runtime-created records from an older in-memory owner are still
+            # recoverable: materialize the matching Host record by canonical
+            # path instead of allowing the frontend to become the authority.
+            workspace = self._workspace_browser.select(snapshot.workspace)
+            self._thread_workspaces[thread_id] = workspace
         return {
             "schema_version": 1,
             "snapshot": snapshot.to_dict(),
+            "workspace": workspace.to_dict(),
             "event_cursor": events.latest_event_id,
             "submission": None,
         }

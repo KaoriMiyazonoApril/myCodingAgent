@@ -145,6 +145,53 @@ test("recovers Snapshot state and reconnects with bounded backoff", async () => 
   client.stop();
 });
 
+test("waits for Snapshot recovery before scheduling a reconnect", async () => {
+  const sources: FakeEventSource[] = [];
+  const timers: Array<{ callback: () => void; delay: number }> = [];
+  let finishRecovery: ((thread: ThreadView) => void) | undefined;
+  const recovery = new Promise<ThreadView>((resolve) => {
+    finishRecovery = resolve;
+  });
+  const client = new ThreadEventClient(
+    "thread-1",
+    "stale-cursor",
+    {
+      onEvent: vi.fn(),
+      onSnapshot: vi.fn(),
+      onConnection: vi.fn(),
+      recover: () => recovery,
+      onError: vi.fn(),
+    },
+    {
+      eventSourceFactory: (url) => {
+        const source = new FakeEventSource(url);
+        sources.push(source);
+        return source;
+      },
+      setTimer: (callback, delay) => {
+        timers.push({ callback, delay });
+        return timers.length;
+      },
+      clearTimer: vi.fn(),
+    },
+  );
+
+  client.start();
+  sources[0]!.onerror?.(new Event("error"));
+  expect(timers).toHaveLength(0);
+
+  finishRecovery!(recoveredView("fresh-cursor"));
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(timers).toHaveLength(1);
+  timers[0]!.callback();
+
+  expect(sources[1]!.url).toBe(
+    "/api/threads/thread-1/events?after_event_id=fresh-cursor",
+  );
+  client.stop();
+});
+
 test("applies an in-stream snapshot recovery without discarding it", () => {
   const sources: FakeEventSource[] = [];
   const onSnapshot = vi.fn();
@@ -173,4 +220,45 @@ test("applies an in-stream snapshot recovery without discarding it", () => {
   client.stop();
 
   expect(onSnapshot).toHaveBeenCalledWith(recovered);
+});
+
+test("ignores events queued by a failed source after recovery starts", async () => {
+  const sources: FakeEventSource[] = [];
+  const onEvent = vi.fn();
+  const client = new ThreadEventClient(
+    "thread-1",
+    null,
+    {
+      onEvent,
+      onSnapshot: vi.fn(),
+      onConnection: vi.fn(),
+      recover: async () => recoveredView("recovered"),
+      onError: vi.fn(),
+    },
+    {
+      eventSourceFactory: (url) => {
+        const source = new FakeEventSource(url);
+        sources.push(source);
+        return source;
+      },
+      setTimer: (callback) => {
+        callback();
+        return 1;
+      },
+      clearTimer: vi.fn(),
+    },
+  );
+
+  client.start();
+  sources[0]!.onerror?.(new Event("error"));
+  sources[0]!.emit("turn_started", {
+    event_id: "stale",
+    type: "turn_started",
+    payload: {},
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(onEvent).not.toHaveBeenCalled();
+  client.stop();
 });

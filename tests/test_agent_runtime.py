@@ -49,9 +49,7 @@ from agent.runtime import (
     TurnSettingsOverride,
     TurnStatus,
     UnsupportedModelSettingError,
-    UnsafeWorkspaceError,
     WorkspaceBusyError,
-    WorkspaceValidationLimitError,
 )
 from agent.runtime.run_controller import RunController
 from agent.tools.registry import ToolRegistry
@@ -3085,20 +3083,18 @@ def test_read_fingerprint_matches_the_exact_content_returned_to_model(
     assert conflict.error_code == "FILE_CHANGED"
 
 
-def test_workspace_root_symlink_is_rejected_before_tool_composition(tmp_path) -> None:
+def test_workspace_root_symlink_is_canonicalized_before_tool_composition(tmp_path) -> None:
     real = tmp_path / "real"
     real.mkdir()
     linked = tmp_path / "linked"
     linked.symlink_to(real, target_is_directory=True)
     runtime = runtime_for_provider(ScriptedProvider([]))
 
-    with pytest.raises(UnsafeWorkspaceError) as captured:
-        runtime.create_thread(linked)
-
-    assert captured.value.code == "UNSAFE_WORKSPACE"
+    thread = runtime.create_thread(linked)
+    assert thread.workspace == str(real.resolve())
 
 
-def test_workspace_symlink_parent_is_rejected_before_tool_composition(tmp_path) -> None:
+def test_workspace_symlink_parent_is_canonicalized_before_tool_composition(tmp_path) -> None:
     real_parent = tmp_path / "real-parent"
     real_parent.mkdir()
     workspace = real_parent / "workspace"
@@ -3107,14 +3103,12 @@ def test_workspace_symlink_parent_is_rejected_before_tool_composition(tmp_path) 
     linked_parent.symlink_to(real_parent, target_is_directory=True)
     runtime = runtime_for_provider(ScriptedProvider([]))
 
-    with pytest.raises(UnsafeWorkspaceError) as captured:
-        runtime.create_thread(linked_parent / "workspace")
-
-    assert captured.value.code == "UNSAFE_WORKSPACE"
+    thread = runtime.create_thread(linked_parent / "workspace")
+    assert thread.workspace == str(workspace.resolve())
 
 
 @pytest.mark.parametrize("link_kind", ["symbolic", "hard"])
-def test_turn_rejects_persistent_workspace_links(tmp_path, link_kind) -> None:
+def test_turn_allows_persistent_workspace_links(tmp_path, link_kind) -> None:
     target = tmp_path / "target.txt"
     target.write_text("data", encoding="utf-8")
     if link_kind == "symbolic":
@@ -3124,28 +3118,28 @@ def test_turn_rejects_persistent_workspace_links(tmp_path, link_kind) -> None:
     runtime = runtime_for_provider(ScriptedProvider([final_response()]))
     thread = runtime.create_thread(tmp_path)
 
-    with pytest.raises(UnsafeWorkspaceError) as captured:
-        asyncio.run(runtime.run_turn(thread.thread_id, "Validate first."))
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Validate first."))
 
-    assert captured.value.code == "UNSAFE_WORKSPACE"
+    assert summary.status is TurnStatus.COMPLETED
     assert runtime.get_snapshot(thread.thread_id).status is ThreadStatus.IDLE
 
 
-def test_nested_mount_point_is_rejected_at_runtime_seam(tmp_path, monkeypatch) -> None:
+def test_nested_mount_point_is_not_scanned_at_runtime_seam(tmp_path, monkeypatch) -> None:
     nested = tmp_path / "mounted"
     nested.mkdir()
+    del nested
     monkeypatch.setattr(
         "agent.runtime.workspace_validator.mounted_paths",
-        lambda: frozenset({nested.resolve()}),
+        lambda: (_ for _ in ()).throw(AssertionError("mount table must not be scanned")),
     )
     runtime = runtime_for_provider(ScriptedProvider([final_response()]))
     thread = runtime.create_thread(tmp_path)
 
-    with pytest.raises(UnsafeWorkspaceError, match="mount"):
-        asyncio.run(runtime.run_turn(thread.thread_id, "Reject nested mount."))
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Do not scan mounts."))
+    assert summary.status is TurnStatus.COMPLETED
 
 
-def test_workspace_entry_budget_fails_closed(tmp_path) -> None:
+def test_workspace_entry_budget_does_not_trigger_recursive_preflight(tmp_path) -> None:
     (tmp_path / "one.txt").write_text("1", encoding="utf-8")
     (tmp_path / "two.txt").write_text("2", encoding="utf-8")
     runtime = runtime_for_provider(
@@ -3154,13 +3148,11 @@ def test_workspace_entry_budget_fails_closed(tmp_path) -> None:
     )
     thread = runtime.create_thread(tmp_path)
 
-    with pytest.raises(WorkspaceValidationLimitError) as captured:
-        asyncio.run(runtime.run_turn(thread.thread_id, "Bound validation."))
-
-    assert captured.value.code == "WORKSPACE_VALIDATION_LIMIT"
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Bound validation."))
+    assert summary.status is TurnStatus.COMPLETED
 
 
-def test_workspace_time_budget_fails_closed(tmp_path) -> None:
+def test_workspace_time_budget_does_not_trigger_recursive_preflight(tmp_path) -> None:
     (tmp_path / "one.txt").write_text("1", encoding="utf-8")
     clock_values = iter((0.0, 0.0, 2.0))
     runtime = runtime_for_provider(
@@ -3170,12 +3162,12 @@ def test_workspace_time_budget_fails_closed(tmp_path) -> None:
     )
     thread = runtime.create_thread(tmp_path)
 
-    with pytest.raises(WorkspaceValidationLimitError):
-        asyncio.run(runtime.run_turn(thread.thread_id, "Time-box validation."))
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Time-box validation."))
+    assert summary.status is TurnStatus.COMPLETED
 
 
 @pytest.mark.parametrize("link_kind", ["symbolic", "hard"])
-def test_file_tools_reject_links_created_after_turn_validation(
+def test_file_tools_authorize_links_created_at_access_time(
     tmp_path,
     link_kind,
 ) -> None:
@@ -3215,7 +3207,8 @@ def test_file_tools_reject_links_created_after_turn_validation(
     assert summary.status is TurnStatus.COMPLETED
     result = provider.requests[1].messages[-1].content[0]
     assert isinstance(result, ToolResultBlock)
-    assert result.error_code == "WORKSPACE_LINK"
+    assert result.error_code is None
+    assert result.content == "1: secret"
 
 
 @pytest.mark.parametrize(

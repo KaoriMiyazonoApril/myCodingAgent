@@ -98,8 +98,51 @@ def test_running_session_accepts_stdin_and_empty_poll(tmp_path) -> None:
                 arguments={"session_id": session_id},
             )
         )
-        assert unknown.error_code == "SESSION_NOT_FOUND"
+        assert unknown.error_code == "SESSION_DEAD"
         reg.close()
+
+    asyncio.run(scenario())
+
+
+def test_natural_exit_is_available_for_one_final_poll_then_reports_dead(tmp_path) -> None:
+    async def scenario() -> None:
+        manager = ProcessManager(
+            WorkspaceFilesystem(tmp_path),
+            sandbox_backend=DeterministicSandboxBackend(),
+        )
+        started = await manager.exec("printf final; sleep .02", yield_time_ms=0)
+        session_id = str(started.metadata["session_id"])
+        await asyncio.sleep(0.08)
+
+        final = await manager.write_stdin(session_id, yield_time_ms=0)
+        assert final.metadata["status"] == "exited"
+        assert final.metadata["stdout"] == "final"
+        with pytest.raises(ToolOperationError) as captured:
+            await manager.write_stdin(session_id, chars="late\n")
+        assert captured.value.code == "SESSION_DEAD"
+        manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_session_interactions_are_serialized(tmp_path) -> None:
+    async def scenario() -> None:
+        manager = ProcessManager(
+            WorkspaceFilesystem(tmp_path),
+            sandbox_backend=DeterministicSandboxBackend(),
+        )
+        started = await manager.exec(
+            "read first; printf 'one:%s\\n' \"$first\"; read second; printf 'two:%s' \"$second\"",
+            yield_time_ms=0,
+        )
+        session_id = str(started.metadata["session_id"])
+        first, second = await asyncio.gather(
+            manager.write_stdin(session_id, chars="A\n", yield_time_ms=500),
+            manager.write_stdin(session_id, chars="B\n", yield_time_ms=500),
+        )
+        assert first.metadata["stdout"] == "one:A\n"
+        assert second.metadata["stdout"] == "two:B"
+        manager.close()
 
     asyncio.run(scenario())
 

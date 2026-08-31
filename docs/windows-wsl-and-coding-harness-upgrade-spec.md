@@ -1,13 +1,16 @@
-# Windows/WSL 原生项目选择与 Coding Harness 内核升级规格
+# Host 项目选择与 Coding Harness 内核升级规格
+
+> 2026-08-31 更新：原 Workstream A（Windows/WSL 原生目录选择器）已撤销并由
+> [autonomous-web-workspace-refactor-spec.md](autonomous-web-workspace-refactor-spec.md)
+> 取代。Web 端项目选择现在只使用 Host filesystem browser；原生 picker、PowerShell
+> dialog、Windows path translation 和对应 transport API 均不再属于系统架构。
 
 ## 1. 目的与交付顺序
 
-本规格覆盖两个独立但连续交付的 workstream：
+本规格保留 Coding Agent 内核按 Policy、`apply_patch`、Stateful Shell、Streaming 四个 Phase
+的升级约束。项目选择架构由上方链接的新规格定义。
 
-1. Windows browser + WSL2 Host 场景的原生 Windows 文件夹选择；
-2. Coding Agent 内核按 Policy、`apply_patch`、Stateful Shell、Streaming 四个 Phase 升级。
-
-实施顺序固定为：先完成并提交原生项目选择，再严格按 Phase 1 → 2 → 3 → 4 实施内核升级。
+内核实施顺序固定为 Phase 1 → 2 → 3 → 4。
 每个阶段必须先完成 focused tests、相关 regression、diff 检查和中文 commit，再进入下一阶段。
 所有完成项最后统一执行全量 Python/frontend regression、架构审查、`git diff --check` 和 push。
 
@@ -41,7 +44,6 @@ TDD 测试只跨以下现有或必要扩展的公共 seam 观察行为：
 
 - Host application factory 与 HTTP JSON/SSE transport；
 - `WorkspaceBrowser.validate()` 最终 workspace authorization；
-- native picker platform adapter 的 capability/select/close interface；
 - `ThreadSettings` → `TurnSettingsOverride` → frozen `TurnConfig`；
 - `ToolPolicy`/`ToolCoordinator` decision、approval、execution interface；
 - `ToolRegistry` 对 parsed `ToolCallBlock` 的 dispatch interface；
@@ -56,114 +58,7 @@ TDD 测试只跨以下现有或必要扩展的公共 seam 观察行为：
 
 ---
 
-# Workstream A — Windows + WSL2 原生项目文件夹选择
-
-## A1. 设计约束
-
-该能力属于 Host 的本地平台集成。Runtime 与 Agent Core 只接收既有 WSL/Linux workspace path，
-不得知道 Windows path、PowerShell 或 native dialog。
-
-原生 dialog 只负责 selection，不是 authorization。成功取得并翻译 WSL path 后，Host 必须把
-它交给同一个 `WorkspaceBrowser.validate()`。不得在 picker adapter 中复制 containment、symlink、
-root authorization 或 accessibility 规则，也不得因“用户亲自选择”扩大 configured roots。
-
-保留 `GET /api/workspaces` 和现有 Host workspace browser，继续支持 `/home/...`、native Linux、
-interop unavailable/failure 以及用户主动浏览 Host filesystem。
-
-## A2. Native picker platform adapter
-
-新增一个小而深的 Host module/interface，封装：
-
-- capability detection：native Linux/非 WSL 为 unsupported；WSL 但 Windows interop 或所需系统
-  executable 不可用时为 interop unavailable；可用时为 available；
-- `select()`：异步等待一个 Windows folder dialog，返回 selected Windows path、cancelled，或 typed
-  process/malformed failure；
-- Windows → WSL translation：使用系统 `wslpath` 等系统 translation capability，通过 argv 传入
-  原始 path；禁止 `C:` → `/mnt/c` 字符串拼接假设；
-- lifecycle `close()`/`shutdown()`：终止并回收 active child/task，且可重复调用；
-- single-flight：同一 Host 同时最多一个 native dialog；第二次请求稳定返回 conflict，不新建窗口。
-
-生产 adapter 只允许 `asyncio.create_subprocess_exec()`/等价的 argv subprocess interface；禁止
-`shell=True`，禁止把选择 path 拼入 shell command。Windows dialog script 必须是固定受信代码，
-选择结果用明确 machine-readable envelope 输出，并显式使用 UTF-8。空格、中文和 Unicode path
-必须无损。取消是正常结果，不抛 Host failure。
-
-不得在 platform adapter 内对翻译后的 path 调用 `resolve()`、realpath 或其他会改变既有安全语义的
-canonicalization。adapter 只检查 transport result 是否结构正确且翻译输出是非空绝对 Linux path；
-最终合法性完全交给 `WorkspaceBrowser.validate()`。
-
-## A3. Host transport
-
-在现有 Host application factory 注入 native picker adapter，提供最小 transport surface：
-
-- 一个 capability read，返回 `schema_version`、`available` 和不可用时稳定的 `reason_code`；
-- 一个 selection command，成功返回 `{status: "selected", workspace: <validated WSL path>}`，取消返回
-  `{status: "cancelled"}`；
-- unsupported、interop unavailable、picker process failure、malformed native result、translation
-  failure、concurrent conflict 使用现有 error envelope 和各自稳定 code；
-- selected WSL path 的 unauthorized、missing、symlink、inaccessible/non-directory 直接复用
-  `WorkspaceBrowser` 的既有 error code/status mapping。
-
-具体 endpoint 名称由实现根据现有 `/api/workspaces` 风格选择，但不得把 Windows path 返回给
-Runtime、Thread DTO、Snapshot、事件或日志。内部错误不得泄漏 stack trace。
-
-Picker 等待期间 event loop 必须继续处理 health、thread API 和 SSE。native picker 必须加入
-`create_app` 的现有 lifespan `shutdown_resources()`，不得建立第二套 shutdown framework。
-
-## A4. Frontend 最小接线
-
-现有“打开项目…”入口保持不变。打开 `WorkspaceDialog` 时：
-
-1. 查询 native capability；
-2. available 时优先触发 native picker（该动作源于用户刚才的 Open Project click）；
-3. selected 时把返回的 WSL path 作为当前 project，并沿用现有 Thread 创建流程；
-4. cancelled 时安静显示现有 Host browser，不显示红色错误；
-5. unavailable/failure/conflict 时保留 browser fallback；failure 可显示简短、可恢复提示，但不得
-   阻止直接浏览 Host filesystem；
-6. dialog 内保留明确的 Host filesystem 浏览方式，并允许在失败后重试 native picker。
-
-不要重做 UI。对正在进行的 native request 禁用重复触发；服务端 single-flight 仍是最终并发语义。
-
-## A5. 稳定结果与错误码
-
-至少区分：
-
-- success：`selected`；
-- normal cancellation：`cancelled`；
-- `NATIVE_PICKER_UNSUPPORTED`；
-- `WINDOWS_INTEROP_UNAVAILABLE`；
-- `NATIVE_PICKER_FAILED`；
-- `NATIVE_PICKER_INVALID_RESULT`；
-- `WSL_PATH_TRANSLATION_FAILED`；
-- `NATIVE_PICKER_BUSY`；
-- 既有 `WORKSPACE_OUTSIDE_ROOT`、`WORKSPACE_NOT_FOUND`、
-  `WORKSPACE_SYMLINK_NOT_ALLOWED`、`WORKSPACE_NOT_ACCESSIBLE`。
-
-命名若必须匹配仓库现有 convention 可微调，但 capability、cancel、failure 和 authorization 不得
-合并成同一种结果。
-
-## A6. Tests 与人工验收
-
-按 red → green vertical slices 覆盖：capability available/unavailable；success；cancel；空格；中文/
-Unicode；系统 path translation argv；translation failure；malformed result；process failure；
-authorized；outside-root；既有 symlink 语义；inaccessible/non-directory；concurrent invocation；
-picker 等待时 health/thread/SSE 可响应；shutdown cleanup；现有 browser fallback；native Linux。
-
-完成 automated tests 后，在真实 Windows + WSL2：
-
-- 在 WSL 启动 production Host，并将当前 Windows-backed repo 配置为 workspace root；
-- Windows browser 打开 localhost，Open Project 应出现 Windows folder dialog；
-- 选择 root 内项目，UI 切换项目，创建 Thread；Agent filesystem/shell 证明 Snapshot 和命令 cwd
-  使用 WSL path；
-- 验证 Cancel、root 外目录拒绝、dialog 打开时 `/api/health` 仍响应；
-- 浏览器部分可用 Playwright；原生窗口选择由真人完成并明确记录，不能声称 Playwright 控制了
-  Windows native UI。
-
-该 workstream 单独提交一个中文 commit，并同步 README 与 Host 设计文档。
-
----
-
-# Workstream B — Coding Harness 内核四阶段升级
+# Coding Harness 内核四阶段升级
 
 ## B0. 不变的责任边界
 
@@ -409,7 +304,7 @@ rtk git diff --check
 - command stdout 绕开统一 EventBuffer/SSE；
 - `apply_patch` 绕开 WorkspaceFilesystem；
 - interactive process 没有 idle/thread/Host shutdown 生命周期；
-- native picker path 绕过 configured roots 或进入 Runtime as Windows path；
+- Host workspace path 未经 canonical containment 检查便进入 Runtime；
 - 为上述能力引入 Agent framework/SDK、Electron/Tauri、provider-hosted execution 或第二套 Runtime。
 
 ## 4. 明确不在范围

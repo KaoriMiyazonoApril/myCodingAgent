@@ -28,6 +28,36 @@ def _client(tmp_path: Path, *roots: Path, dev_mode: bool = False) -> TestClient:
     )
 
 
+def test_workspace_api_without_allowlist_starts_at_host_root(tmp_path) -> None:
+    client = TestClient(
+        create_app(
+            provider_store=ProviderStore(tmp_path / 'providers.json'),
+            model_catalog=_Catalog(),
+            workspace_browser=WorkspaceBrowser(),
+        )
+    )
+
+    response = client.get('/api/workspaces')
+
+    assert response.status_code == 200
+    assert response.json()['path'] == '/'
+    assert response.json()['roots'] == ['/']
+
+
+def test_workspace_selection_reuses_canonical_record(tmp_path) -> None:
+    client = _client(tmp_path, tmp_path)
+
+    first = client.post('/api/workspaces/select', json={'path': str(tmp_path)})
+    second = client.post('/api/workspaces/select', json={'path': str(tmp_path)})
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()['workspace'] == second.json()['workspace']
+    record = first.json()['workspace']
+    assert record['canonical_path'] == str(tmp_path)
+    assert record['display_name'] == tmp_path.name
+
+
 def test_workspace_api_lists_one_level_sorted_directories_and_roots(tmp_path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -61,6 +91,11 @@ def test_workspace_api_lists_one_level_sorted_directories_and_roots(tmp_path) ->
                 "type": "directory",
             },
             {
+                "name": "directory-link",
+                "path": str(first / "a-directory"),
+                "type": "directory",
+            },
+            {
                 "name": "z-directory",
                 "path": str(first / "z-directory"),
                 "type": "directory",
@@ -90,10 +125,10 @@ def test_workspace_api_defaults_to_first_root_and_limits_to_500(tmp_path) -> Non
 @pytest.mark.parametrize(
     ("path_builder", "code"),
     [
-        (lambda root: str(root / "missing"), "WORKSPACE_NOT_FOUND"),
-        (lambda root: str(root.parent / "sibling"), "WORKSPACE_OUTSIDE_ROOT"),
-        (lambda root: f"{root}/child/../", "WORKSPACE_OUTSIDE_ROOT"),
-        (lambda root: f"{root}-prefix", "WORKSPACE_OUTSIDE_ROOT"),
+        (lambda root: str(root / "missing"), "PATH_NOT_FOUND"),
+        (lambda root: str(root.parent / "sibling"), "OUTSIDE_ALLOWED_ROOT"),
+        (lambda root: f"{root}-prefix", "OUTSIDE_ALLOWED_ROOT"),
+        (lambda root: str(root / "bad\x00path"), "INVALID_PATH"),
     ],
 )
 def test_workspace_api_rejects_missing_and_escape_paths(
@@ -115,7 +150,7 @@ def test_workspace_api_rejects_missing_and_escape_paths(
     assert response.json()["error"]["code"] == code
 
 
-def test_workspace_api_rejects_symlink_navigation(tmp_path) -> None:
+def test_workspace_api_rejects_external_symlink_navigation(tmp_path) -> None:
     root = tmp_path / "root"
     outside = tmp_path / "outside"
     root.mkdir()
@@ -128,7 +163,7 @@ def test_workspace_api_rejects_symlink_navigation(tmp_path) -> None:
     )
 
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "WORKSPACE_SYMLINK_NOT_ALLOWED"
+    assert response.json()["error"]["code"] == "OUTSIDE_ALLOWED_ROOT"
 
 
 def test_workspace_api_reports_inaccessible_directory(tmp_path, monkeypatch) -> None:
@@ -149,7 +184,7 @@ def test_workspace_api_reports_inaccessible_directory(tmp_path, monkeypatch) -> 
     )
 
     assert response.status_code == 403
-    assert response.json()["error"]["code"] == "WORKSPACE_NOT_ACCESSIBLE"
+    assert response.json()["error"]["code"] == "PERMISSION_DENIED"
     assert "test denial" not in response.text
 
 

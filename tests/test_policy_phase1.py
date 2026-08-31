@@ -12,6 +12,7 @@ from agent.runtime import (
     ApprovalMode,
     CommandAwarePolicy,
     ExecClassification,
+    ExecutionProfile,
     ModelSettings,
     PolicyDecision,
     PolicyResult,
@@ -117,6 +118,26 @@ def test_non_command_tools_are_allowed_without_risk_classification() -> None:
     )
     assert result.decision is PolicyDecision.ALLOW
     assert result.reason_code == "NON_COMMAND_TOOL"
+
+
+@pytest.mark.parametrize(
+    ("command", "profile"),
+    [
+        ("git status", ExecutionProfile.READ_ONLY),
+        ("pytest -q", ExecutionProfile.WORKSPACE_WRITE),
+        ("curl https://example.test", ExecutionProfile.WORKSPACE_WRITE_NETWORK),
+        ("npm install", ExecutionProfile.WORKSPACE_WRITE_NETWORK),
+    ],
+)
+def test_policy_result_selects_minimum_execution_profile(command, profile) -> None:
+    result = CommandAwarePolicy().decide(_call(command))
+    assert result.execution_profile is profile
+
+
+def test_privileged_command_is_denied_even_when_approval_is_available() -> None:
+    result = CommandAwarePolicy().decide(_call("sudo ls"))
+    assert result.decision is PolicyDecision.DENY
+    assert result.reason_code == "PRIVILEGED_COMMAND_UNSUPPORTED"
 
 
 def test_turn_config_freezes_approval_mode_and_override_does_not_mutate_defaults() -> None:

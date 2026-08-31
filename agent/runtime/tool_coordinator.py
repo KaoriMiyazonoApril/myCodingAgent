@@ -168,12 +168,28 @@ class ToolCoordinator:
             if not await self._request_approval(call, policy_result):
                 return self._denied_result(policy_result, approval_denied=True)
         self._registry.set_event_sink(self._events.emit)
+        execution_profile = policy_result.execution_profile
         self._events.tool_started(call)
         conflict = self._change_tracker.before_execution(call)
         if conflict is not None:
             return conflict
         try:
-            result = await self._controller.wait(self._registry.execute_async(call))
+            execute_async = self._registry.execute_async
+            try:
+                parameters = inspect.signature(execute_async).parameters.values()
+            except (TypeError, ValueError):
+                parameters = ()
+            accepts_profile = any(
+                parameter.name == "execution_profile"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            execution = (
+                execute_async(call, execution_profile=execution_profile)
+                if accepts_profile
+                else execute_async(call)
+            )
+            result = await self._controller.wait(execution)
         except (TurnLimitReached, asyncio.CancelledError):
             self._registry.cancel_active_sessions()
             self._change_tracker.execution_interrupted(call)
