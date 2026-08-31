@@ -39,6 +39,22 @@ def content_fingerprint(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def truncate_utf8(text: str, max_bytes: int, *, marker: str = "\n... output truncated ...") -> tuple[str, bool]:
+    """Return text bounded by UTF-8 bytes without splitting a code point."""
+
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    marker_bytes = marker.encode("utf-8")
+    if len(marker_bytes) >= max_bytes:
+        return marker_bytes[:max_bytes].decode("utf-8", errors="ignore"), True
+    prefix = encoded[: max_bytes - len(marker_bytes)]
+    prefix = prefix.decode("utf-8", errors="ignore").encode("utf-8")
+    return (prefix + marker_bytes).decode("utf-8"), True
+
+
 class ToolOperationError(Exception):
     """An expected local-tool failure with a stable, model-visible code."""
 
@@ -54,6 +70,23 @@ class FileSnapshot:
     exists: bool
     content: bytes | None
     mode: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedTextPage:
+    """One line page whose serialized text is bounded in UTF-8 bytes."""
+
+    content: str
+    total_lines: int
+    relative: str
+    fingerprint: str
+    returned_lines: int
+    start_line: int | None
+    end_line: int | None
+    truncated: bool
+    line_truncated: bool
+    returned_bytes: int
+    original_selected_bytes: int
 
 
 class WorkspaceFilesystem:
@@ -220,6 +253,167 @@ class WorkspaceFilesystem:
             total_lines,
             relative,
             digest.hexdigest(),
+        )
+
+    def read_text_page_bounded(
+        self,
+        raw_path: object,
+        *,
+        offset: int,
+        limit: int,
+        max_output_bytes: int,
+    ) -> BoundedTextPage:
+        """Read a page while bounding the returned serialized UTF-8 text.
+
+        The scanner continues through the selected file after output fills so
+        that line counts, selected source bytes, and the content fingerprint
+        remain truthful.  Only a bounded prefix of a selected line is kept in
+        memory, which prevents one-line/minified files from becoming a hidden
+        context-sized allocation.
+        """
+
+        if max_output_bytes < 1:
+            raise ValueError("max_output_bytes must be positive")
+        target, relative = self._resolve_text_file(raw_path, max_bytes=MAX_TEXT_FILE_BYTES)
+        marker = b"\n... output truncated ..."
+        if max_output_bytes <= len(marker):
+            marker = b"...truncated..."[:max_output_bytes]
+        content_capacity = max(0, max_output_bytes - len(marker))
+
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        digest = hashlib.sha256()
+        output = bytearray()
+        total_lines = 0
+        selected_line_count = 0
+        returned_lines = 0
+        start_line: int | None = None
+        end_line: int | None = None
+        output_truncated = False
+        line_truncated = False
+        original_selected_bytes = 0
+        line_bytes = 0
+        line_capture = bytearray()
+        line_capture_truncated = False
+        skip_lf_after_cr = False
+
+        def current_line_number() -> int:
+            return total_lines + 1
+
+        def append_selected_line(line_number: int, separator_bytes: int) -> None:
+            nonlocal selected_line_count, original_selected_bytes
+            nonlocal returned_lines, start_line, end_line
+            nonlocal output_truncated, line_truncated
+            if not (offset <= line_number < offset + limit):
+                return
+            selected_line_count += 1
+            original_selected_bytes += line_bytes + separator_bytes
+            if output_truncated:
+                return
+
+            prefix = f"{line_number}: ".encode("utf-8")
+            line = prefix + bytes(line_capture)
+            separator = b"\n" if returned_lines else b""
+            # A source line that exceeded the capture budget is necessarily
+            # incomplete even if its formatted prefix would otherwise fit.
+            needs_marker = line_capture_truncated
+            available = content_capacity - len(output) - len(separator)
+            if not needs_marker and len(line) <= available:
+                output.extend(separator)
+                output.extend(line)
+                returned_lines += 1
+                if start_line is None:
+                    start_line = line_number
+                end_line = line_number
+                return
+
+            output_truncated = True
+            line_truncated = True
+            if available <= 0:
+                return
+            # Prefixes are tiny compared with the configured boundary.  If a
+            # caller intentionally supplies a very small boundary, keep the
+            # prefix whole and report only the marker rather than splitting it.
+            if len(prefix) > available:
+                return
+            content_budget = available - len(prefix)
+            clipped = bytes(line_capture[:content_budget])
+            output.extend(separator)
+            output.extend(prefix)
+            output.extend(clipped)
+            returned_lines += 1
+            if start_line is None:
+                start_line = line_number
+            end_line = line_number
+
+        def finish_line(separator_bytes: int) -> None:
+            nonlocal total_lines, line_bytes, line_capture
+            nonlocal line_capture_truncated, skip_lf_after_cr
+            append_selected_line(current_line_number(), separator_bytes)
+            total_lines += 1
+            line_bytes = 0
+            line_capture.clear()
+            line_capture_truncated = False
+            skip_lf_after_cr = False
+
+        def consume(decoded: str) -> None:
+            nonlocal line_bytes, line_capture_truncated, skip_lf_after_cr
+            for character in decoded:
+                encoded = character.encode("utf-8")
+                if skip_lf_after_cr and character == "\n":
+                    skip_lf_after_cr = False
+                    continue
+                skip_lf_after_cr = False
+                if character in _LINE_SEPARATORS:
+                    finish_line(len(encoded))
+                    if character == "\r":
+                        skip_lf_after_cr = True
+                    continue
+                line_bytes += len(encoded)
+                line_number = current_line_number()
+                if offset <= line_number < offset + limit:
+                    if len(line_capture) + len(encoded) <= max_output_bytes:
+                        line_capture.extend(encoded)
+                    else:
+                        line_capture_truncated = True
+
+        try:
+            with target.open("rb") as source:
+                while chunk := source.read(READ_CHUNK_BYTES):
+                    if b"\0" in chunk:
+                        raise ToolOperationError(
+                            "NOT_TEXT", f"file contains NUL bytes: {relative}"
+                        )
+                    digest.update(chunk)
+                    consume(decoder.decode(chunk))
+                consume(decoder.decode(b"", final=True))
+        except UnicodeDecodeError as error:
+            raise ToolOperationError(
+                "NOT_TEXT", f"file is not valid UTF-8: {relative}"
+            ) from error
+        except ToolOperationError:
+            raise
+        except OSError as error:
+            raise ToolOperationError("IO_ERROR", f"could not read file: {relative}") from error
+
+        if line_bytes:
+            finish_line(0)
+        if output_truncated:
+            output.extend(marker[: max(0, max_output_bytes - len(output))])
+        content = bytes(output).decode("utf-8", errors="strict")
+        returned_bytes = len(output)
+        has_more_lines = end_line is not None and end_line < total_lines
+        return BoundedTextPage(
+            content=content,
+            total_lines=total_lines,
+            relative=relative,
+            fingerprint=digest.hexdigest(),
+            returned_lines=returned_lines,
+            start_line=start_line,
+            end_line=end_line,
+            truncated=output_truncated or has_more_lines,
+            line_truncated=line_truncated,
+            returned_bytes=returned_bytes,
+            original_selected_bytes=original_selected_bytes,
         )
 
     def write_text_file(self, raw_path: object, content: object) -> tuple[str, int]:

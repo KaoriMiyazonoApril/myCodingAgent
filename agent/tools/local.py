@@ -11,7 +11,7 @@ from typing import cast
 import regex
 
 from agent.tools.apply_patch import apply_patch
-from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem
+from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem, truncate_utf8
 from agent.tools.process import CommandRunner, CommandSandboxBackend, ProcessManager
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
@@ -24,6 +24,7 @@ MAX_SEARCH_TOTAL_BYTES = 50 * 1024 * 1024
 MAX_SEARCH_LINE_CHARS = 100_000
 MAX_SEARCH_DURATION_SECONDS = 5.0
 REGEX_TIMEOUT_SECONDS = 0.05
+MAX_READ_RETURN_BYTES = 256 * 1024
 
 
 def _object_schema(
@@ -64,23 +65,27 @@ def _read_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) ->
     offset = cast(int, arguments["offset"])
     limit = cast(int, arguments["limit"])
 
-    page, total_lines, relative, fingerprint = filesystem.read_text_page(
-        arguments.get("path"), offset=offset, limit=limit
+    page = filesystem.read_text_page_bounded(
+        arguments.get("path"),
+        offset=offset,
+        limit=limit,
+        max_output_bytes=MAX_READ_RETURN_BYTES,
     )
-    start_line = offset if page else None
-    end_line = offset + len(page) - 1 if page else None
     return ToolResult(
-        content="\n".join(f"{number}: {line}" for number, line in enumerate(page, offset)),
+        content=page.content,
         metadata={
-            "path": relative,
+            "path": page.relative,
             "requested_offset": offset,
             "requested_limit": limit,
-            "returned_lines": len(page),
-            "total_lines": total_lines,
-            "start_line": start_line,
-            "end_line": end_line,
-            "truncated": bool(page) and end_line < total_lines,
-            "content_fingerprint": fingerprint,
+            "returned_lines": page.returned_lines,
+            "total_lines": page.total_lines,
+            "start_line": page.start_line,
+            "end_line": page.end_line,
+            "truncated": page.truncated,
+            "line_truncated": page.line_truncated,
+            "returned_bytes": page.returned_bytes,
+            "original_selected_bytes": page.original_selected_bytes,
+            "content_fingerprint": page.fingerprint,
         },
     )
 
@@ -171,12 +176,16 @@ def _glob(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> Tool
             truncated = True
             break
         matches.append(relative)
+    content, content_truncated = truncate_utf8(
+        "\n".join(matches),
+        MAX_READ_RETURN_BYTES,
+    )
     return ToolResult(
-        content="\n".join(matches),
+        content=content,
         metadata={
             "path": selected_relative,
             "matches": len(matches),
-            "truncated": truncated,
+            "truncated": truncated or content_truncated,
         },
     )
 
@@ -246,15 +255,19 @@ def _grep(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> Tool
                 matches.append((relative, line_number, line))
         if limit_reached:
             break
-    return ToolResult(
-        content="\n".join(
+    content, content_truncated = truncate_utf8(
+        "\n".join(
             f"{relative}:{line_number}: {line}"
             for relative, line_number, line in matches
         ),
+        MAX_READ_RETURN_BYTES,
+    )
+    return ToolResult(
+        content=content,
         metadata={
             "path": selected_relative,
             "matches": len(matches),
-            "truncated": truncated,
+            "truncated": truncated or content_truncated,
         },
     )
 

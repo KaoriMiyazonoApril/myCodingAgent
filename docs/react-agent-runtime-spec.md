@@ -110,6 +110,10 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
   `read_file` 与文件写入会刷新已知内容指纹，外部变化在覆盖前返回 `FILE_CHANGED`，模型
   重新读取后可安全重试。只由文件工具修改的 Turn 报告 `diff_complete = true`；实际执行过
   `run_command` 的 Turn 保守报告 `false`，且不会猜测无法恢复 original 的命令改动文件。
+- Policy/output hardening 已补齐：`CommandAwarePolicy` 在既有 classifier 前以有界
+  `shlex` token 分析解包 `env`、`python`/`python3 -m`、动态解释器和 `xargs`，未知或
+  歧义 wrapper 保守归入需审批/拒绝路径；`read_file` 及 grep/glob/命令组合结果使用
+  UTF-8 byte boundary，超长单行会带截断标记并报告实际返回字节、选中源字节和真实行范围。
 - Workstream B Phase 2 将 `apply_patch` 纳入同一 ChangeTracker seam：一次结构化 patch 的
   多个路径先整体检查版本冲突，再按文档顺序记录 original/final 并发出 `file_changed`；
   patch parser 和 WorkspaceFilesystem 提供无部分修改的预检及提交失败逆序恢复。

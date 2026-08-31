@@ -68,7 +68,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 - Runtime composition is explicit: it constructs shared filesystem and process modules from the configured workspace, injects those modules into tools, then registers tools. No global workspace configuration is introduced.
 - A filesystem module centralizes relative-path normalization, absolute-path rejection, canonical workspace containment, UTF-8 validation, regular-file validation, atomic text replacement, and controlled traversal. It accepts `/` path separators at the tool interface and returns workspace-relative POSIX paths.
 - Absolute paths and any lexical or effective canonical path escaping the workspace are rejected. Existing targets and nearest existing parents are resolved at access time, so internal file and directory aliases remain usable while external aliases are denied with `WORKSPACE_ESCAPE`. Recursive search follows internal aliases without traversing outside the workspace and avoids directory cycles.
-- Text files are strict UTF-8 regular files without NUL bytes and have a 10 MiB direct-read resource limit. Direct reads of directories, missing files, oversized files, binary or non-UTF-8 files, and unsafe paths become structured operational errors. Search traversal skips non-text files and continues with remaining files. New write content containing NUL is rejected as non-text.
+- Text files are strict UTF-8 regular files without NUL bytes and have a 10 MiB direct-read resource limit. Direct reads of directories, missing files, oversized files, binary or non-UTF-8 files, and unsafe paths become structured operational errors. Search traversal skips non-text files and continues with remaining files. New write content containing NUL is rejected as non-text. `read_file` additionally bounds serialized output to 256 KiB, preserving UTF-8 boundaries and reporting `truncated`, `returned_bytes`, `original_selected_bytes`, and truthful returned-line fields.
 - Existing-file writes use a same-directory temporary file plus atomic replacement. When the
   effective target has multiple hard-link names, the existing inode is updated in place so valid
   aliases observe the same change; the previous bytes are retained for write-failure recovery.
@@ -111,7 +111,7 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 
 - Project command execution requires Linux or WSL2 with bubblewrap installed and usable. `run_command` uses its namespace with `/workspace` as the sole persistent mount (read-only or writable according to the execution profile); `/tmp` is ephemeral, other host paths are absent, and the network is shared only for an approved network profile. This is capability isolation, not an approval or intent policy.
 - Model-facing paths should remain workspace-relative POSIX paths even when the runtime executes on Windows. The runtime does not translate arbitrary command syntax between shells.
-- The retained result limit for glob and grep is 200; traversal stops on the 201st match rather than accumulating the full repository result set. Direct text files are limited to 10 MiB, and grep has the additional scan limits documented above. Each command stdout and stderr capture budget is 100 KiB. These are resource limits, not approval or permission decisions, and all non-error truncation is exposed to the model.
+- The retained result limit for glob and grep is 200; traversal stops on the 201st match rather than accumulating the full repository result set. Direct text files are limited to 10 MiB, and grep has the additional scan limits documented above. Serialized grep/glob results are also bounded to 256 KiB. Each command stdout and stderr capture budget is 100 KiB, and its combined tool text is bounded as well. These are resource limits, not approval or permission decisions, and all non-error truncation is exposed to the model.
 - This specification is local by explicit request and has not been published as a GitHub Issue.
 
 ## 当前实现
@@ -150,4 +150,6 @@ Agent 仍缺少一个一致、可测试且不依赖模型供应商的本地能�
 可正常解析，外部 alias 以 `WORKSPACE_ESCAPE` 拒绝，搜索遍历不会进入工作区外目录且会
 避免目录环。`glob` 和 `grep` 最多保留 200 个结果并在确认截断后提前停止，`grep` 还对
 文件数量、单文件/总字节数、行长、总时长和正则匹配时长设置资源边界。`read_file` 流式
-保留请求页，并拒绝超过 10 MiB 的文本文件。命令的每个输出流最多保留 100 KiB 的头尾内容。
+保留请求页，并拒绝超过 10 MiB 的文本文件；返回文本再以 256 KiB UTF-8 byte budget
+截断，超长单行会显式标记且不虚报完整行。`grep`/`glob` 的序列化结果同样受 256 KiB
+边界约束。命令的每个输出流最多保留 100 KiB 的头尾内容，组合后的工具文本也有边界。

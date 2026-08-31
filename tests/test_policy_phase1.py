@@ -41,6 +41,20 @@ def _call(command: str, *, tty: bool = False) -> ToolCallBlock:
         ("pytest -q", ExecClassification.TEST_BUILD),
         ("npm run build", ExecClassification.TEST_BUILD),
         ("python -m my_tool", ExecClassification.ORDINARY_SANDBOXED),
+        ("python -m pip install requests", ExecClassification.PACKAGE_INSTALL),
+        ("python3 -m pip install requests", ExecClassification.PACKAGE_INSTALL),
+        ("env pip install requests", ExecClassification.PACKAGE_INSTALL),
+        ("/usr/bin/env pip install requests", ExecClassification.PACKAGE_INSTALL),
+        ("env FOO=bar rm -rf build", ExecClassification.DESTRUCTIVE),
+        ("python -c 'print(1)'", ExecClassification.DYNAMIC_INTERPRETER),
+        ("python3 -c 'print(1)'", ExecClassification.DYNAMIC_INTERPRETER),
+        ("python -", ExecClassification.DYNAMIC_INTERPRETER),
+        ("python3 -", ExecClassification.DYNAMIC_INTERPRETER),
+        ("xargs rm", ExecClassification.DESTRUCTIVE),
+        ("xargs sh", ExecClassification.INTERACTIVE),
+        ("xargs bash", ExecClassification.INTERACTIVE),
+        ("xargs -n 1 rm", ExecClassification.DESTRUCTIVE),
+        ("xargs", ExecClassification.UNKNOWN),
         ("rm -rf build", ExecClassification.DESTRUCTIVE),
         ("find . -delete", ExecClassification.DESTRUCTIVE),
         ("git branch -D old", ExecClassification.DESTRUCTIVE),
@@ -138,6 +152,23 @@ def test_privileged_command_is_denied_even_when_approval_is_available() -> None:
     result = CommandAwarePolicy().decide(_call("sudo ls"))
     assert result.decision is PolicyDecision.DENY
     assert result.reason_code == "PRIVILEGED_COMMAND_UNSUPPORTED"
+
+
+@pytest.mark.parametrize("mode", [ApprovalMode.UNTRUSTED, ApprovalMode.ON_REQUEST])
+def test_dynamic_interpreter_requires_approval(mode) -> None:
+    result = CommandAwarePolicy().decide(
+        _call("python3 -c 'print(1)'"), approval_mode=mode
+    )
+    assert result.decision is PolicyDecision.REQUIRE_APPROVAL
+    assert result.reason_code == "DYNAMIC_INTERPRETER"
+
+
+def test_dynamic_interpreter_is_denied_in_never_mode() -> None:
+    result = CommandAwarePolicy().decide(
+        _call("python -"), approval_mode=ApprovalMode.NEVER
+    )
+    assert result.decision is PolicyDecision.DENY
+    assert result.reason_code == "DYNAMIC_INTERPRETER_NEVER"
 
 
 def test_turn_config_freezes_approval_mode_and_override_does_not_mutate_defaults() -> None:

@@ -20,7 +20,7 @@ from typing import Any
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem
+from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem, truncate_utf8
 from agent.tools.types import ToolResult
 
 if TYPE_CHECKING:
@@ -667,6 +667,8 @@ class CommandRunner:
         content = (
             f"{status}\nstdout:\n{execution.stdout}\nstderr:\n{execution.stderr}"
         )
+        content, content_truncated = truncate_utf8(content, OUTPUT_LIMIT_BYTES)
+        metadata["content_truncated"] = content_truncated
         return ToolResult(content=content, metadata=metadata, error_code=error_code)
 
 
@@ -864,6 +866,7 @@ class ProcessSession:
             content = stdout
         else:
             content = f"stdout:\n{stdout}\nstderr:\n{stderr}"
+        content, content_truncated = truncate_utf8(content, OUTPUT_LIMIT_BYTES)
         return ToolResult(
             content=content,
             metadata={
@@ -894,6 +897,7 @@ class ProcessSession:
                 "stdout_truncated": self._pending_truncated["stdout"],
                 "stderr_truncated": self._pending_truncated["stderr"],
                 "output_truncated": any(self._pending_truncated.values()),
+                "content_truncated": content_truncated,
             },
             error_code=error_code,
         )

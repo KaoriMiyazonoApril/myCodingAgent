@@ -15,6 +15,7 @@ import pytest
 from agent.core.messages import ToolCallBlock
 from agent.runtime.policy import ExecutionProfile
 from agent.tools.local import create_local_tool_registry
+from agent.tools.local import MAX_READ_RETURN_BYTES
 from agent.tools.filesystem import WorkspaceFilesystem, content_fingerprint
 from agent.tools.process import (
     BubblewrapSandboxBackend,
@@ -281,6 +282,9 @@ def test_read_file_returns_numbered_page_and_metadata(tmp_path) -> None:
         "start_line": 2,
         "end_line": 2,
         "truncated": True,
+        "line_truncated": False,
+        "returned_bytes": len("2: second".encode("utf-8")),
+        "original_selected_bytes": len("second\n".encode("utf-8")),
         "content_fingerprint": content_fingerprint(b"first\nsecond\nthird\n"),
     }
 
@@ -877,6 +881,55 @@ def test_read_file_rejects_files_beyond_its_resource_limit(tmp_path, monkeypatch
     )
 
     assert result.error_code == "FILE_TOO_LARGE"
+
+
+def test_read_file_bounds_a_single_multimegabyte_line_by_utf8_bytes(tmp_path) -> None:
+    source = ("界" * (MAX_READ_RETURN_BYTES * 4)) + "\nsecond"
+    (tmp_path / "minified.txt").write_text(source, encoding="utf-8")
+    registry = create_test_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="call_bounded_read",
+            name="read_file",
+            arguments={"path": "minified.txt", "limit": 2},
+        )
+    )
+
+    returned = result.content.encode("utf-8")
+    assert result.error_code is None
+    assert len(returned) <= MAX_READ_RETURN_BYTES
+    assert result.metadata["truncated"] is True
+    assert result.metadata["line_truncated"] is True
+    assert result.metadata["returned_bytes"] == len(returned)
+    assert result.metadata["original_selected_bytes"] == len(source.encode("utf-8"))
+    assert result.metadata["returned_lines"] == 1
+    assert result.metadata["start_line"] == 1
+    assert result.metadata["end_line"] == 1
+    assert "truncated" in result.content
+
+
+def test_read_file_byte_boundary_does_not_split_utf8_or_claim_unreturned_lines(
+    tmp_path,
+) -> None:
+    source = "前" * (MAX_READ_RETURN_BYTES // 3) + "\nsecond\nthird"
+    (tmp_path / "unicode.txt").write_text(source, encoding="utf-8")
+    registry = create_test_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="call_unicode_bounded_read",
+            name="read_file",
+            arguments={"path": "unicode.txt", "limit": 3},
+        )
+    )
+
+    assert result.error_code is None
+    result.content.encode("utf-8")
+    assert result.metadata["returned_bytes"] == len(result.content.encode("utf-8"))
+    assert result.metadata["end_line"] == 1
+    assert result.metadata["line_truncated"] is True
+    assert result.metadata["total_lines"] == 3
 
 
 def test_write_overwrite_preserves_mode_and_edit_failure_is_immutable(tmp_path) -> None:

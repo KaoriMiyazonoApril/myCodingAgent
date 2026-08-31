@@ -92,7 +92,13 @@ class ExecClassification(str, Enum):
     PRIVILEGED = "privileged"
     INTERACTIVE = "interactive"
     COMPLEX_SHELL = "complex_shell"
+    DYNAMIC_INTERPRETER = "dynamic_interpreter"
     UNKNOWN = "unknown"
+
+    # Wrapper analysis deliberately has no separate ``allow`` path for an
+    # ambiguous wrapper.  Keeping this alias makes the conservative outcome
+    # explicit to callers while preserving the existing UNKNOWN contract.
+    AMBIGUOUS_WRAPPER = UNKNOWN
 
     SAFE = SAFE_READ_ONLY
     ORDINARY = ORDINARY_SANDBOXED
@@ -149,6 +155,76 @@ def classify_exec_command(command: str) -> ExecClassification:
     if not tokens:
         return ExecClassification.UNKNOWN
 
+    return _classify_tokens(tokens)
+
+
+def _classify_tokens(tokens: list[str], *, depth: int = 0) -> ExecClassification:
+    """Classify one tokenized command, recursively unwrapping safe wrappers.
+
+    This is intentionally a bounded token analysis rather than a shell
+    parser.  A wrapper is only removed when its target can be identified
+    unambiguously; otherwise UNKNOWN reaches the normal approval matrix.
+    """
+
+    if not tokens or depth > 4:
+        return ExecClassification.UNKNOWN
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    if executable == "env":
+        target = _env_target(tokens[1:])
+        return (
+            ExecClassification.UNKNOWN
+            if target is None
+            else _classify_tokens(target, depth=depth + 1)
+        )
+    if executable in {"python", "python3"}:
+        return _classify_python(tokens, depth=depth)
+    if executable == "xargs":
+        target = _xargs_target(tokens[1:])
+        return (
+            ExecClassification.UNKNOWN
+            if target is None
+            else _classify_tokens(target, depth=depth + 1)
+        )
+
+    return _classify_direct(tokens)
+
+
+def _classify_python(tokens: list[str], *, depth: int) -> ExecClassification:
+    """Recognize Python's dynamic modes and classify ``-m`` targets."""
+
+    args = [token.lower() for token in tokens[1:]]
+    if any(argument == "-c" for argument in args):
+        return ExecClassification.DYNAMIC_INTERPRETER
+    # ``python -`` reads source from stdin.  It is dynamic even when options
+    # precede the stdin marker, so do not reduce it to ordinary execution.
+    if any(argument == "-" for argument in args):
+        return ExecClassification.DYNAMIC_INTERPRETER
+    for index, argument in enumerate(args):
+        if argument == "-m":
+            if index + 1 >= len(args):
+                return ExecClassification.UNKNOWN
+            module = args[index + 1]
+            module_args = tokens[index + 3 :]
+            if module in {"pip", "pip3", "pipx", "npm", "yarn", "pnpm"}:
+                return _classify_tokens(
+                    [module, *module_args],
+                    depth=depth + 1,
+                )
+            if module in {
+                "pytest", "py.test", "tox", "nox", "ruff", "flake8",
+                "mypy", "pyright", "unittest",
+            }:
+                return ExecClassification.TEST_BUILD
+            # An explicit module is ordinary interpreter execution unless it
+            # contains a shell-control token (which the outer source scan
+            # already catches for unquoted operators).
+            return ExecClassification.ORDINARY_SANDBOXED
+    return _classify_direct(tokens)
+
+
+def _classify_direct(tokens: list[str]) -> ExecClassification:
+    """Classify an already unwrapped executable using the existing matrix."""
+
     executable = tokens[0].rsplit("/", 1)[-1].lower()
     args = [token.lower() for token in tokens[1:]]
     if executable in _DESTRUCTIVE_EXECUTABLES:
@@ -198,6 +274,104 @@ def classify_exec_command(command: str) -> ExecClassification:
     if executable == "eval":
         return ExecClassification.COMPLEX_SHELL
     return ExecClassification.ORDINARY_SANDBOXED
+
+
+_ENV_FLAG_OPTIONS = frozenset({
+    "-i",
+    "--ignore-environment",
+    "-0",
+})
+_ENV_VALUE_OPTIONS = frozenset({
+    "-u",
+    "--unset",
+})
+
+
+def _env_target(tokens: list[str]) -> list[str] | None:
+    """Return the command after a reliably parsed ``env`` prefix."""
+
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if _is_env_assignment(token):
+            index += 1
+            continue
+        if token in _ENV_FLAG_OPTIONS:
+            index += 1
+            continue
+        if token in _ENV_VALUE_OPTIONS:
+            if index + 1 >= len(tokens):
+                return None
+            index += 2
+            continue
+        if token.startswith("--unset="):
+            if not token.removeprefix("--unset="):
+                return None
+            index += 1
+            continue
+        if token.startswith("-"):
+            # Unknown options may alter how following tokens are interpreted.
+            return None
+        break
+    return tokens[index:] or None
+
+
+def _is_env_assignment(token: str) -> bool:
+    name, separator, _ = token.partition("=")
+    return bool(
+        separator
+        and name
+        and (name[0].isalpha() or name[0] == "_")
+        and all(character.isalnum() or character == "_" for character in name)
+    )
+
+
+_XARGS_FLAG_OPTIONS = frozenset({
+    "-0", "--null", "-r", "--no-run-if-empty", "-t", "--verbose",
+    "-p", "--interactive", "-o", "--open-tty", "--show-limits",
+})
+_XARGS_VALUE_OPTIONS = frozenset({
+    "-a", "--arg-file", "-d", "--delimiter", "-e", "-E", "--eof",
+    "-I", "--replace", "-L", "--max-lines", "-n", "--max-args",
+    "-P", "--max-procs", "-s", "--max-chars", "--process-slot-var",
+})
+
+
+def _xargs_target(tokens: list[str]) -> list[str] | None:
+    """Return a known xargs target, or None for an ambiguous invocation."""
+
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if not token.startswith("-") or token == "-":
+            break
+        if token in _XARGS_FLAG_OPTIONS:
+            index += 1
+            continue
+        if token in _XARGS_VALUE_OPTIONS:
+            if index + 1 >= len(tokens):
+                return None
+            index += 2
+            continue
+        if token.startswith("--"):
+            option, separator, value = token.partition("=")
+            if option not in _XARGS_VALUE_OPTIONS or not separator or not value:
+                return None
+            index += 1
+            continue
+        # Common short options may carry their value in the same token (for
+        # example -n1 and -I{}).  Unknown clusters stay conservative.
+        if len(token) >= 3 and token[:2] in _XARGS_VALUE_OPTIONS:
+            index += 1
+            continue
+        return None
+    return tokens[index:] or None
 
 
 classify_command = classify_exec_command
@@ -339,6 +513,7 @@ class CommandAwarePolicy:
             ExecClassification.PRIVILEGED,
             ExecClassification.INTERACTIVE,
             ExecClassification.COMPLEX_SHELL,
+            ExecClassification.DYNAMIC_INTERPRETER,
             ExecClassification.UNKNOWN,
         }
     )
@@ -437,6 +612,7 @@ def _reason_code(classification: ExecClassification) -> str:
         ExecClassification.PRIVILEGED: "PRIVILEGED_COMMAND",
         ExecClassification.INTERACTIVE: "INTERACTIVE_COMMAND",
         ExecClassification.COMPLEX_SHELL: "COMPLEX_SHELL",
+        ExecClassification.DYNAMIC_INTERPRETER: "DYNAMIC_INTERPRETER",
         ExecClassification.UNKNOWN: "UNKNOWN_COMMAND",
     }[classification]
 
