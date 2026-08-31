@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 from fastapi.testclient import TestClient
 
@@ -234,6 +235,113 @@ def test_thread_creation_exposes_frozen_approval_mode(tmp_path) -> None:
     settings = response.json()["thread"]["snapshot"]["settings"]
     assert settings["approval_mode"] == ApprovalMode.NEVER.value
     assert calls[0].approval_mode is ApprovalMode.NEVER
+
+
+def test_production_host_restores_thread_catalog_after_restart(tmp_path) -> None:
+    provider_store = _configured_store(tmp_path / "providers.json")
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    state_dir = tmp_path / "state"
+
+    first_app = create_app(
+        provider_store=provider_store,
+        model_catalog=_Catalog(),
+        workspace_browser=WorkspaceBrowser([tmp_path]),
+        state_dir=state_dir,
+    )
+    with TestClient(first_app) as client:
+        workspace_id = _workspace_id(client, workspace)
+        created = client.post(
+            "/api/threads",
+            json={"workspace_id": workspace_id},
+        )
+        assert created.status_code == 201
+        thread = created.json()["thread"]
+        thread_id = thread["snapshot"]["thread_id"]
+        settings = client.patch(
+            f"/api/threads/{thread_id}/settings",
+            json={
+                "expected_version": 0,
+                "provider_config_id": "deepseek",
+                "model": "deepseek-chat",
+                "approval_mode": "never",
+            },
+        )
+        assert settings.status_code == 200
+
+    second_app = create_app(
+        provider_store=provider_store,
+        model_catalog=_Catalog(),
+        workspace_browser=WorkspaceBrowser([tmp_path]),
+        state_dir=state_dir,
+    )
+    with TestClient(second_app) as client:
+        listed = client.get("/api/threads")
+        reopened = client.get(f"/api/threads/{thread_id}")
+
+    assert listed.status_code == 200
+    assert [item["snapshot"]["thread_id"] for item in listed.json()["threads"]] == [
+        thread_id
+    ]
+    restored = reopened.json()["thread"]
+    assert restored["snapshot"]["workspace"] == str(workspace)
+    assert restored["snapshot"]["settings"]["version"] == 1
+    assert restored["snapshot"]["settings"]["approval_mode"] == "never"
+    assert restored["event_cursor"] is not None
+
+
+def test_restored_deleted_workspace_is_listable_but_turn_is_unavailable(
+    tmp_path,
+) -> None:
+    provider_store = _configured_store(tmp_path / "providers.json")
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    state_dir = tmp_path / "state"
+
+    first_app = create_app(
+        provider_store=provider_store,
+        model_catalog=_Catalog(),
+        workspace_browser=WorkspaceBrowser([tmp_path]),
+        state_dir=state_dir,
+    )
+    with TestClient(first_app) as client:
+        workspace_id = _workspace_id(client, workspace)
+        created = client.post(
+            "/api/threads",
+            json={"workspace_id": workspace_id},
+        )
+        assert created.status_code == 201
+        thread_id = created.json()["thread"]["snapshot"]["thread_id"]
+    workspace.rmdir()
+
+    second_app = create_app(
+        provider_store=provider_store,
+        model_catalog=_Catalog(),
+        workspace_browser=WorkspaceBrowser([tmp_path]),
+        state_dir=state_dir,
+    )
+    with TestClient(second_app) as client:
+        listed = client.get("/api/threads")
+        restored = client.get(f"/api/threads/{thread_id}")
+        started = client.post(
+            f"/api/threads/{thread_id}/turns",
+            json={"message": "must not run"},
+        )
+        for _ in range(100):
+            failure = client.get(f"/api/threads/{thread_id}").json()["thread"][
+                "host_error"
+            ]
+            if failure is not None:
+                break
+            time.sleep(0.01)
+
+    assert listed.status_code == 200
+    assert listed.json()["threads"][0]["workspace"]["path"] == str(workspace)
+    assert restored.status_code == 200
+    assert restored.json()["thread"]["snapshot"]["workspace"] == str(workspace)
+    assert started.status_code == 202
+    assert failure is not None
+    assert failure["code"] == "WORKSPACE_UNAVAILABLE"
 
 
 def test_approval_resolution_uses_runtime_and_reports_stale_request(tmp_path) -> None:

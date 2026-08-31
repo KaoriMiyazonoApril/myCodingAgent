@@ -3,10 +3,12 @@
 from .errors import (
     ContextLimitError,
     IdempotencyConflictError,
+    IdempotencyInterruptedError,
     SettingsConflictError,
     ThreadBusyError,
     ThreadClosedError,
     UnsafeWorkspaceError,
+    WorkspaceUnavailableError,
     UnsupportedModelSettingError,
     WorkspaceBusyError,
     WorkspaceValidationLimitError,
@@ -40,6 +42,21 @@ from .settings import (
     TurnSettingsOverride,
 )
 from .thread_runtime import ThreadRuntime
+from .thread_store import (
+    DEFAULT_DATABASE_FILENAME,
+    STORE_SCHEMA_VERSION,
+    InMemoryThreadStore,
+    LocalThreadStore,
+    StoredActiveTurn,
+    StoredIdempotency,
+    ThreadState,
+    ThreadStore,
+    ThreadStoreError,
+    default_database_path,
+    default_state_directory,
+    deserialize_thread_state,
+    serialize_thread_state,
+)
 from .types import SCHEMA_VERSION, ThreadSnapshot, ThreadStatus, TurnStatus, TurnSummary
 
 __all__ = [
@@ -57,9 +74,11 @@ __all__ = [
     "CommandClassification",
     "ContextLimitError",
     "IdempotencyConflictError",
+    "IdempotencyInterruptedError",
     "ThreadBusyError",
     "ThreadClosedError",
     "UnsafeWorkspaceError",
+    "WorkspaceUnavailableError",
     "PromptBuilder",
     "PolicyDecision",
     "PolicyContext",
@@ -84,4 +103,17 @@ __all__ = [
     "TurnStatus",
     "TurnSummary",
     "ToolPolicy",
+    "ThreadStore",
+    "ThreadState",
+    "StoredActiveTurn",
+    "StoredIdempotency",
+    "InMemoryThreadStore",
+    "LocalThreadStore",
+    "ThreadStoreError",
+    "STORE_SCHEMA_VERSION",
+    "DEFAULT_DATABASE_FILENAME",
+    "default_state_directory",
+    "default_database_path",
+    "serialize_thread_state",
+    "deserialize_thread_state",
 ]

@@ -13,7 +13,11 @@ from pathlib import Path
 import stat
 import time
 
-from .errors import UnsafeWorkspaceError, WorkspaceValidationLimitError
+from .errors import (
+    UnsafeWorkspaceError,
+    WorkspaceUnavailableError,
+    WorkspaceValidationLimitError,
+)
 
 
 def mounted_paths() -> frozenset[Path]:
@@ -103,7 +107,9 @@ class WorkspaceValidator:
 
         try:
             metadata = os.stat(workspace, follow_symlinks=True)
+        except (FileNotFoundError, NotADirectoryError, PermissionError) as error:
+            raise WorkspaceUnavailableError("workspace root is not accessible") from error
         except OSError as error:
             raise UnsafeWorkspaceError("workspace root is not accessible") from error
         if not stat.S_ISDIR(metadata.st_mode):
-            raise UnsafeWorkspaceError("workspace root is not a regular directory")
+            raise WorkspaceUnavailableError("workspace root is not a directory")

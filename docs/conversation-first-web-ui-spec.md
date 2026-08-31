@@ -12,7 +12,7 @@
 
 所有用户界面文案、状态、按钮、提示与无障碍标签使用中文。Provider 名称、模型 ID、文件路径、工具原始标识、代码、Diff、终端输出和错误代码作为技术数据保持原值；工具在普通界面显示中文友好名称，并在展开详情中保留原始标识。
 
-Conversation 标题由前端根据第一条用户消息确定性生成，不新增 Host/API title 字段。无消息时使用“新对话”作为 fallback；有消息后清理连续空白并截断为适合导航和标题栏的短文本。标题可从 Thread Snapshot 重建，因此刷新后稳定，但本轮不实现独立 Session/title persistence。
+Conversation 标题由前端根据第一条用户消息确定性生成，不新增 Host/API title 字段。无消息时使用“新对话”作为 fallback；有消息后清理连续空白并截断为适合导航和标题栏的短文本。标题可从 Thread Snapshot 重建，因此刷新后稳定；本轮仍不实现独立 Session/title persistence，Thread 的 canonical state 则由 Runtime ThreadStore 按其独立规格持久化。
 
 ## User Stories
 
@@ -114,7 +114,8 @@ Conversation 标题由前端根据第一条用户消息确定性生成，不新�
 
 ## Out of Scope
 
-- Session, Conversation-title, or database persistence beyond reconstructing display state from the existing in-memory Thread Snapshot.
+- Session 或 Conversation-title 的独立字段持久化仍不在本轮范围；Thread 的 canonical state
+  与事件持久化由 Runtime ThreadStore 负责，前端只从 hydratable Snapshot 重建显示状态。
 - Approval UI or approval-policy changes.
 - Sandbox redesign, native Windows Host, remote deployment, multi-user, multi-agent, worktree, or token streaming.
 - New Agent Loop, Runtime, event protocol, provider backend architecture, DSH plugin/Cordis/slot architecture, or provider-hosted execution.

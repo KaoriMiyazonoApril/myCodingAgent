@@ -309,6 +309,6 @@ rtk git diff --check
 
 ## 4. 明确不在范围
 
-不实现 native Windows Host、远程部署、多用户、多 Agent、持久化 conversation/session、完整 Bash parser、
+不实现 native Windows Host、远程部署、多用户、多 Agent、独立 session/PTY 持久化、完整 Bash parser、
 新的 sandbox 产品、Provider-hosted filesystem/command、Electron/Tauri、Browser File System Access 作为 Agent
 filesystem、UI redesign 或 Agent framework/SDK。

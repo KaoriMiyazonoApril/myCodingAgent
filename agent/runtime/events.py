@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -170,6 +171,18 @@ class EventBatch:
         return asdict(self)
 
 
+_TRANSIENT_EVENT_TYPES = frozenset(
+    {
+        "model_text_delta",
+        "model_reasoning_delta",
+        "model_tool_call_delta",
+        "model_message_end",
+        "model_error",
+        "command_output_delta",
+    }
+)
+
+
 class EventSubscription:
     """A bounded wake-only subscription over an :class:`EventBuffer`."""
 
@@ -252,15 +265,48 @@ class EventSubscription:
 class EventBuffer:
     """Drop oldest events at capacity instead of back-pressuring the Agent."""
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(
+        self,
+        capacity: int,
+        *,
+        events: list[AgentEvent] | tuple[AgentEvent, ...] = (),
+        initial_sequence: int | None = None,
+    ) -> None:
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
             raise ValueError("event_buffer_capacity must be a positive integer")
         self._events: deque[AgentEvent] = deque(maxlen=capacity)
-        self._thread_sequence = 0
+        self._thread_sequence = max(
+            0,
+            max((event.sequence for event in events), default=0),
+            0 if initial_sequence is None else initial_sequence,
+        )
         self._subscriptions: set[EventSubscription] = set()
+        self._durable_sink: Callable[[AgentEvent], object] | None = None
+        for event in events:
+            self._events.append(event)
+
+    def set_durable_sink(self, sink: Callable[[AgentEvent], object] | None) -> None:
+        """Mirror semantic events to storage without persisting stream deltas."""
+
+        self._durable_sink = sink
+
+    @property
+    def thread_sequence(self) -> int:
+        """Latest Thread-scoped event sequence, including retained events."""
+
+        return self._thread_sequence
+
+    def next_sequence(self) -> int:
+        """Allocate one monotonic sequence for any Thread event emitter."""
+
+        self._thread_sequence += 1
+        return self._thread_sequence
 
     def append(self, event: AgentEvent) -> None:
+        self._thread_sequence = max(self._thread_sequence, event.sequence)
         self._events.append(event)
+        if self._durable_sink is not None and event.type not in _TRANSIENT_EVENT_TYPES:
+            self._durable_sink(event)
         for subscription in tuple(self._subscriptions):
             subscription._notify()
 
@@ -295,13 +341,12 @@ class EventBuffer:
     ) -> AgentEvent:
         """Append an event whose lifecycle scope is the Thread, not one Turn."""
 
-        self._thread_sequence += 1
         event = AgentEvent(
             schema_version=SCHEMA_VERSION,
             event_id=str(uuid4()),
             thread_id=thread_id,
             turn_id=None,
-            sequence=self._thread_sequence,
+            sequence=self.next_sequence(),
             type=event_type,
             timestamp=utc_now(),
             payload=json_safe(payload),
@@ -348,16 +393,14 @@ class TurnEventEmitter:
         self._turn_id = turn_id
         self._buffer = buffer
         self._reasoning_visibility = reasoning_visibility
-        self._sequence = 0
 
     def emit(self, event_type: str, payload: dict[str, Any]) -> AgentEvent:
-        self._sequence += 1
         event = AgentEvent(
             schema_version=SCHEMA_VERSION,
             event_id=str(uuid4()),
             thread_id=self._thread_id,
             turn_id=self._turn_id,
-            sequence=self._sequence,
+            sequence=self._buffer.next_sequence(),
             type=event_type,
             timestamp=utc_now(),
             payload=json_safe(payload),

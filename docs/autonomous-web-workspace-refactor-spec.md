@@ -44,7 +44,8 @@ must follow the Policy result that authorized a command.
   no duplicate Runtime Workspace class is introduced. Host Thread views expose
   the matching Workspace metadata so the frontend can recover after refresh or
   thread switch.
-- Workspace and Thread persistence remain in-memory in this version.
+- Host Workspace records remain process-local in this refactor. Durable Thread state is owned by
+  the Runtime ThreadStore and is documented in `docs/thread-persistence.md`.
 
 ### Module data flow
 
@@ -256,7 +257,8 @@ Host WorkspaceBrowser -> Host Workspace record
 ## Explicit out of scope
 
 - WebSocket replacement for SSE.
-- Thread or Workspace persistence across Host restart.
+- Durable Workspace picker records across Host restart (the canonical path is retained in each
+  persisted Thread, but the Host selection ID is reconstructed).
 - Context compaction or history summarization.
 - A general file manager (file preview, rename, move, delete, upload, favorites,
   or OS-native dialogs).

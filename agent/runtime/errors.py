@@ -25,6 +25,12 @@ class UnsafeWorkspaceError(RuntimeError):
     code = "UNSAFE_WORKSPACE"
 
 
+class WorkspaceUnavailableError(UnsafeWorkspaceError):
+    """A persisted workspace no longer exists or cannot be accessed."""
+
+    code = "WORKSPACE_UNAVAILABLE"
+
+
 class WorkspaceValidationLimitError(RuntimeError):
     """A complete workspace scan exceeded its configured resource budget."""
 
@@ -41,6 +47,12 @@ class IdempotencyConflictError(RuntimeError):
     """An idempotency key was reused for a different Turn submission."""
 
     code = "IDEMPOTENCY_CONFLICT"
+
+
+class IdempotencyInterruptedError(RuntimeError):
+    """A persisted idempotent submission was interrupted by a restart."""
+
+    code = "IDEMPOTENCY_INTERRUPTED"
 
 
 class SettingsConflictError(RuntimeError):

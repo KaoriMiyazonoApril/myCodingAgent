@@ -14,7 +14,7 @@ from agent.host.provider_config import ProviderStore
 from agent.host.workspace import WorkspaceBrowser
 from agent.model.provider import LLMProvider
 from agent.model.types import LLMRequest, LLMResponse, Usage
-from agent.runtime import ModelSettings, ThreadRuntime
+from agent.runtime import AllowAllPolicy, ModelSettings, ThreadRuntime
 from agent.tools.registry import ToolRegistry
 from tests.sandbox_support import create_test_tool_registry
 
@@ -264,6 +264,7 @@ def test_host_runs_real_runtime_local_tools_and_returns_recoverable_diff(
             tool_registry_factory=create_test_tool_registry,
             provider_resolver=lambda provider_id, model: provider,
             default_settings=default_settings,
+            tool_policy=AllowAllPolicy(),
         )
 
     app = create_app(

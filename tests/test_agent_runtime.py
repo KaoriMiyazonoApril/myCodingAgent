@@ -1186,6 +1186,7 @@ def test_acceptance_read_edit_test_and_diff_loop_uses_real_local_tools(
     runtime = runtime_for_provider(
         provider,
         tool_registry_factory=create_test_tool_registry,
+        tool_policy=AllowAllPolicy(),
     )
     thread = runtime.create_thread(tmp_path)
 
@@ -1230,6 +1231,7 @@ def test_acceptance_failed_validation_is_returned_to_the_model_and_reported(
     runtime = runtime_for_provider(
         provider,
         tool_registry_factory=create_test_tool_registry,
+        tool_policy=AllowAllPolicy(),
     )
     thread = runtime.create_thread(tmp_path)
 

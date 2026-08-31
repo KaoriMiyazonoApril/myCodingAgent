@@ -2,7 +2,8 @@
 
 ## Problem Statement
 
-项目已经具备以 `ThreadRuntime` 为最高外部 seam 的内存态 Coding Agent Runtime，能够创建
+项目已经具备以 `ThreadRuntime` 为最高外部 seam 的 Coding Agent Runtime，既支持内存态
+嵌入也支持由 ThreadStore 驱动的持久化，能够创建
 Thread、运行阻塞至终态的 Turn、读取 Snapshot 与事件、取消 Turn、更新设置、关闭 Thread，
 并通过本地工具、Policy、Conversation 和模型连接层完成 ReAct 闭环。当前缺少面向普通用户的
 本地应用入口：用户只能通过 Python 代码组合这些模块，无法在浏览器中选择 Host 文件系统里的
@@ -16,8 +17,9 @@ Provider 配置、受限 workspace 浏览和生产静态资源。
 
 该能力必须保持现有依赖方向和课程约束。Web UI 不得绕过 `ThreadRuntime` 依赖 AgentLoop、
 ToolCoordinator、具体 Provider 或具体工具实现；Host 不得复制 Agent 状态或重新实现 Agent
-推理、工具执行与 Conversation 规则。第一版仍是可信本机单用户、单进程、内存态 Thread，
-重点是打通可观察、可取消、可恢复的本地纵向链路，而不是扩展成远程多用户平台或完整 IDE。
+推理、工具执行与 Conversation 规则。Host 生产模式在用户状态目录使用 SQLite 持久化
+Thread 历史；Runtime 仍支持 InMemoryThreadStore 的单进程嵌入模式。重点是打通可观察、
+可取消、可恢复的本地纵向链路，而不是扩展成远程多用户平台或完整 IDE。
 
 ## Solution
 
@@ -126,7 +128,10 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Workstream B Phase 1 已形成最小审批接线：Host 暴露 Runtime 的 approval resolution command，
   前端只展示 `approval_requested` 的稳定 reason 与 approve/deny 操作；Policy 决策和风险判断
   仍完全属于 Runtime，Web 不自行复算。
-- Thread and event persistence remain in memory. Provider credentials and default Provider/model selection are the only durable local application settings in V1.
+- Runtime persistence is owned by ThreadStore. Production Host uses LocalThreadStore in the
+  user state directory; InMemoryThreadStore remains available for tests and ephemeral embedding.
+  Provider credentials stay in the Host configuration store, and are never copied into Thread
+  rows, events, or canonical messages.
 
 ### Deep modules and seams
 
@@ -169,12 +174,20 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 
 ### Host lifecycle and Thread catalog
 
-- The Host owns an in-memory catalog of Thread IDs it created because Runtime has no enumeration interface. For every ID, Runtime Snapshot remains the source of Thread status, messages, settings, and latest Turn.
-- Closed Threads remain in the catalog and are returned as read-only until process shutdown. Closing is explicit and idempotent; it is not represented as deletion or persistence.
+- The Host catalog is derived from Runtime list_threads snapshots. Production Runtime hydrates
+  that list from LocalThreadStore on first catalog/read access, while injected ephemeral
+  runtimes may keep the process-local catalog behavior. Runtime Snapshot remains the source of
+  Thread status, messages, settings, and latest Turn.
+- Closed Threads remain in the catalog and are returned as read-only. Process shutdown closes
+  ephemeral resources but does not mark every durable Thread closed; only an explicit close is a
+  permanent lifecycle transition.
 - `TurnTaskManager` registers a submission before scheduling `run_turn`, rejects a second submission for that Thread, creates the background task, consumes its result/exception, and removes the mapping on every terminal path.
 - Turn POST returns HTTP 202 with accepted status. While preflight is pending, Thread view adds a separate Host `submission.status = starting`; this is transport lifecycle rather than Agent state.
 - Pending cancellation cancels the scheduled task. Once Runtime reports an active Turn, cancellation delegates to `cancel_turn`. Closing an active Thread follows Runtime close/cancel semantics and awaits task cleanup.
-- Server shutdown stops accepting mutating commands, cancels pending and active Turns, awaits TaskManager cleanup, closes every Thread and Provider resource, and has a ten-second grace period. A timeout is logged and causes a non-zero exit.
+- Server shutdown stops accepting mutating commands, cancels pending and active Turns, awaits
+  TaskManager cleanup, closes ephemeral Thread/Provider/Store resources, and has a ten-second
+  grace period. A timeout is logged and causes a non-zero exit. Durable Thread history remains
+  resumable across the next Host process.
 
 ### Workspace browsing
 
@@ -272,8 +285,11 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Approval endpoints, Approval Card, dangerous-command classification, or a new production ToolPolicy.
 - Live command stdout/stderr streaming, or provider-hosted execution.
 - WebSocket, Electron, Tauri, PTY, xterm.js, Monaco IDE, drag-and-drop filesystem access, or browser File System API workspace selection.
-- Thread, Turn, event, conversation, diff, or task persistence across Host restarts; database-backed sessions; command reattachment beyond the in-memory per-Thread `ProcessManager` lifecycle.
-- Authentication, TLS, remote access, multi-user operation, cloud deployment, distributed Host instances, or cross-process coordination.
+Live process/PTY/approval-future reattachment, streaming assembler recovery, and cross-process
+coordination remain out of scope. Durable Thread, Turn, canonical Conversation, semantic
+event, diff, settings, and idempotency history is supported through the Runtime ThreadStore.
+The Host does not provide cloud sync, distributed locking, or multi-user storage.
+Authentication, TLS, remote access, multi-user operation, and cloud deployment remain out of scope.
 - Custom Provider base URLs, OpenRouter, Ollama, LM Studio, arbitrary OpenAI-compatible endpoints, multiple accounts per Provider, multiple API keys, key rotation, OAuth, or system keyring integration.
 - Provider pricing/capability registries, paid compatibility probes, automatic tool-calling verification, or a Cherry Studio-scale Provider catalog.
 - Context compression, session branching, concurrent Turns in one Thread, Turn queues, mid-Turn steering, multi-agent UI, subagent UI, or plugin UI.

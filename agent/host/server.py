@@ -42,6 +42,8 @@ def build_web_app(
     *,
     workspace_roots: Sequence[str] = (),
     dev: bool = False,
+    state_dir: Path | None = None,
+    database_path: Path | None = None,
 ):
     """Compose a development or production app without starting a socket."""
 
@@ -55,6 +57,8 @@ def build_web_app(
         workspace_browser=WorkspaceBrowser(roots),
         dev_mode=dev,
         static_dir=static_dir,
+        state_dir=state_dir,
+        database_path=database_path,
     )
 
 
@@ -63,10 +67,17 @@ def run_web(
     port: int = DEFAULT_PORT,
     workspace_roots: Sequence[str] = (),
     dev: bool = False,
+    state_dir: Path | None = None,
+    database_path: Path | None = None,
 ) -> int:
     """Start the loopback-only Agent Host and block until shutdown."""
 
-    app = build_web_app(workspace_roots=workspace_roots, dev=dev)
+    app = build_web_app(
+        workspace_roots=workspace_roots,
+        dev=dev,
+        state_dir=state_dir,
+        database_path=database_path,
+    )
     roots = app.state.workspace_browser.roots
     print(f"Agent Web UI:\nhttp://{LOOPBACK_HOST}:{port}")
     print("Workspace roots:")

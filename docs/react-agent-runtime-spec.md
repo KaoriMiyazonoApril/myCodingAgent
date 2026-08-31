@@ -31,11 +31,22 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 调用方通过 Runtime 获取结构化 Snapshot、阶段级事件和 Turn Summary，无需理解这些内部
 实现。
 
-第一版状态全部保存在内存中。核心对象设计为 JSON 可序列化数据，现由独立 Host 通过 REST
-接收命令、由 SSE 转发事件。HTTP adapter 与 React 前端不进入 Runtime 模块；数据库和上下文
-压缩仍留待后续实现。
+Runtime 的默认嵌入模式仍可使用内存状态，但生产 Host 通过 ThreadStore 将
+provider-independent 的 Thread、canonical Conversation、Turn summary、语义事件和幂等
+记录保存到用户状态目录中的 SQLite。核心对象通过显式 JSON mapper 序列化，数据库不进入
+workspace，也不保存 Provider secret 或进程运行时对象。独立 Host 通过 REST 接收命令、
+由 SSE 转发 EventBuffer 事件；HTTP adapter 与 React 前端不进入 Runtime 模块。
 
 ## Implementation Status
+
+- Thread persistence 已接入 ThreadStore seam：InMemoryThreadStore 保留测试和嵌入的
+  无磁盘模式，LocalThreadStore 以版本化 SQLite 保存 canonical messages、ThreadSettings、
+  Turn history、语义事件和幂等请求。Runtime 以 Thread-scoped sequence 恢复 EventBuffer，
+  对重启时的 running/waiting_approval Turn 生成 FAILED/runtime_restarted，不恢复
+  ProcessManager、PTY、approval future、stream assembler 或未完成消息。生产 Host 从持久
+  Runtime 枚举历史 Thread；删除的 workspace 仍可读，但新 Turn 返回
+  WORKSPACE_UNAVAILABLE。详细责任边界、schema 与兼容范围见
+  docs/thread-persistence.md。
 
 - Workstream B Phase 1 已补齐 `ApprovalMode`（`UNTRUSTED`、`ON_REQUEST`、`NEVER`）的
   Thread 默认、单 Turn 覆盖与冻结 `TurnConfig` 语义。命令策略在 Policy 层对模型提交的
@@ -252,7 +263,7 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 
 ## Implementation Decisions
 
-- `Thread` is the long-lived conversation concept. It owns one immutable, normalized workspace reference, ordered conversation history, mutable default settings, a current status, an optional active Turn ID, and timestamps. Thread data is in-memory in the first version.
+- `Thread` is the long-lived conversation concept. It owns one immutable, normalized workspace reference, ordered conversation history, mutable default settings, a current status, an optional active Turn ID, and timestamps. Runtime state is persisted through `ThreadStore` when supplied (the production Host uses SQLite); the default embedded mode remains in-memory.
 - `Turn` is one user message plus one complete ReAct execution. A Thread may have many sequential Turns. A new Turn may be submitted only while its Thread is `IDLE`; submission changes the state atomically so two callers cannot both start.
 - Thread states are `IDLE`, `RUNNING`, `WAITING_APPROVAL`, and `CLOSED`. Turn states are `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, and `LIMIT_REACHED`. A completed, failed, cancelled, or limited Turn returns its Thread to `IDLE` unless the Thread is being closed. `close_thread()` is idempotent: it closes an idle Thread and its tool resources immediately, or marks an active Thread as closing, requests cancellation, and lets the existing terminal cleanup path release leases before closing the tool registry and publishing `CLOSED`. Snapshots and retained events remain readable after closure; commands that would mutate the Thread fail with `THREAD_CLOSED`.
 - `ThreadRuntime` is the highest external seam and the primary test surface. Its small interface covers Thread creation, settings updates, Turn submission, cancellation, approval resolution, event consumption, snapshot retrieval, and Thread closure. Transport adapters call this interface rather than reaching into Agent Loop modules.
@@ -285,9 +296,9 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 - `ThreadSnapshot` is a JSON-compatible public view containing Thread ID, normalized public workspace identifier, Thread status, public messages, active Turn ID, sanitized settings and version, timestamps, and the latest Turn summary where applicable. It never serializes internal Python objects directly.
 - Public messages contain user and assistant text plus structured tool calls and safe tool results. System prompts, credentials, internal tracebacks, and raw reasoning are excluded from the ordinary message list.
 - `TurnSummary` contains Turn ID, status, stop reason, final assistant text, modified files, file diffs, diff completeness, iteration/tool-call counters, accumulated usage, start/end timestamps, and an optional safe error summary. It is the final result of one Turn, not the mutable state of the whole Agent.
-- Every `AgentEvent` has schema version, event ID, Thread ID, nullable Turn ID, monotonically increasing sequence within its lifecycle scope, type, timestamp, and JSON-compatible payload. Turn stage events carry a Turn ID and per-Turn sequence. Thread-scoped events such as `settings_updated` use a null Turn ID and a separate per-Thread sequence. The shared bounded buffer and event-ID cursor preserve their total append order. Stage-level types cover Turn lifecycle, complete model response, tool request/start/finish, approval request/resolution, file changes, settings updates, cancellation, completion, failure, and limit termination.
+- Every `AgentEvent` has schema version, event ID, Thread ID, nullable Turn ID, a monotonically increasing Thread-scoped sequence, type, timestamp, and JSON-compatible payload. The shared bounded EventBuffer and event-ID cursor preserve total append order, while durable semantic events are mirrored through `ThreadStore`; model streaming deltas remain transient. Stage-level types cover Turn lifecycle, complete model response, tool request/start/finish, approval request/resolution, file changes, settings updates, cancellation, completion, failure, and limit termination.
 - Reasoning transmission is backend-controlled by `reasoning_visibility`. The default `hidden` value emits no reasoning. Explicit `debug` emits a separate complete reasoning event after a model response; reasoning does not enter ordinary messages, summaries, or logs. The frontend may decide whether to render a reasoning event it has received.
-- Events are kept in a bounded in-memory ring buffer and must never block Agent execution because a consumer is slow or absent. Each event sequence allows gap detection; a consumer whose cursor expired retrieves a fresh Snapshot.
+- Live events are kept in a bounded in-memory ring buffer and must never block Agent execution because a consumer is slow or absent. Durable semantic events are also restored from `ThreadStore`; the next Thread sequence continues after restart. A consumer whose live cursor expired retrieves a fresh Snapshot.
 - The separate Host transport maps Thread creation, versioned settings updates, Turn submission, cancellation, Snapshot retrieval, and Thread closure to HTTP commands and forwards Runtime events with SSE. Approval remains excluded from Web V1. The core Runtime still has no dependency on the Web framework.
 - Turn submission accepts a non-empty, at-most-200-character idempotency key and atomically requires the Thread to be `IDLE` for a new key. A matching retry joins the in-flight result or returns a detached completed Summary; reuse with different user text or settings override fails with `IDEMPOTENCY_CONFLICT`. The Host adapter consumes this behavior without moving it into transport code.
 - All external data has an explicit schema version. Compatibility is defined by JSON field semantics, not by importing Python dataclasses into a frontend.
@@ -317,7 +328,10 @@ Runtime 组合现有 `LLMProvider` 与 `ToolRegistry` seam，并通过少量深�
 ## Out of Scope
 
 - React UI, HTTP routes, and SSE framing remain outside the Runtime module and are specified in `docs/local-web-ui-host-spec.md`; WebSocket and frontend-generated Runtime types remain out of scope.
-- Database persistence, process-restart recovery, distributed locks, multi-process Runtime coordination, or durable event storage.
+- Distributed locks and multi-process Runtime coordination remain out of scope. Thread, canonical
+  Conversation, Turn summary, semantic event, settings, and idempotency persistence plus local
+  process-restart recovery are provided by `ThreadStore`; live process/session reattachment remains
+  out of scope.
 - Mid-Turn user steering, concurrent Turns within one Thread, implicit Turn queues, or automatic cancellation of an older Turn.
 - Automatic context compression, summarization, silent history deletion, or provider-specific tokenizers.
 - Automatic loading or recursive precedence rules for `AGENTS.md` and other project instruction files.

@@ -13,6 +13,12 @@ from .errors import UnsupportedModelSettingError
 class _Unset:
     """Sentinel separating inheritance from an explicit ``None`` override."""
 
+    def __deepcopy__(self, memo: dict[int, object]) -> "_Unset":
+        """Keep the sentinel identity stable across detached state copies."""
+
+        del memo
+        return self
+
 
 _UNSET = _Unset()
 

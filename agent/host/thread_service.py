@@ -6,13 +6,22 @@ from collections.abc import Callable
 import inspect
 from pathlib import Path
 from typing import Protocol
+from uuid import NAMESPACE_URL, uuid5
 
 from agent.model import OpenAICompatibleProvider, create_provider_config
-from agent.runtime import ApprovalMode, ModelSettings, ThreadRuntime, ThreadSettings
+from agent.runtime import (
+    ApprovalMode,
+    ModelSettings,
+    LocalThreadStore,
+    ThreadRuntime,
+    ThreadSettings,
+    ThreadStore,
+    default_state_directory,
+)
 from agent.tools import create_local_tool_registry
 
 from .provider_config import ProviderConfigurationError, ProviderStore
-from .workspace import WorkspaceBrowser, WorkspaceRecord
+from .workspace import WorkspaceBrowseError, WorkspaceBrowser, WorkspaceRecord
 
 
 class ConfigurationRequiredError(RuntimeError):
@@ -28,6 +37,8 @@ class ApprovalNotFoundError(RuntimeError):
 
 
 class RuntimeView(Protocol):
+    def list_threads(self) -> list[object]: ...
+
     def create_thread(
         self,
         workspace: Path,
@@ -62,6 +73,7 @@ class RuntimeView(Protocol):
         user_text: str,
         *,
         idempotency_key: str | None = None,
+        settings_override=None,
     ): ...
 
     def cancel_turn(self, thread_id: str) -> bool: ...
@@ -96,6 +108,8 @@ class ThreadHost:
         self._thread_workspaces: dict[str, WorkspaceRecord] = {}
 
     def list_threads(self) -> list[dict[str, object]]:
+        self._ensure_persistent_runtime()
+        self._sync_thread_ids()
         return [self._view(thread_id) for thread_id in self._thread_ids]
 
     def create_thread(
@@ -119,7 +133,8 @@ class ThreadHost:
             Path(workspace.path),
             settings=initial_settings,
         )
-        self._thread_ids.append(snapshot.thread_id)
+        if snapshot.thread_id not in self._thread_ids:
+            self._thread_ids.append(snapshot.thread_id)
         self._thread_workspaces[snapshot.thread_id] = workspace
         return self._view(snapshot.thread_id)
 
@@ -191,11 +206,9 @@ class ThreadHost:
         return self._runtime
 
     async def shutdown(self) -> None:
-        """Close Runtime Threads and Host-owned Provider resources."""
+        """Close Runtime resources while keeping Threads resumable."""
 
         if self._runtime is not None:
-            for thread_id in self._thread_ids:
-                self._runtime.close_thread(thread_id)
             close_runtime = getattr(self._runtime, "aclose", None)
             if callable(close_runtime):
                 result = close_runtime()
@@ -216,7 +229,18 @@ class ThreadHost:
             # Runtime-created records from an older in-memory owner are still
             # recoverable: materialize the matching Host record by canonical
             # path instead of allowing the frontend to become the authority.
-            workspace = self._workspace_browser.select(snapshot.workspace)
+            try:
+                workspace = self._workspace_browser.select(snapshot.workspace)
+            except WorkspaceBrowseError:
+                # A deleted or no-longer-allowed directory must not hide
+                # durable history. It remains unusable for new Turns, while
+                # the Host can still render the canonical path in the view.
+                path = Path(snapshot.workspace)
+                workspace = WorkspaceRecord(
+                    workspace_id=f"restored-{uuid5(NAMESPACE_URL, snapshot.workspace)}",
+                    path=snapshot.workspace,
+                    display_name=path.name or snapshot.workspace,
+                )
             self._thread_workspaces[thread_id] = workspace
         return {
             "schema_version": 1,
@@ -227,9 +251,45 @@ class ThreadHost:
         }
 
     def _require_thread(self, thread_id: str) -> RuntimeView:
+        self._ensure_persistent_runtime()
+        self._sync_thread_ids()
         if thread_id not in self._thread_ids or self._runtime is None:
             raise ThreadNotFoundError(thread_id)
         return self._runtime
+
+    def _ensure_persistent_runtime(self) -> None:
+        """Hydrate a production Runtime on the first catalog/read request."""
+
+        if self._runtime is not None:
+            return
+        if not getattr(self._runtime_factory, "supports_persistence", False):
+            return
+        self._runtime = self._runtime_factory(self._provider_defaults_for_restore())
+
+    def _provider_defaults_for_restore(self) -> ModelSettings:
+        selected = self._provider_store.default_selection()
+        if selected is not None:
+            return ModelSettings(
+                provider_config_id=selected["provider_id"],
+                model=selected["model"],
+            )
+        # Restored Threads retain their own settings. These placeholders
+        # avoid forcing a credential lookup merely to list durable history.
+        return ModelSettings(
+            provider_config_id="__restored__",
+            model="__restored__",
+        )
+
+    def _sync_thread_ids(self) -> None:
+        if self._runtime is None:
+            return
+        list_threads = getattr(self._runtime, "list_threads", None)
+        if not callable(list_threads):
+            return
+        for snapshot in list_threads():
+            thread_id = getattr(snapshot, "thread_id", None)
+            if isinstance(thread_id, str) and thread_id not in self._thread_ids:
+                self._thread_ids.append(thread_id)
 
     def _selection(
         self,
@@ -261,9 +321,27 @@ class ThreadHost:
 class ProductionRuntimeFactory:
     """Build one Runtime and retain its low-level clients for Host shutdown."""
 
-    def __init__(self, store: ProviderStore) -> None:
+    supports_persistence = True
+
+    def __init__(
+        self,
+        store: ProviderStore,
+        *,
+        thread_store: ThreadStore | None = None,
+        state_dir: Path | None = None,
+        database_path: Path | None = None,
+    ) -> None:
+        if state_dir is not None and database_path is not None:
+            raise ValueError("provide either state_dir or database_path, not both")
         self._store = store
         self._providers: list[OpenAICompatibleProvider] = []
+        self._thread_store = thread_store
+        if self._thread_store is None:
+            self._thread_store = (
+                LocalThreadStore(database_path=database_path)
+                if database_path is not None
+                else LocalThreadStore(state_dir or default_state_directory())
+            )
 
     def __call__(self, default_settings: ModelSettings) -> ThreadRuntime:
         def resolve(provider_config_id: str, model: str) -> OpenAICompatibleProvider:
@@ -281,15 +359,30 @@ class ProductionRuntimeFactory:
             tool_registry_factory=create_local_tool_registry,
             provider_resolver=resolve,
             default_settings=default_settings,
+            store=self._thread_store,
         )
 
     async def close(self) -> None:
         providers, self._providers = self._providers, []
         for provider in providers:
             await provider.close()
+        close_store = getattr(self._thread_store, "close", None)
+        if callable(close_store):
+            close_store()
 
 
-def production_runtime_factory(store: ProviderStore) -> RuntimeFactory:
+def production_runtime_factory(
+    store: ProviderStore,
+    *,
+    thread_store: ThreadStore | None = None,
+    state_dir: Path | None = None,
+    database_path: Path | None = None,
+) -> RuntimeFactory:
     """Build the Runtime lazily while resolving credentials only for model calls."""
 
-    return ProductionRuntimeFactory(store)
+    return ProductionRuntimeFactory(
+        store,
+        thread_store=thread_store,
+        state_dir=state_dir,
+        database_path=database_path,
+    )

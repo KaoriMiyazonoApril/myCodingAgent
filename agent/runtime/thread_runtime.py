@@ -19,12 +19,14 @@ from .errors import (
     ApprovalTimeoutError,
     ContextLimitError,
     IdempotencyConflictError,
+    IdempotencyInterruptedError,
     SettingsConflictError,
     ThreadBusyError,
     ThreadClosedError,
     TurnLimitReached,
 )
 from .events import (
+    AgentEvent,
     EventBatch,
     EventBuffer,
     EventSubscription,
@@ -41,6 +43,13 @@ from .settings import (
     ThreadSettings,
     TurnConfig,
     TurnSettingsOverride,
+)
+from .thread_store import (
+    InMemoryThreadStore,
+    StoredActiveTurn,
+    StoredIdempotency,
+    ThreadState,
+    ThreadStore,
 )
 from .types import SCHEMA_VERSION, ThreadSnapshot, ThreadStatus, TurnStatus, TurnSummary
 from .tool_coordinator import ToolCoordinator
@@ -60,6 +69,7 @@ class _ActiveTurn:
     changes: ChangeTracker
     events: TurnEventEmitter
     started_at: str
+    idempotency_key: str | None = None
 
 
 @dataclass(slots=True)
@@ -68,6 +78,7 @@ class _IdempotentSubmission:
     settings_override: TurnSettingsOverride | None
     future: asyncio.Future[TurnSummary] | None
     summary: TurnSummary | None = None
+    interrupted: bool = False
 
 
 @dataclass(slots=True)
@@ -84,6 +95,8 @@ class _ThreadRecord:
     updated_at: str = ""
     latest_turn: TurnSummary | None = None
     events: EventBuffer | None = None
+    durable_events: list[AgentEvent] = field(default_factory=list)
+    turns: list[TurnSummary] = field(default_factory=list)
     idempotent_submissions: dict[str, _IdempotentSubmission] = field(
         default_factory=dict
     )
@@ -111,6 +124,7 @@ class ThreadRuntime:
         workspace_validation_max_seconds: float = 10,
         workspace_validation_clock: Callable[[], float] | None = None,
         default_context_window_tokens: int = 32_000,
+        store: ThreadStore | None = None,
     ) -> None:
         if reasoning_visibility not in {"hidden", "debug"}:
             raise ValueError("reasoning_visibility must be 'hidden' or 'debug'")
@@ -162,6 +176,7 @@ class ThreadRuntime:
         self._tool_policy = tool_policy or CommandAwarePolicy()
         self._approval_timeout_seconds = approval_timeout_seconds
         self._default_context_window_tokens = default_context_window_tokens
+        self._store = store if store is not None else InMemoryThreadStore()
         validator_options: dict[str, object] = {
             "max_entries": workspace_validation_max_entries,
             "max_seconds": workspace_validation_max_seconds,
@@ -169,6 +184,7 @@ class ThreadRuntime:
         if workspace_validation_clock is not None:
             validator_options["clock"] = workspace_validation_clock
         self._workspace_validator = WorkspaceValidator(**validator_options)
+        self._restore_stored_threads()
 
     def create_thread(
         self,
@@ -192,8 +208,187 @@ class ThreadRuntime:
             updated_at=created_at,
             events=EventBuffer(self._event_buffer_capacity),
         )
+        assert record.events is not None
+        record.events.set_durable_sink(
+            lambda event, current=record: self._on_durable_event(current, event)
+        )
         self._threads[thread_id] = record
+        self._persist_record(record)
         return self._snapshot(record)
+
+    def list_threads(self) -> list[ThreadSnapshot]:
+        """Enumerate all durable Threads in stable creation order."""
+
+        return [self._snapshot(record) for record in self._threads.values()]
+
+    def open_thread(self, thread_id: str) -> ThreadSnapshot:
+        """Open a restored Thread through the same public Snapshot seam."""
+
+        return self.get_snapshot(thread_id)
+
+    def get_turns(self, thread_id: str) -> list[TurnSummary]:
+        """Return detached terminal Turn summaries for one Thread."""
+
+        return deepcopy(self._threads[thread_id].turns)
+
+    def _restore_stored_threads(self) -> None:
+        """Hydrate canonical state and recover work that died with the process."""
+
+        for state in self._store.list_threads():
+            workspace = Path(state.workspace)
+            tools = self._tools_for_restored_workspace(workspace)
+            durable_events = list(state.events)
+            events = EventBuffer(
+                self._event_buffer_capacity,
+                events=durable_events[-self._event_buffer_capacity :],
+                initial_sequence=state.event_sequence,
+            )
+            record = _ThreadRecord(
+                thread_id=state.thread_id,
+                workspace=workspace,
+                tools=tools,
+                conversation=Conversation.from_messages(state.messages),
+                settings=state.settings,
+                status=state.status,
+                completed_turns=state.completed_turns,
+                created_at=state.created_at,
+                updated_at=state.updated_at,
+                latest_turn=deepcopy(state.latest_turn),
+                events=events,
+                durable_events=durable_events,
+                turns=deepcopy(state.turns),
+                idempotent_submissions={
+                    key: _IdempotentSubmission(
+                        user_text=value.user_text,
+                        settings_override=deepcopy(value.settings_override),
+                        future=None,
+                        summary=deepcopy(value.summary),
+                        interrupted=value.interrupted,
+                    )
+                    for key, value in state.idempotency.items()
+                },
+            )
+            events.set_durable_sink(
+                lambda event, current=record: self._on_durable_event(current, event)
+            )
+            self._threads[record.thread_id] = record
+            if state.active_turn is not None or state.status in {
+                ThreadStatus.RUNNING,
+                ThreadStatus.WAITING_APPROVAL,
+            }:
+                self._recover_active_record(record, state.active_turn)
+
+    def _tools_for_restored_workspace(self, workspace: Path) -> ToolRegistry:
+        """Rebuild ephemeral tools when possible; history survives a missing root."""
+
+        try:
+            if not workspace.exists() or not workspace.is_dir():
+                return ToolRegistry()
+        except OSError:
+            return ToolRegistry()
+        return self._tool_registry_factory(workspace)
+
+    def _recover_active_record(
+        self,
+        record: _ThreadRecord,
+        active: StoredActiveTurn | None,
+    ) -> None:
+        """Turn interrupted by process restart becomes one terminal failure."""
+
+        turn_id = active.turn_id if active is not None else str(uuid4())
+        ended_at = utc_now()
+        summary = TurnSummary(
+            schema_version=SCHEMA_VERSION,
+            turn_id=turn_id,
+            thread_id=record.thread_id,
+            status=TurnStatus.FAILED,
+            stop_reason="runtime_restarted",
+            final_text="" if active is None else active.last_assistant_text,
+            iterations=0 if active is None else active.iterations,
+            tool_calls=0 if active is None else active.tool_calls,
+            usage={} if active is None else deepcopy(active.usage),
+            modified_files=[],
+            file_diffs=[],
+            diff_complete=False,
+            started_at="" if active is None else active.started_at,
+            ended_at=ended_at,
+            error={
+                "code": "RUNTIME_RESTARTED",
+                "message": "Turn was interrupted when the Runtime restarted",
+            },
+        )
+        record.status = ThreadStatus.IDLE
+        record.active_turn = None
+        record.conversation.append_interrupted_tool_results()
+        record.completed_turns += 1
+        record.latest_turn = deepcopy(summary)
+        record.turns.append(deepcopy(summary))
+        record.updated_at = ended_at
+        if active is not None and active.idempotency_key is not None:
+            submission = record.idempotent_submissions.get(active.idempotency_key)
+            if submission is not None:
+                submission.summary = deepcopy(summary)
+                submission.interrupted = True
+                submission.future = None
+        assert record.events is not None
+        emitter = TurnEventEmitter(
+            thread_id=record.thread_id,
+            turn_id=turn_id,
+            buffer=record.events,
+            reasoning_visibility=self._reasoning_visibility,
+        )
+        emitter.emit("turn_failed", {"summary": summary.to_dict()})
+        self._persist_record(record)
+
+    def _on_durable_event(self, record: _ThreadRecord, event: AgentEvent) -> None:
+        """Mirror one semantic event exactly once before committing state."""
+
+        if event not in record.durable_events:
+            record.durable_events.append(event)
+        self._persist_record(record)
+
+    def _persist_record(self, record: _ThreadRecord) -> None:
+        """Write one detached semantic state transition through ThreadStore."""
+
+        events = record.events
+        assert events is not None
+        active = record.active_turn
+        active_state = None
+        if active is not None:
+            active_state = StoredActiveTurn(
+                turn_id=active.turn_id,
+                started_at=active.started_at,
+                idempotency_key=active.idempotency_key,
+                iterations=active.controller.iterations,
+                tool_calls=active.controller.tool_calls,
+                usage=deepcopy(active.controller.usage),
+                last_assistant_text=active.controller.last_assistant_text,
+            )
+        state = ThreadState(
+            thread_id=record.thread_id,
+            workspace=record.workspace.as_posix(),
+            status=record.status,
+            settings=record.settings,
+            messages=record.conversation.canonical_messages(),
+            completed_turns=record.completed_turns,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            latest_turn=deepcopy(record.latest_turn),
+            turns=deepcopy(record.turns),
+            events=deepcopy(record.durable_events),
+            event_sequence=events.thread_sequence,
+            active_turn=active_state,
+            idempotency={
+                key: StoredIdempotency(
+                    user_text=value.user_text,
+                    settings_override=deepcopy(value.settings_override),
+                    summary=deepcopy(value.summary),
+                    interrupted=value.interrupted,
+                )
+                for key, value in record.idempotent_submissions.items()
+            },
+        )
+        self._store.save_thread(state)
 
     async def run_turn(
         self,
@@ -217,6 +412,10 @@ class ThreadRuntime:
                     raise IdempotencyConflictError(
                         "idempotency key was already used for another Turn"
                     )
+                if existing.interrupted:
+                    raise IdempotencyInterruptedError(
+                        "idempotent Turn was interrupted by a Runtime restart"
+                    )
                 if existing.summary is not None:
                     return deepcopy(existing.summary)
                 assert existing.future is not None
@@ -235,6 +434,13 @@ class ThreadRuntime:
         )
         workspace_lease: WorkspaceLease | None = None
         try:
+            # A restored Thread remains readable when its root disappeared,
+            # but a new Turn must fail before provider/tool execution and must
+            # never recreate or substitute that workspace.
+            await asyncio.to_thread(
+                self._workspace_validator.validate,
+                record.workspace,
+            )
             turn_config = (
                 TurnConfig.from_thread_settings(
                     record.settings,
@@ -264,14 +470,6 @@ class ThreadRuntime:
                 record.tools.definitions(),
             )
             workspace_lease = self._workspace_leases.acquire(record.workspace)
-            # Re-check only the selected root without walking its contents.
-            # Access-time containment remains the filesystem module's job;
-            # moving this lightweight stat/scandir check off the event loop
-            # keeps cancellation and Host responsiveness intact.
-            await asyncio.to_thread(
-                self._workspace_validator.validate,
-                record.workspace,
-            )
             if record.status is ThreadStatus.CLOSED or record.closing:
                 raise ThreadClosedError(f"thread is closed: {thread_id}")
         except BaseException as error:
@@ -307,6 +505,7 @@ class ThreadRuntime:
                 changes=changes,
                 events=events,
                 started_at=utc_now(),
+                idempotency_key=idempotency_key,
             )
             record.active_turn = active_turn
             if idempotency_key is not None:
@@ -338,6 +537,7 @@ class ThreadRuntime:
                 assert submission.future is not None
                 submission.future.set_result(deepcopy(summary))
                 submission.future = None
+            self._persist_record(record)
             return summary
         except BaseException:
             if idempotency_key is not None and submission is not None:
@@ -351,6 +551,7 @@ class ThreadRuntime:
             )
             record.active_turn = None
             record.updated_at = utc_now()
+            self._persist_record(record)
             assert workspace_lease is not None
             self._workspace_leases.release(workspace_lease)
             if record.closing:
@@ -361,11 +562,14 @@ class ThreadRuntime:
 
         records = tuple(self._threads.values())
         for record in records:
-            record.closing = True
             if record.active_turn is not None:
                 record.active_turn.controller.cancel()
-            else:
-                record.status = ThreadStatus.CLOSED
+            elif record.status is not ThreadStatus.CLOSED:
+                # Host shutdown is process lifecycle, not an explicit user
+                # close. Preserve the Thread as resumable durable history.
+                record.status = ThreadStatus.IDLE
+                record.updated_at = utc_now()
+                self._persist_record(record)
         await asyncio.gather(
             *(record.tools.aclose() for record in records),
             return_exceptions=True,
@@ -556,6 +760,7 @@ class ThreadRuntime:
         if active_turn is None:
             record.status = ThreadStatus.CLOSED
             record.tools.close()
+            self._persist_record(record)
             return True
         active_turn.events.emit("thread_close_requested", {})
         active_turn.controller.cancel()
@@ -609,6 +814,7 @@ class ThreadRuntime:
             created_at=record.created_at,
             updated_at=record.updated_at,
             latest_turn=deepcopy(record.latest_turn),
+            turns=deepcopy(record.turns),
         )
 
     @staticmethod
@@ -642,6 +848,7 @@ class ThreadRuntime:
         )
         record.completed_turns += 1
         record.latest_turn = deepcopy(summary)
+        record.turns.append(deepcopy(summary))
         record.updated_at = summary.ended_at
         active_turn.events.emit(event_type, {"summary": summary.to_dict()})
         return summary

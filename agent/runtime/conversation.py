@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from agent.core.messages import Message, TextBlock, ToolResultBlock
+from copy import deepcopy
+
+from agent.core.messages import Message, TextBlock, ToolCallBlock, ToolResultBlock
 
 from .events import public_message
 
@@ -14,6 +16,16 @@ class Conversation:
         self._messages = [
             Message(role="system", content=[TextBlock(text=system_prompt)])
         ]
+
+    @classmethod
+    def from_messages(cls, messages: list[Message]) -> Conversation:
+        """Restore canonical provider history from a detached store snapshot."""
+
+        if not messages or messages[0].role != "system":
+            raise ValueError("conversation must begin with a system message")
+        conversation = cls.__new__(cls)
+        conversation._messages = deepcopy(messages)
+        return conversation
 
     def append_user(self, text: str) -> None:
         self._messages.append(Message(role="user", content=[TextBlock(text=text)]))
@@ -28,6 +40,44 @@ class Conversation:
 
     def request_messages(self) -> list[Message]:
         return list(self._messages)
+
+    def canonical_messages(self) -> list[Message]:
+        """Return detached system/user/assistant/tool history for persistence."""
+
+        return deepcopy(self._messages)
+
+    def append_interrupted_tool_results(self) -> list[str]:
+        """Close tool-call history without re-executing calls after a restart."""
+
+        pending: list[str] = []
+        completed: set[str] = set()
+        for message in self._messages:
+            if message.role == "assistant":
+                pending.extend(
+                    block.id
+                    for block in message.content
+                    if isinstance(block, ToolCallBlock)
+                )
+            elif message.role == "tool":
+                completed.update(
+                    block.tool_call_id
+                    for block in message.content
+                    if isinstance(block, ToolResultBlock)
+                )
+        pending = [call_id for call_id in pending if call_id not in completed]
+        for call_id in pending:
+            self.append_tool_result(
+                ToolResultBlock(
+                    tool_call_id=call_id,
+                    content="tool call interrupted by Runtime restart",
+                    metadata={
+                        "executed": False,
+                        "reason_code": "RUNTIME_RESTARTED",
+                    },
+                    error_code="RUNTIME_RESTARTED",
+                )
+            )
+        return pending
 
     def prospective_request_messages(self, user_text: str) -> list[Message]:
         """Return the first request for a possible Turn without mutating history."""

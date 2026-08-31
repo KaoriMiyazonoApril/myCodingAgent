@@ -24,8 +24,10 @@ from agent.runtime import (
     ThinkingKeep,
     ThinkingSettings,
     ThreadClosedError,
+    ThreadStore,
     TurnSettingsOverride,
     UnsafeWorkspaceError,
+    WorkspaceUnavailableError,
     WorkspaceValidationLimitError,
 )
 
@@ -170,12 +172,20 @@ def create_app(
     event_stream_adapter: EventStreamAdapter | None = None,
     dev_mode: bool = False,
     static_dir: Path | None = None,
+    state_dir: Path | None = None,
+    database_path: Path | None = None,
+    thread_store: ThreadStore | None = None,
     shutdown_timeout_seconds: float = 10.0,
 ) -> FastAPI:
     """Compose the local Host at its highest HTTP test seam."""
 
     browser = workspace_browser or WorkspaceBrowser()
-    runtime_builder = runtime_factory or production_runtime_factory(provider_store)
+    runtime_builder = runtime_factory or production_runtime_factory(
+        provider_store,
+        state_dir=state_dir,
+        database_path=database_path,
+        thread_store=thread_store,
+    )
     threads = ThreadHost(
         provider_store=provider_store,
         workspace_browser=browser,
@@ -353,6 +363,13 @@ def create_app(
         error: UnsafeWorkspaceError,
     ) -> JSONResponse:
         return _error_response(400, error.code, "Runtime rejected the workspace")
+
+    @app.exception_handler(WorkspaceUnavailableError)
+    async def workspace_unavailable(
+        request: Request,
+        error: WorkspaceUnavailableError,
+    ) -> JSONResponse:
+        return _error_response(409, error.code, "Workspace is unavailable")
 
     @app.exception_handler(WorkspaceValidationLimitError)
     async def workspace_validation_limit(
