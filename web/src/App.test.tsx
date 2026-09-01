@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, test, vi } from "vitest";
 
 import { App } from "./App";
@@ -704,6 +704,20 @@ test("creates switches refreshes and closes Host threads", async () => {
           }),
         } as Response;
       }
+      if (path.startsWith("/api/threads/thread-new/capabilities")) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread_id: "thread-new",
+            capabilities: {
+              thinking_supported: false,
+              supports_thinking_budget: false,
+              supported_keep_values: [],
+            },
+          }),
+        } as Response;
+      }
       if (path === "/api/threads/thread-new/settings" && method === "PATCH") {
         settingsUpdates += 1;
         if (settingsUpdates > 1) {
@@ -832,6 +846,9 @@ test("creates switches refreshes and closes Host threads", async () => {
   fireEvent.change(screen.getByLabelText("对话模型"), {
     target: { value: "deepseek-reasoner" },
   });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "保存对话设置" })).not.toBeDisabled(),
+  );
   fireEvent.click(screen.getByRole("button", { name: "保存对话设置" }));
   await waitFor(() =>
     expect(screen.queryByLabelText("对话设置")).not.toBeInTheDocument(),
@@ -841,6 +858,9 @@ test("creates switches refreshes and closes Host threads", async () => {
   fireEvent.change(screen.getByLabelText("对话模型"), {
     target: { value: "stale-model" },
   });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "保存对话设置" })).not.toBeDisabled(),
+  );
   fireEvent.click(screen.getByRole("button", { name: "保存对话设置" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "更新对话设置失败 · Thread settings changed",
@@ -1332,6 +1352,207 @@ test("opening and saving unchanged Settings preserves enabled Thinking", async (
     budget_tokens: 1_024,
     keep: null,
   });
+});
+
+test("keeps Settings save disabled until the exact capability preview resolves", async () => {
+  vi.useFakeTimers();
+  try {
+    const thread = appThread("thread-thinking-pending", {
+      enabled: true,
+      budget_tokens: 1_024,
+      keep: null,
+    });
+    const requests: Array<{ path: string; method: string; body?: string }> = [];
+    let resolvePreview: (response: Response) => void = () => undefined;
+    const preview = new Promise<Response>((resolve) => {
+      resolvePreview = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        const method = init?.method ?? "GET";
+        requests.push({ path, method, body: init?.body as string | undefined });
+        if (path === "/api/providers") {
+          return {
+            ok: true,
+            json: async () => ({
+              schema_version: 1,
+              default_provider_id: "deepseek",
+              providers: [
+                {
+                  provider_id: "deepseek",
+                  display_name: "DeepSeek",
+                  configured: true,
+                  credential_mask: "••••test",
+                  selected_model: "deepseek-chat",
+                  is_default: true,
+                },
+              ],
+            }),
+          } as Response;
+        }
+        if (path === "/api/threads") {
+          return {
+            ok: true,
+            json: async () => ({ schema_version: 1, threads: [thread] }),
+          } as Response;
+        }
+        if (path.startsWith(`/api/threads/${thread.snapshot.thread_id}/capabilities`)) {
+          return preview;
+        }
+        if (path === `/api/threads/${thread.snapshot.thread_id}/settings` && method === "PATCH") {
+          return {
+            ok: true,
+            json: async () => ({ thread }),
+          } as Response;
+        }
+        throw new Error(`Unexpected request: ${method} ${path}`);
+      }),
+    );
+
+    render(<App />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("button", { name: /Skills/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
+
+    const save = screen.getByRole("button", { name: "保存对话设置" });
+    expect(save).toBeDisabled();
+    fireEvent.click(save);
+    expect(
+      requests.some(({ method }) => method === "PATCH"),
+    ).toBe(false);
+
+    await act(async () => {
+      vi.advanceTimersByTime(179);
+    });
+    expect(
+      requests.some(({ path }) => path.includes("/capabilities")),
+    ).toBe(false);
+    await act(async () => {
+      vi.advanceTimersByTime(1);
+      await Promise.resolve();
+    });
+    expect(save).toBeDisabled();
+
+    resolvePreview({
+      ok: true,
+      json: async () => ({
+        schema_version: 1,
+        thread_id: thread.snapshot.thread_id,
+        capabilities: thread.capabilities,
+      }),
+    } as Response);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(save).not.toBeDisabled();
+
+    fireEvent.click(save);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const patch = requests.find(({ method }) => method === "PATCH");
+    expect(JSON.parse(patch?.body ?? "{}").thinking).toEqual({
+      enabled: true,
+      budget_tokens: 1_024,
+      keep: null,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("keeps Settings save disabled when the capability preview fails", async () => {
+  vi.useFakeTimers();
+  try {
+    const thread = appThread("thread-thinking-error", {
+      enabled: true,
+      budget_tokens: 1_024,
+      keep: null,
+    });
+    const requests: Array<{ path: string; method: string; body?: string }> = [];
+    let rejectPreview: (reason?: unknown) => void = () => undefined;
+    const preview = new Promise<Response>((_, reject) => {
+      rejectPreview = reject;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        const method = init?.method ?? "GET";
+        requests.push({ path, method, body: init?.body as string | undefined });
+        if (path === "/api/providers") {
+          return {
+            ok: true,
+            json: async () => ({
+              schema_version: 1,
+              default_provider_id: "deepseek",
+              providers: [
+                {
+                  provider_id: "deepseek",
+                  display_name: "DeepSeek",
+                  configured: true,
+                  credential_mask: "••••test",
+                  selected_model: "deepseek-chat",
+                  is_default: true,
+                },
+              ],
+            }),
+          } as Response;
+        }
+        if (path === "/api/threads") {
+          return {
+            ok: true,
+            json: async () => ({ schema_version: 1, threads: [thread] }),
+          } as Response;
+        }
+        if (path.startsWith(`/api/threads/${thread.snapshot.thread_id}/capabilities`)) {
+          return preview;
+        }
+        if (path === `/api/threads/${thread.snapshot.thread_id}/settings` && method === "PATCH") {
+          return {
+            ok: true,
+            json: async () => ({ thread }),
+          } as Response;
+        }
+        throw new Error(`Unexpected request: ${method} ${path}`);
+      }),
+    );
+
+    render(<App />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
+    const save = screen.getByRole("button", { name: "保存对话设置" });
+    expect(save).toBeDisabled();
+
+    await act(async () => {
+      vi.advanceTimersByTime(180);
+      await Promise.resolve();
+    });
+    rejectPreview(new Error("preview unavailable"));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(save).toBeDisabled();
+    expect(screen.getByText("无法确认当前候选模型能力，请修改候选后重试。")).toBeInTheDocument();
+    fireEvent.click(save);
+    expect(requests.some(({ method }) => method === "PATCH")).toBe(false);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("updates the Skills button from a live skill_loaded event", async () => {

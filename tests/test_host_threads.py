@@ -309,6 +309,41 @@ def test_candidate_capabilities_are_authoritative_for_settings_switches(tmp_path
     }
 
 
+def test_empty_candidate_capabilities_fail_closed_in_host_projection() -> None:
+    class Runtime:
+        def capabilities_for(
+            self,
+            thread_id: str,
+            *,
+            provider_config_id: str | None = None,
+            model: str | None = None,
+        ) -> dict[str, object]:
+            del thread_id
+            if provider_config_id is not None or model is not None:
+                return {}
+            return {"thinking_supported": True}
+
+    candidate = ThreadHost._capabilities(
+        Runtime(),
+        "thread-1",
+        provider_config_id="candidate-provider",
+        model="candidate-model",
+    )
+    current = ThreadHost._capabilities(Runtime(), "thread-1")
+
+    assert candidate == {
+        "thinking_supported": False,
+        "supports_thinking_budget": False,
+        "supported_keep_values": [],
+        "thinking": {
+            "supported": False,
+            "supports_budget_tokens": False,
+            "supported_keep_values": [],
+        },
+    }
+    assert current == {"thinking_supported": True}
+
+
 def test_thread_api_maps_not_found_invalid_workspace_and_provider(tmp_path) -> None:
     calls: list[ModelSettings] = []
     store = _configured_store(tmp_path / "providers.json")

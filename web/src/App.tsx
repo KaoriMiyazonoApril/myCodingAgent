@@ -1240,6 +1240,8 @@ function ActiveThreadView({
   const [capabilities, setCapabilities] = useState<ThreadCapabilities>(
     DISABLED_CAPABILITIES,
   );
+  const [capabilitiesPending, setCapabilitiesPending] = useState(false);
+  const [capabilitiesError, setCapabilitiesError] = useState(false);
 
   useEffect(() => {
     if (!showSettings) {
@@ -1266,13 +1268,18 @@ function ActiveThreadView({
         .then((next) => {
           if (!cancelled) {
             setCapabilities(next);
+            setCapabilitiesPending(false);
+            setCapabilitiesError(false);
           }
         })
         .catch(() => {
-          // Conservative disabled capabilities keep unsupported fields out of
-          // a save while the candidate endpoint is unavailable.
+          // An unavailable preview is not proof that optional fields are
+          // unsupported. Keep saving disabled so unchanged Thinking cannot be
+          // destructively normalized to null.
           if (!cancelled) {
             setCapabilities(DISABLED_CAPABILITIES);
+            setCapabilitiesPending(false);
+            setCapabilitiesError(true);
           }
         });
     }, 180);
@@ -1468,6 +1475,8 @@ function ActiveThreadView({
                     role="menuitem"
                     onClick={() => {
                       setShowSettings(true);
+                      setCapabilitiesPending(true);
+                      setCapabilitiesError(false);
                       setShowDetails(false);
                       setShowMenu(false);
                     }}
@@ -1523,7 +1532,11 @@ function ActiveThreadView({
                   type="button"
                   className="icon-button"
                   aria-label="关闭对话设置"
-                  onClick={() => setShowSettings(false)}
+                  onClick={() => {
+                    setShowSettings(false);
+                    setCapabilitiesPending(false);
+                    setCapabilitiesError(false);
+                  }}
                 >
                   ×
                 </button>
@@ -1541,6 +1554,8 @@ function ActiveThreadView({
                     setSettingsProvider(event.target.value);
                     setSettingsModel(next?.selected_model ?? "");
                     setCapabilities(DISABLED_CAPABILITIES);
+                    setCapabilitiesPending(true);
+                    setCapabilitiesError(false);
                     setSettingsThinking(false);
                     setSettingsThinkingBudget(null);
                   }}
@@ -1559,6 +1574,8 @@ function ActiveThreadView({
                   onChange={(event) => {
                     setSettingsModel(event.target.value);
                     setCapabilities(DISABLED_CAPABILITIES);
+                    setCapabilitiesPending(true);
+                    setCapabilitiesError(false);
                     setSettingsThinking(false);
                     setSettingsThinkingBudget(null);
                   }}
@@ -1646,7 +1663,9 @@ function ActiveThreadView({
                   disabled={
                     busy ||
                     thread.snapshot.status === "closed" ||
-                    !settingsModel.trim()
+                    !settingsModel.trim() ||
+                    capabilitiesPending ||
+                    capabilitiesError
                   }
                   onClick={() =>
                     onSaveSettings({
@@ -1675,7 +1694,9 @@ function ActiveThreadView({
                 </button>
               </div>
               <p className="field-help">
-                更改将在下一次模型请求时生效。
+                {capabilitiesError
+                  ? "无法确认当前候选模型能力，请修改候选后重试。"
+                  : "更改将在下一次模型请求时生效。"}
               </p>
             </div>
           ) : null}

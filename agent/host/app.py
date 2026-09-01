@@ -497,11 +497,10 @@ def create_app(
             provider_config_id=provider_config_id,
             model=model,
         )
-        thread = threads.get_thread(thread_id)
         return {
             "schema_version": SCHEMA_VERSION,
             "thread_id": thread_id,
-            "capabilities": capabilities or thread.get("capabilities", {}),
+            "capabilities": capabilities,
         }
 
     @app.get("/api/threads/{thread_id}/events")

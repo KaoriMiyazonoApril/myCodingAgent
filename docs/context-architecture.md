@@ -169,10 +169,14 @@ thread-scoped.  The Host preserves internal safety limits when a partial setting
 `limits` object.  `GET /api/threads/{thread_id}/capabilities` exposes conservative capability flags so
 the Web editor disables unsupported thinking controls rather than guessing from provider names. The endpoint
 accepts an optional provider/model candidate and always resolves that pair rather than reusing the current
-Thread capability. The Web editor clears optional thinking fields while a candidate preview is pending; Host
-save validation normalizes unsupported fields before persistence. Thread snapshots include Skills metadata and
-capability projections, never provider credentials. Explicit Skill bodies are not persisted as synthetic
-messages; model-driven bodies remain in their real bounded ToolResult history by design.
+Thread capability. The Web editor disables optional controls and Settings save while a candidate preview is
+pending; a preview transport failure keeps save disabled rather than treating unknown capability as unsupported.
+Host save validation normalizes unsupported fields before persistence. Thread snapshots include Skills metadata and
+capability projections, never provider credentials. When Settings opens or its provider/model draft changes,
+the Web editor marks the exact capability candidate as pending and disables saving until that preview resolves
+or fails closed; an actual provider/model draft change also clears optional thinking fields. Explicit Skill
+bodies are not persisted as synthetic messages; model-driven bodies remain in their real bounded ToolResult
+history by design.
 
 ## Observability and verification
 

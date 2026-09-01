@@ -31,6 +31,21 @@ from .provider_config import ProviderConfigurationError, ProviderStore
 from .workspace import WorkspaceBrowseError, WorkspaceBrowser, WorkspaceRecord
 
 
+def _disabled_capabilities() -> dict[str, object]:
+    """Return a fresh conservative projection for unavailable candidates."""
+
+    return {
+        "thinking_supported": False,
+        "supports_thinking_budget": False,
+        "supported_keep_values": [],
+        "thinking": {
+            "supported": False,
+            "supports_budget_tokens": False,
+            "supported_keep_values": [],
+        },
+    }
+
+
 class ConfigurationRequiredError(RuntimeError):
     code = "CONFIGURATION_REQUIRED"
 
@@ -302,16 +317,7 @@ class ThreadHost:
         if not callable(capabilities):
             capabilities = getattr(runtime, "get_capabilities", None)
         if not callable(capabilities):
-            return {
-                "thinking_supported": False,
-                "supports_thinking_budget": False,
-                "supported_keep_values": [],
-                "thinking": {
-                    "supported": False,
-                    "supports_budget_tokens": False,
-                    "supported_keep_values": [],
-                },
-            }
+            return _disabled_capabilities()
         try:
             value = capabilities(
                 thread_id,
@@ -323,9 +329,18 @@ class ThreadHost:
             # one-argument method.  They cannot preview a candidate, but do
             # not make a candidate appear to have current capabilities.
             if provider_config_id is not None or model is not None:
-                return {}
-            value = capabilities(thread_id)
-        return value if isinstance(value, dict) else {}
+                return _disabled_capabilities()
+            try:
+                value = capabilities(thread_id)
+            except Exception:
+                return _disabled_capabilities()
+        except Exception:
+            return _disabled_capabilities()
+        return (
+            value
+            if isinstance(value, dict) and value
+            else _disabled_capabilities()
+        )
 
     @staticmethod
     def _normalize_settings(
