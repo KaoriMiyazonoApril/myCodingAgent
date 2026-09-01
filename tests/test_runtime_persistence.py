@@ -22,6 +22,7 @@ from agent.runtime import (
     TurnStatus,
     TurnSummary,
     WorkspaceUnavailableError,
+    canonical_history_fingerprint,
 )
 from agent.runtime.thread_store import (
     InMemoryThreadStore,
@@ -229,6 +230,7 @@ def test_runtime_restart_reuses_persisted_compaction_checkpoint(tmp_path: Path) 
             "goal: preserve old request\ncompleted work: old answer recorded"
         ),
         covered_through=1,
+        canonical_fingerprint=canonical_history_fingerprint(state.messages, 1),
     )
     store.save_thread(state)
     store.close()

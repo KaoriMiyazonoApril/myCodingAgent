@@ -15,6 +15,9 @@ from dataclasses import dataclass
 from enum import Enum
 import re
 
+from agent.core.messages import Message, TextBlock
+
+from .context_budget import TokenEstimator
 from .context_types import ContextSection
 
 
@@ -407,6 +410,29 @@ def _estimate_tokens(text: str) -> int:
     return max(0, (ascii_count + 3) // 4 + (non_ascii + 1) // 2)
 
 
+def _estimate_view_message(text: str, estimator: object | None) -> int:
+    """Estimate the exact model Message used for the task-state view.
+
+    Context estimation is a message-level contract. Passing ``list[str]`` to
+    a provider estimator used to raise and silently fall back to a different
+    character heuristic, making both budget decisions and reported estimates
+    misleading (especially for CJK text).  A missing estimator uses the same
+    canonical project estimator rather than a second approximation.
+    """
+
+    selected = estimator if estimator is not None else TokenEstimator()
+    method = getattr(selected, "estimate", None)
+    if not callable(method):
+        raise ValueError("estimator must provide estimate(messages, tools)")
+    estimate = method(
+        [Message(role="system", content=[TextBlock(text=text)])],
+        (),
+    )
+    if isinstance(estimate, bool) or not isinstance(estimate, int) or estimate < 0:
+        raise ValueError("estimator must return a non-negative integer")
+    return estimate
+
+
 def _validation_key(evidence: Evidence) -> str | None:
     if evidence.kind not in {EvidenceKind.VALIDATION, EvidenceKind.FAILURE}:
         return None
@@ -598,14 +624,7 @@ class TaskState:
             if len(candidate) > hard_chars:
                 omitted += 1
                 continue
-            if estimator is not None:
-                method = getattr(estimator, "estimate", None)
-                try:
-                    estimate = method([candidate], ()) if callable(method) else _estimate_tokens(candidate)
-                except Exception:
-                    estimate = _estimate_tokens(candidate)
-            else:
-                estimate = _estimate_tokens(candidate)
+            estimate = _estimate_view_message(candidate, estimator)
             if estimate > budget_tokens:
                 omitted += 1
                 continue
@@ -620,7 +639,7 @@ class TaskState:
         text = "\n".join(lines)
         return TaskStateView(
             text=text,
-            estimated_tokens=_estimate_tokens(text),
+            estimated_tokens=_estimate_view_message(text, estimator),
             budget_tokens=budget_tokens,
             item_count=selected,
             omitted_items=omitted,

@@ -88,7 +88,7 @@ def test_explicit_skill_loads_before_first_model_without_fake_tool_history(tmp_p
     ]
 
 
-def test_model_skill_tool_has_real_pair_and_loaded_projection_next_iteration(
+def test_model_skill_tool_has_real_pair_without_duplicate_body_projection(
     tmp_path: Path,
 ) -> None:
     _write_skill(tmp_path)
@@ -133,8 +133,8 @@ def test_model_skill_tool_has_real_pair_and_loaded_projection_next_iteration(
         for block in message.content
     )
     late_text = "\n".join(_text(message) for message in second_history[-1:])
-    assert "loaded_skills:" in late_text
-    assert "Use alpha workflow." in late_text
+    assert "loaded_skills:" not in late_text
+    assert "Use alpha workflow." not in late_text
     assert sum(
         isinstance(block, ToolCallBlock)
         for message in second_history

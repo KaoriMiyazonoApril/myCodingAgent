@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import inspect
+from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
@@ -20,6 +21,8 @@ from agent.runtime import (
     ThreadRuntime,
     ThreadSettings,
     ThreadStore,
+    ThinkingKeep,
+    ThinkingSettings,
     default_state_directory,
 )
 from agent.tools import create_local_tool_registry
@@ -52,7 +55,13 @@ class RuntimeView(Protocol):
 
     def get_snapshot(self, thread_id: str): ...
 
-    def capabilities_for(self, thread_id: str) -> dict[str, object]: ...
+    def capabilities_for(
+        self,
+        thread_id: str,
+        *,
+        provider_config_id: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, object]: ...
 
     def get_events(self, thread_id: str, *, after_event_id: str | None = None): ...
 
@@ -148,6 +157,23 @@ class ThreadHost:
         self._require_thread(thread_id)
         return self._view(thread_id)
 
+    def capabilities_for(
+        self,
+        thread_id: str,
+        *,
+        provider_config_id: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, object]:
+        """Preview effective capabilities for persisted or draft settings."""
+
+        runtime = self._require_thread(thread_id)
+        return self._capabilities(
+            runtime,
+            thread_id,
+            provider_config_id=provider_config_id,
+            model=model,
+        )
+
     def get_events(
         self,
         thread_id: str,
@@ -178,6 +204,13 @@ class ThreadHost:
     ) -> dict[str, object]:
         runtime = self._require_thread(thread_id)
         self._configured_provider(settings.provider_config_id)
+        capabilities = self._capabilities(
+            runtime,
+            thread_id,
+            provider_config_id=settings.provider_config_id,
+            model=settings.model,
+        )
+        settings = self._normalize_settings(settings, capabilities)
         runtime.update_settings(
             thread_id,
             expected_version=expected_version,
@@ -258,7 +291,13 @@ class ThreadHost:
         }
 
     @staticmethod
-    def _capabilities(runtime: RuntimeView, thread_id: str) -> dict[str, object]:
+    def _capabilities(
+        runtime: RuntimeView,
+        thread_id: str,
+        *,
+        provider_config_id: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, object]:
         capabilities = getattr(runtime, "capabilities_for", None)
         if not callable(capabilities):
             capabilities = getattr(runtime, "get_capabilities", None)
@@ -273,8 +312,59 @@ class ThreadHost:
                     "supported_keep_values": [],
                 },
             }
-        value = capabilities(thread_id)
+        try:
+            value = capabilities(
+                thread_id,
+                provider_config_id=provider_config_id,
+                model=model,
+            )
+        except TypeError:
+            # Source-compatible RuntimeView fakes may still expose the V1
+            # one-argument method.  They cannot preview a candidate, but do
+            # not make a candidate appear to have current capabilities.
+            if provider_config_id is not None or model is not None:
+                return {}
+            value = capabilities(thread_id)
         return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _normalize_settings(
+        settings: ModelSettings,
+        capabilities: dict[str, object],
+    ) -> ModelSettings:
+        """Normalize unsupported optional fields at the Host save boundary."""
+
+        thinking = settings.thinking
+        if thinking is None:
+            return settings
+        nested = capabilities.get("thinking")
+        nested_capabilities = nested if isinstance(nested, dict) else {}
+        supported = bool(
+            capabilities.get("thinking_supported", False)
+            or nested_capabilities.get("supported", False)
+        )
+        if not supported:
+            return replace(settings, thinking=None)
+        supports_budget = bool(
+            capabilities.get("supports_thinking_budget", False)
+            or nested_capabilities.get("supports_budget_tokens", False)
+        )
+        keep_values = capabilities.get(
+            "supported_keep_values",
+            nested_capabilities.get("supported_keep_values", []),
+        )
+        if not isinstance(keep_values, (list, tuple, set, frozenset)):
+            keep_values = ()
+        keep_values = tuple(value for value in keep_values if isinstance(value, str))
+        keep = thinking.keep
+        if keep is not None and keep.value not in keep_values:
+            keep = None
+        normalized = ThinkingSettings(
+            enabled=thinking.enabled,
+            budget_tokens=thinking.budget_tokens if supports_budget else None,
+            keep=keep,
+        )
+        return replace(settings, thinking=normalized)
 
     def _require_thread(self, thread_id: str) -> RuntimeView:
         self._ensure_persistent_runtime()

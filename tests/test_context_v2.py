@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import asyncio
 
-from agent.core.messages import Message, TextBlock, ToolCallBlock
+import pytest
+
+from agent.core.messages import Message, TextBlock, ToolCallBlock, ToolResultBlock
 from agent.runtime.context import ContextManager
 from agent.runtime.context_types import ContextSection
-from agent.runtime.evidence import evidence_from_tool_execution, extract_salient_diagnostics
+from agent.runtime.evidence import (
+    attach_salient_evidence,
+    evidence_from_tool_execution,
+    extract_salient_diagnostics,
+)
+from agent.runtime.history import RecentRawTailSelector, RollingSemanticCompactor, ToolResultPruner
+from agent.runtime.history.compaction import CompactionSummary
 from agent.runtime.runtime_environment import RuntimeContext
 from agent.runtime.task_state import Evidence, EvidenceKind, PlanStepStatus, TaskPlan, TaskState
+from agent.runtime.thread_runtime import ThreadRuntime
 from agent.tools.types import ToolResult
+from agent.tools.result_bounds import reduce_tool_result_block
 
 
 def _message(role: str, text: str) -> Message:
@@ -249,3 +259,259 @@ def test_failed_file_write_is_failure_evidence_without_claiming_mutation() -> No
         timestamp="now",
     )
     assert [item.kind for item in evidence] == [EvidenceKind.FAILURE]
+
+
+def test_salient_handoff_keeps_successful_mutation_and_artifact_provenance() -> None:
+    mutation_call = ToolCallBlock(
+        id="mutation-call",
+        name="write_file",
+        arguments={"path": "src/app.py", "content": "updated"},
+    )
+    mutation = ToolResult(
+        content="updated file",
+        metadata={"changed_paths": ["src/app.py"], "status": "success"},
+    )
+    attach_salient_evidence(mutation_call, mutation)
+    assert mutation.metadata["salient_evidence"]["paths"] == ["src/app.py"]
+
+    artifact_call = ToolCallBlock(
+        id="artifact-call",
+        name="make_report",
+        arguments={},
+    )
+    artifact = ToolResult(
+        content="report ready",
+        metadata={"artifact_path": "output/report.json", "status": "success"},
+    )
+    attach_salient_evidence(artifact_call, artifact)
+    assert artifact.metadata["salient_evidence"]["paths"] == ["output/report.json"]
+
+    opaque = ToolResult(content="bulk payload", metadata={"status": "success"})
+    attach_salient_evidence(
+        ToolCallBlock(id="opaque-call", name="large_result", arguments={}),
+        opaque,
+    )
+    assert "salient_evidence" not in opaque.metadata
+
+
+def test_task_state_view_uses_one_message_estimator_and_reports_that_estimate() -> None:
+    class MessageEstimator:
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[Message], tuple[object, ...]]] = []
+
+        def estimate(self, messages, tools=()):
+            assert all(isinstance(message, Message) for message in messages)
+            self.calls.append((list(messages), tuple(tools)))
+            return sum(
+                len(block.text)
+                for message in messages
+                for block in message.content
+                if isinstance(block, TextBlock)
+            )
+
+    estimator = MessageEstimator()
+    state = TaskState(
+        plan=TaskPlan([{"step": "保留中文约束", "status": "in_progress"}])
+    )
+
+    view = state.view(budget_tokens=2_000, estimator=estimator)
+
+    assert estimator.calls
+    final_message = estimator.calls[-1][0][0]
+    assert final_message.role == "system"
+    assert view.estimated_tokens == estimator.estimate([final_message], ())
+    assert "保留中文约束" in view.text
+
+
+def test_task_state_view_does_not_silently_fallback_for_invalid_estimator() -> None:
+    state = TaskState(plan=TaskPlan([{"step": "check", "status": "pending"}]))
+
+    class InvalidEstimator:
+        def estimate(self, messages, tools=()):
+            del messages, tools
+            return "not-an-estimate"
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        state.view(estimator=InvalidEstimator())
+
+    with pytest.raises(ValueError, match="provide estimate"):
+        state.view(estimator=object())
+
+
+def test_salient_diagnostic_survives_bound_prune_compaction_and_a_fresh_turn() -> None:
+    def round_messages(tag: str) -> list[Message]:
+        call = ToolCallBlock(
+            id=f"call-{tag}",
+            name="run_command",
+            arguments={"command": "pytest -q"},
+        )
+        raw = ToolResult(
+            content=(
+                f"ERROR {tag} at the head\n"
+                + ("unimportant output\n" * 10_000)
+                + f"AssertionError: {tag} expected 2 actual 1 critical middle diagnostic\n"
+                + ("unimportant output\n" * 10_000)
+                + f"ERROR {tag} tail diagnostic\n"
+            ),
+            metadata={
+                "command": "pytest -q",
+                "paths": [f"src/{tag}.py"] + [f"src/{index}.py" for index in range(100)],
+            },
+            error_code="COMMAND_FAILED",
+        )
+        attach_salient_evidence(call, raw)
+        bounded = reduce_tool_result_block(raw.to_message_block(call.id))
+        return [
+            Message(role="assistant", content=[call]),
+            Message(role="tool", content=[bounded]),
+        ]
+
+    history = [
+        _message("user", "preserve the important constraint"),
+        *round_messages("head"),
+        *round_messages("middle"),
+        *round_messages("tail"),
+        _message("user", "new scope after validation failure"),
+    ]
+    pruned = ToolResultPruner(threshold_chars=32).prune(history)
+    retained_diagnostics = [
+        block.metadata["salient_evidence"]
+        for message in pruned
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert pruned.pruned_count == 3
+    assert all(
+        any(tag in " ".join(item["lines"]) for tag in ("head", "middle", "tail"))
+        for item in retained_diagnostics
+    )
+    assert all(len(item["paths"]) <= 16 and sum(map(len, item["paths"])) <= 2_048 for item in retained_diagnostics)
+
+    class MetadataCompactor:
+        async def compact(self, previous, region):
+            del previous
+            diagnostics = []
+            for message in region:
+                for block in message.content:
+                    if isinstance(block, ToolResultBlock):
+                        evidence = block.metadata.get("salient_evidence", {})
+                        diagnostics.extend(evidence.get("lines", []))
+            return CompactionSummary("retained diagnostics: " + " | ".join(diagnostics))
+
+    selection = RecentRawTailSelector(usable_input_tokens=1).select(pruned)
+    compacted = asyncio.run(
+        RollingSemanticCompactor(MetadataCompactor()).compact(pruned, selection)
+    )
+    assert compacted is not None
+    assert all(tag in compacted.summary.text for tag in ("head", "middle", "tail"))
+    assert compacted.checkpoint.valid_for_history(pruned)
+
+    # A new scope starts with empty TaskState.  The bounded durable handoff in
+    # the checkpoint remains visible through Context's model-visible summary.
+    fresh_state = TaskState()
+    manager = ContextManager()
+    plan, _ = asyncio.run(
+        manager.assemble_with_reduction(
+            pruned,
+            runtime_context=RuntimeContext(workspace="/workspace"),
+            task_state=fresh_state,
+            checkpoint=compacted.checkpoint,
+        )
+    )
+    assert fresh_state.view().text == "task_state:\n- plan: none"
+    rendered_text = "\n".join(
+        block.text
+        for message in manager.render(plan)
+        for block in message.content
+        if isinstance(block, TextBlock)
+    )
+    assert all(tag in rendered_text for tag in ("head", "middle", "tail"))
+    assert rendered_text.count("unimportant output") < 10
+
+
+def test_prefix_stays_canonical_when_plan_and_tool_history_change() -> None:
+    manager = ContextManager()
+    canonical_user = _message("user", "same canonical request")
+    first_plan, _ = asyncio.run(
+        manager.assemble_with_reduction(
+            [canonical_user],
+            current_input="same canonical request",
+            runtime_context=RuntimeContext(workspace="/workspace"),
+            task_state=TaskState(
+                plan=TaskPlan([{"step": "inspect", "status": "in_progress"}])
+            ),
+        )
+    )
+    first_request = manager.render(first_plan)
+
+    call = ToolCallBlock(
+        id="prefix-call",
+        name="run_command",
+        arguments={"command": "pytest -q"},
+    )
+    result = Message(
+        role="tool",
+        content=[
+            ToolResultBlock(
+                tool_call_id=call.id,
+                content="failed",
+                metadata={"command": "pytest -q", "exit_code": 1},
+                error_code="COMMAND_FAILED",
+            )
+        ],
+    )
+    history_after_tool = [
+        canonical_user,
+        Message(role="assistant", content=[call]),
+        result,
+    ]
+    second_plan, _ = asyncio.run(
+        manager.assemble_with_reduction(
+            history_after_tool,
+            runtime_context=RuntimeContext(workspace="/workspace"),
+            task_state=TaskState(
+                plan=TaskPlan([{"step": "repair", "status": "blocked"}])
+            ),
+        )
+    )
+    second_request = manager.render(second_plan)
+
+    # Only the late TaskState partition changes between requests.  The
+    # baseline system message and already-existing chronological history stay
+    # a byte-for-byte provider request prefix through tool execution.
+    assert first_request[:-1] == second_request[: len(first_request) - 1]
+    assert sum(
+        1
+        for message in second_request
+        if message.role == "user"
+        and any(
+            isinstance(block, TextBlock)
+            and block.text == "same canonical request"
+            for block in message.content
+        )
+    ) == 1
+    assert second_plan.late_sections[-1].name == "task_state"
+
+
+def test_context_diagnostics_are_bounded_and_available_outside_rendered_plan() -> None:
+    raw = {
+        "epoch_sections": [f"section-{index}" for index in range(100)],
+        "context_epoch_sections": [f"epoch-{index}" for index in range(100)],
+        "late_working_tail_sections": ["loaded_skills", "task_state"],
+        "loaded_skill_names": [f"skill-{index}" for index in range(100)],
+        "canonical_history_messages": 14,
+        "history_estimate_tokens": 123,
+        "task_state_view_estimate_tokens": 45,
+        "tool_results_pruned": 3,
+        "checkpoint_validation": "reused",
+        "final_request_estimate_tokens": 456,
+        "final_fit": "fits",
+    }
+
+    diagnostics = ThreadRuntime._context_diagnostics(raw)
+
+    assert diagnostics["epoch_sections"] == [f"section-{index}" for index in range(32)]
+    assert diagnostics["context_epoch_sections"] == [f"epoch-{index}" for index in range(32)]
+    assert len(diagnostics["loaded_skill_names"]) == 32
+    assert diagnostics["late_working_tail_sections"] == ["loaded_skills", "task_state"]
+    assert diagnostics["final_request_estimate_tokens"] == 456

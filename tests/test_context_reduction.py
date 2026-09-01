@@ -23,6 +23,7 @@ from agent.runtime.context_history import (
     LLMHistoryCompactor,
     RecentRawTailSelector,
     RollingSemanticCompactor,
+    canonical_history_fingerprint,
     estimate_history_tokens,
 )
 
@@ -208,6 +209,7 @@ def test_checkpoint_covered_raw_units_are_not_retained_alongside_summary() -> No
     checkpoint = CompactionCheckpoint(
         CompactionSummary("synthetic covered handoff"),
         covered_through=2,
+        canonical_fingerprint=canonical_history_fingerprint(history, 2),
     )
 
     selection = RecentRawTailSelector(usable_input_tokens=200).select(
@@ -240,7 +242,11 @@ def test_oversized_atomic_compaction_request_fails_without_provider_call() -> No
     compactor = LLMHistoryCompactor(provider, request_budget_tokens=500)
     canonical = [_text("user", "canonical"), _text("assistant", "answer")]
     original = deepcopy(canonical)
-    checkpoint = CompactionCheckpoint(CompactionSummary("old handoff"), covered_through=-1)
+    checkpoint = CompactionCheckpoint(
+        CompactionSummary("old handoff"),
+        covered_through=-1,
+        canonical_fingerprint=canonical_history_fingerprint(canonical, -1),
+    )
 
     with pytest.raises(CompactionError) as captured:
         asyncio.run(

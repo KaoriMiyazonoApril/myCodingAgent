@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from copy import deepcopy
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -27,6 +26,9 @@ from .context_types import (
     ContextSection,
     ContextSource,
 )
+from .context_plan import ContextPlan, ContextSources
+from .context_reduction import promote_retained_prefix_for_compaction
+from .context_renderer import ContextRenderer
 from .instructions import (
     FileProjectInstructionsProvider,
     MAX_PROJECT_INSTRUCTIONS_BYTES,
@@ -90,48 +92,6 @@ from .history import (
 )
 
 
-@dataclass(frozen=True, slots=True)
-class ContextSources:
-    """The stable and request-scoped sources for one model request."""
-
-    base_system_instructions: BaseSystemInstructions
-    project_instructions: ProjectInstructions
-    runtime_context: RuntimeContext | None = None
-    compaction_summary: CompactionSummary | None = None
-    task_state: TaskState | None = None
-    available_skills: object | None = None
-    available_skills_max_chars: int = 8_000
-
-    def sections(self) -> list[ContextSection]:
-        sections = self.base_system_instructions.sections()
-        sections.extend(self.project_instructions.sections())
-        if self.available_skills is not None:
-            projection = getattr(self.available_skills, "model_projection", None)
-            if callable(projection):
-                projected = projection(max_chars=self.available_skills_max_chars)
-                content = getattr(projected, "text", projected)
-            else:
-                content = str(getattr(self.available_skills, "model_catalog", ""))
-            if content:
-                # Keep the catalog in its own deterministic baseline block so
-                # the short base instructions remain an exact prefix for
-                # embedders that cache the first system block.
-                sections.append(ContextSection("available_skills", content, stable=True))
-        if self.runtime_context is not None:
-            sections.extend(self.runtime_context.sections())
-        if self.compaction_summary is not None:
-            sections.append(
-                ContextSection(
-                    "compaction_summary",
-                    self.compaction_summary.text,
-                    stable=False,
-                )
-            )
-        if self.task_state is not None:
-            sections.extend(self.task_state.sections())
-        return sections
-
-
 class HistorySelector(Protocol):
     """Choose model-visible history from a detached canonical snapshot."""
 
@@ -158,127 +118,6 @@ class NoOpHistoryCompactor:
 
     def compact(self, history: Sequence[Message]) -> list[Message]:
         return deepcopy(list(history))
-
-
-@dataclass(frozen=True, slots=True)
-class ContextPlan:
-    """Detached, inspectable description of one model-visible context."""
-
-    source_sections: list[ContextSection]
-    selected_history: list[Message]
-    compacted_history: list[Message]
-    current_input: Message | None
-    estimated_tokens: int
-    input_budget_tokens: int
-    budget_status: str
-    decision_metadata: dict[str, object] = field(default_factory=dict)
-    pressure: str = "normal"
-    final_fit: str = "fits"
-    late_sections: list[ContextSection] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        if self.budget_status not in {"fits", "exceeds", "overflow"}:
-            raise ValueError("budget_status must be 'fits', 'exceeds', or 'overflow'")
-        if self.pressure not in {"normal", "soft", "hard"}:
-            raise ValueError("pressure must be normal, soft, or hard")
-        if self.final_fit not in {"fits", "overflow"}:
-            raise ValueError("final_fit must be fits or overflow")
-        if (
-            isinstance(self.estimated_tokens, bool)
-            or not isinstance(self.estimated_tokens, int)
-            or self.estimated_tokens < 0
-            or isinstance(self.input_budget_tokens, bool)
-            or not isinstance(self.input_budget_tokens, int)
-            or self.input_budget_tokens < 0
-        ):
-            raise ValueError("context estimates must be non-negative integers")
-        object.__setattr__(self, "source_sections", deepcopy(self.source_sections))
-        object.__setattr__(self, "selected_history", deepcopy(self.selected_history))
-        object.__setattr__(self, "compacted_history", deepcopy(self.compacted_history))
-        object.__setattr__(self, "current_input", deepcopy(self.current_input))
-        object.__setattr__(self, "decision_metadata", deepcopy(self.decision_metadata))
-        object.__setattr__(self, "late_sections", deepcopy(self.late_sections))
-
-    @property
-    def baseline_sections(self) -> list[ContextSection]:
-        late_names = {section.name for section in self.late_sections}
-        return [section for section in self.source_sections if section.name not in late_names]
-
-    @property
-    def working_tail_sections(self) -> list[ContextSection]:
-        return deepcopy(self.late_sections)
-
-    @property
-    def epoch_sections(self) -> list[ContextSection]:
-        return self.baseline_sections
-
-
-class ContextRenderer:
-    """Render a ContextPlan into provider-independent model messages."""
-
-    def render(self, plan: ContextPlan) -> list[Message]:
-        def section_text(section: ContextSection) -> str:
-            # TaskState/Skill projections already carry a self-describing
-            # heading.  Avoid rendering ``task_state: task_state:`` while
-            # retaining headings for ordinary source sections.
-            prefix = f"{section.name}:"
-            return (
-                section.content
-                if section.content.startswith(prefix)
-                else f"{prefix}\n{section.content}"
-            )
-
-        late_names = {section.name for section in plan.late_sections}
-        baseline_sections = [
-            section for section in plan.source_sections if section.name not in late_names
-        ]
-        stable = [section for section in baseline_sections if section.stable]
-        dynamic = [section for section in baseline_sections if not section.stable]
-
-        # Keep the base/project pair as the first block.  That small
-        # compatibility detail lets existing embedders append their own
-        # project instructions while the provider serializer still sees the
-        # same stable prefix.  The remaining epoch sections retain their
-        # boundaries as additional TextBlocks; provider adapters concatenate
-        # them in order, while tests and observability seams can distinguish
-        # runtime/catalog changes from the stable core.
-        core_names = {"base_system_instructions", "project_instructions"}
-        core = [section for section in stable if section.name in core_names]
-        epoch_tail = [section for section in stable if section.name not in core_names]
-        system_content: list[TextBlock] = []
-        core_text = "\n\n".join(section.content for section in core if section.content)
-        if core_text:
-            system_content.append(TextBlock(text=core_text))
-        tail_text = "\n\n".join(
-            section_text(section)
-            for section in (*epoch_tail, *dynamic)
-            if section.content
-        )
-        if tail_text:
-            separator = "\n\n" if system_content else ""
-            system_content.append(TextBlock(text=separator + tail_text))
-        messages = [Message(role="system", content=system_content)]
-        history = [
-            deepcopy(message)
-            for message in plan.compacted_history
-            if message.role != "system"
-        ]
-        messages.extend(history)
-        if plan.current_input is not None and (
-            not history or history[-1] != plan.current_input
-        ):
-            messages.append(deepcopy(plan.current_input))
-        if plan.late_sections:
-            late_text = "\n\n".join(
-                section_text(section)
-                for section in plan.late_sections
-                if section.content
-            )
-            if late_text:
-                messages.append(
-                    Message(role="system", content=[TextBlock(text=late_text)])
-                )
-        return messages
 
 
 class ContextManager:
@@ -510,7 +349,7 @@ class ContextManager:
             # hard pressure, promote the retained closed prefix through the
             # largest eligible unit so semantic compaction still has a
             # protocol-safe region to summarize.
-            promoted = _promote_retained_prefix_for_compaction(
+            promoted = promote_retained_prefix_for_compaction(
                 selection,
                 estimator=self.budget.estimator,
             )
@@ -660,16 +499,6 @@ class ContextManager:
         selected_skill_state = skill_state if skill_state is not None else self.skill_state
         late_sections: list[ContextSection] = []
         if include_late_tail:
-            if has_task_state:
-                task_view = task_state.view(estimator=self.budget.estimator)
-                late_sections.append(
-                    ContextSection(
-                        "task_state",
-                        task_view.text,
-                        stable=False,
-                        placement="late",
-                    )
-                )
             if selected_skill_state is not None:
                 projection = getattr(selected_skill_state, "projection", None)
                 loaded_text = projection() if callable(projection) else ""
@@ -682,6 +511,16 @@ class ContextManager:
                             placement="late",
                         )
                     )
+            if has_task_state:
+                task_view = task_state.view(estimator=self.budget.estimator)
+                late_sections.append(
+                    ContextSection(
+                        "task_state",
+                        task_view.text,
+                        stable=False,
+                        placement="late",
+                    )
+                )
         plan_metadata = deepcopy(metadata)
         plan_metadata.update(
             {
@@ -826,128 +665,6 @@ def _messages(value: Sequence[Message], name: str) -> list[Message]:
     if any(not isinstance(message, Message) for message in messages):
         raise ValueError(f"{name} must contain Message values")
     return deepcopy(messages)
-
-
-def _promote_retained_prefix_for_compaction(
-    selection: HistorySelection,
-    *,
-    estimator: object | None = None,
-) -> HistorySelection:
-    """Expose a large retained atomic prefix to the one compaction pass.
-
-    ``RecentRawTailSelector`` keeps a boundary unit whole by design.  That
-    rule is important for protocol safety, but a large closed interaction at
-    the boundary can make an otherwise reducible request impossible to fit.
-    This helper is used only after a hard post-prune estimate and moves the
-    retained closed prefix through the largest eligible unit.  The moved
-    units remain complete and chronological; the newest tool interaction and
-    every open unit stay in the raw tail.
-    """
-
-    retained_units = sorted(
-        selection.retained_units,
-        key=lambda unit: unit.start_index,
-    )
-    if len(retained_units) < 2:
-        return selection
-    latest_tool_start = max(
-        (
-            unit.start_index
-            for unit in retained_units
-            if unit.is_tool_interaction
-        ),
-        default=None,
-    )
-    eligible = [
-        unit
-        for unit in retained_units
-        if unit.closed
-        and not any(message.role == "system" for message in unit.messages)
-        and unit.start_index != latest_tool_start
-    ]
-    if not eligible:
-        return selection
-
-    def unit_tokens(unit: AtomicHistoryUnit) -> int:
-        return estimate_history_tokens(unit.messages, estimator)
-
-    chosen = max(
-        eligible,
-        key=lambda unit: (unit_tokens(unit), unit.start_index),
-    )
-    moved = [
-        unit
-        for unit in retained_units
-        if unit.end_index <= chosen.end_index
-        and unit.closed
-        and not any(message.role == "system" for message in unit.messages)
-    ]
-    if not moved:
-        return selection
-    moved_indexes = {unit.start_index for unit in moved}
-    remaining = [
-        unit for unit in retained_units if unit.start_index not in moved_indexes
-    ]
-    compact_units = sorted(
-        [*selection.compact_units, *moved],
-        key=lambda unit: unit.start_index,
-    )
-
-    def flatten(units: Sequence[AtomicHistoryUnit]) -> list[Message]:
-        return [
-            deepcopy(message)
-            for unit in units
-            for message in unit.messages
-        ]
-
-    selected = flatten(remaining)
-    compact_candidates = flatten(
-        [
-            unit
-            for unit in compact_units
-            if not any(message.role == "system" for message in unit.messages)
-        ]
-    )
-    non_system_retained = [
-        unit
-        for unit in remaining
-        if not any(message.role == "system" for message in unit.messages)
-    ]
-    boundary = (
-        min(unit.start_index for unit in non_system_retained)
-        if non_system_retained
-        else None
-    )
-    canonical_end = max(
-        (unit.end_index for unit in compact_units),
-        default=None,
-    )
-    retained_tokens = (
-        estimate_history_tokens(selected, estimator) if selected else 0
-    )
-    metadata = deepcopy(selection.metadata)
-    metadata.update(
-        {
-            "retained_tokens": retained_tokens,
-            "retained_message_count": len(selected),
-            "compact_candidate_messages": len(compact_candidates),
-            "compact_candidate_units": len(compact_units),
-            "boundary": boundary,
-            "canonical_compact_end": canonical_end,
-            "promoted_for_hard_pressure": True,
-        }
-    )
-    return HistorySelection(
-        selected,
-        compact_candidates=compact_candidates,
-        retained_units=remaining,
-        compact_units=compact_units,
-        target_tokens=selection.target_tokens,
-        retained_tokens=retained_tokens,
-        boundary=boundary,
-        canonical_end=canonical_end,
-        metadata=metadata,
-    )
 
 
 def _current_input(value: str | Message | None) -> Message | None:

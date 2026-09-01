@@ -11,6 +11,7 @@ from .discovery import (
 )
 from .loader import SkillLoader
 from .types import (
+    MAX_EXPLICIT_SKILL_PROJECTION_CHARS,
     MAX_SKILL_BODY_CHARS,
     MAX_SKILL_CATALOG_CHARS,
     MAX_SKILL_DESCRIPTION_CHARS,
@@ -27,6 +28,7 @@ from .types import (
 )
 
 __all__ = [
+    "MAX_EXPLICIT_SKILL_PROJECTION_CHARS",
     "MAX_SKILL_BODY_CHARS",
     "MAX_SKILL_CATALOG_CHARS",
     "MAX_SKILL_DESCRIPTION_CHARS",

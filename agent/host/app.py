@@ -484,12 +484,24 @@ def create_app(
         }
 
     @app.get("/api/threads/{thread_id}/capabilities")
-    async def thread_capabilities(thread_id: str) -> dict[str, object]:
+    async def thread_capabilities(
+        thread_id: str,
+        provider_config_id: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, object]:
+        # Query parameters describe a draft candidate, not persisted Thread
+        # settings.  The Host delegates this preview to Runtime so the next
+        # request uses the same effective capability decision.
+        capabilities = threads.capabilities_for(
+            thread_id,
+            provider_config_id=provider_config_id,
+            model=model,
+        )
         thread = threads.get_thread(thread_id)
         return {
             "schema_version": SCHEMA_VERSION,
             "thread_id": thread_id,
-            "capabilities": thread.get("capabilities", {}),
+            "capabilities": capabilities or thread.get("capabilities", {}),
         }
 
     @app.get("/api/threads/{thread_id}/events")

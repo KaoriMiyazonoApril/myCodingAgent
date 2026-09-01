@@ -1063,6 +1063,14 @@ test("shows Skills metadata and capability-gated thread settings", async () => {
                 selected_model: "deepseek-chat",
                 is_default: true,
               },
+              {
+                provider_id: "moonshot",
+                display_name: "Moonshot / Kimi",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "moonshot-v1",
+                is_default: false,
+              },
             ],
           }),
         } as Response;
@@ -1086,6 +1094,25 @@ test("shows Skills metadata and capability-gated thread settings", async () => {
           }),
         } as Response;
       }
+      if (path.startsWith("/api/threads/thread-skills/capabilities")) {
+        const candidate = new URL(path, "http://test.local");
+        const provider = candidate.searchParams.get("provider_config_id");
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread_id: "thread-skills",
+            capabilities:
+              provider === "moonshot"
+                ? {
+                    thinking_supported: false,
+                    supports_thinking_budget: false,
+                    supported_keep_values: [],
+                  }
+                : thread.capabilities,
+          }),
+        } as Response;
+      }
       throw new Error(`Unexpected request: ${method} ${path}`);
     }),
   );
@@ -1100,9 +1127,30 @@ test("shows Skills metadata and capability-gated thread settings", async () => {
   expect(skills).toHaveTextContent("Repository workflow guidance");
   fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
   fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
-  expect(screen.getByLabelText("Thinking")).not.toBeDisabled();
+  await waitFor(() => expect(screen.getByLabelText("Thinking")).not.toBeDisabled());
   fireEvent.click(screen.getByLabelText("Thinking"));
   expect(screen.getByLabelText("Thinking budget")).toBeInTheDocument();
-  expect(screen.getByLabelText("Thinking history")).toBeInTheDocument();
-  expect(requests.some(({ path }) => path === "/api/threads/thread-skills/capabilities")).toBe(false);
+  expect(screen.queryByLabelText("Thinking history")).not.toBeInTheDocument();
+  expect(
+    requests.some(({ path }) => path.startsWith("/api/threads/thread-skills/capabilities?")),
+  ).toBe(true);
+
+  // A draft switch must use the candidate capability preview immediately and
+  // must not retain the previous provider's thinking controls.
+  fireEvent.change(screen.getByLabelText("模型服务商"), {
+    target: { value: "moonshot" },
+  });
+  await waitFor(() => expect(screen.getByLabelText("Thinking")).toBeDisabled());
+  expect(screen.queryByLabelText("Thinking budget")).not.toBeInTheDocument();
+  await waitFor(() =>
+    expect(
+      requests.some(({ path }) =>
+        path.includes("provider_config_id=moonshot") && path.includes("model=moonshot-v1"),
+      ),
+    ).toBe(true),
+  );
+  fireEvent.change(screen.getByLabelText("模型服务商"), {
+    target: { value: "deepseek" },
+  });
+  await waitFor(() => expect(screen.getByLabelText("Thinking")).not.toBeDisabled());
 });

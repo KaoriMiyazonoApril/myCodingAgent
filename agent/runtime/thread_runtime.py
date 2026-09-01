@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import logging
 import os
 from pathlib import Path
+import threading
 from uuid import uuid4
 
 from agent.model.errors import LLMError
@@ -84,6 +85,44 @@ ToolRegistryFactory = Callable[[Path], ToolRegistry]
 ProviderResolver = Callable[[str, str], LLMProvider]
 
 
+async def _validate_workspace_async(validator: WorkspaceValidator, workspace: Path) -> None:
+    """Run the bounded root check without joining asyncio's default executor.
+
+    The validator normally performs one cheap ``stat``.  Keeping this seam
+    asynchronous is still important for embedders (and for cancellation
+    tests that replace it with a deliberately blocking checker), while a
+    daemon worker avoids the process-wide executor shutdown path used by
+    ``asyncio.to_thread`` on affected Python builds.
+    """
+
+    error_holder: list[BaseException] = []
+    settled = threading.Event()
+
+    def validate() -> None:
+        try:
+            validator.validate(workspace)
+        except BaseException as error:
+            error_holder.append(error)
+        finally:
+            settled.set()
+
+    threading.Thread(
+        target=validate,
+        name="my-coding-agent-workspace-validation",
+        daemon=True,
+    ).start()
+    while not settled.is_set():
+        try:
+            await asyncio.sleep(0.005)
+        except asyncio.CancelledError:
+            # No workspace lease or provider has been acquired at this point.
+            # The bounded checker can finish independently without keeping
+            # the cancelled Turn or event-loop shutdown alive.
+            raise
+    if error_holder:
+        raise error_holder[0]
+
+
 @dataclass(slots=True)
 class _ActiveTurn:
     turn_id: str
@@ -130,6 +169,7 @@ class _ThreadRecord:
     compaction_checkpoint: CompactionCheckpoint | None = None
     checkpoint_diagnostics: tuple[str, ...] = ()
     skill_catalog: SkillCatalog = field(default_factory=SkillCatalog)
+    context_diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 class ThreadRuntime:
@@ -687,8 +727,13 @@ class ThreadRuntime:
             # A restored Thread remains readable when its root disappeared,
             # but a new Turn must fail before provider/tool execution and must
             # never recreate or substitute that workspace.
-            await asyncio.to_thread(
-                self._workspace_validator.validate,
+            # WorkspaceValidator deliberately performs one bounded root
+            # ``stat``/directory check and never walks descendants. Keep the
+            # public preflight awaitable for embedders and cancellation, but
+            # use our daemon-worker seam instead of asyncio's process-global
+            # default executor.
+            await _validate_workspace_async(
+                self._workspace_validator,
                 record.workspace,
             )
             turn_config = (
@@ -961,12 +1006,24 @@ class ThreadRuntime:
     ) -> ProviderCapabilities | None:
         """Read provider capabilities without constructing its HTTP client."""
 
+        return self._provider_capabilities_for_values(
+            turn_config.provider_config_id,
+            turn_config.model,
+        )
+
+    def _provider_capabilities_for_values(
+        self,
+        provider_config_id: str,
+        model: str,
+    ) -> ProviderCapabilities | None:
+        """Resolve candidate capabilities independently of Thread settings."""
+
         capabilities_for = getattr(self._provider_resolver, "capabilities_for", None)
         if not callable(capabilities_for):
             return None
         capabilities = capabilities_for(
-            turn_config.provider_config_id,
-            turn_config.model,
+            provider_config_id,
+            model,
         )
         return capabilities if isinstance(capabilities, ProviderCapabilities) else None
 
@@ -1024,6 +1081,10 @@ class ThreadRuntime:
             record.compaction_checkpoint = deepcopy(checkpoint)
             self._persist_record(record)
 
+        def save_context_diagnostics(value: dict[str, object]) -> None:
+            diagnostics = self._context_diagnostics(value)
+            record.context_diagnostics = diagnostics
+
         try:
             outcome = await self._loop.run(
                 record.conversation,
@@ -1040,6 +1101,7 @@ class ThreadRuntime:
                 compaction_checkpoint=record.compaction_checkpoint,
                 history_compactor=history_compactor,
                 checkpoint_sink=save_checkpoint,
+                context_diagnostics_sink=save_context_diagnostics,
             )
             return self._finish_turn(
                 record,
@@ -1132,7 +1194,18 @@ class ThreadRuntime:
     def get_snapshot(self, thread_id: str) -> ThreadSnapshot:
         return self._snapshot(self._threads[thread_id])
 
-    def capabilities_for(self, thread_id: str) -> dict[str, object]:
+    def get_context_diagnostics(self, thread_id: str) -> dict[str, object]:
+        """Return the last bounded model-context decision for diagnostics."""
+
+        return deepcopy(self._threads[thread_id].context_diagnostics)
+
+    def capabilities_for(
+        self,
+        thread_id: str,
+        *,
+        provider_config_id: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, object]:
         """Return a safe Host-facing projection for the Thread's model.
 
         Capability lookup deliberately uses the resolver's provider-independent
@@ -1142,8 +1215,17 @@ class ThreadRuntime:
 
         record = self._threads[thread_id]
         try:
-            turn_config = TurnConfig.from_thread_settings(
-                record.settings,
+            candidate_provider = provider_config_id or record.settings.provider_config_id
+            candidate_model = model or record.settings.model
+            # Validate the candidate at this seam so a draft cannot silently
+            # fall back to the current Thread's provider/model.
+            candidate_settings = ModelSettings(
+                provider_config_id=candidate_provider,
+                model=candidate_model,
+            )
+            turn_config = TurnConfig.from_model_settings(
+                candidate_settings,
+                settings_version=record.settings.version,
                 system_prompt=self._system_prompt,
                 reasoning_visibility=self._reasoning_visibility,
             )
@@ -1155,8 +1237,8 @@ class ThreadRuntime:
                 # factories provide the hook above and therefore avoid
                 # constructing a transport for this read-only endpoint.
                 provider = self._provider_resolver(
-                    turn_config.provider_config_id,
-                    turn_config.model,
+                    candidate_provider,
+                    candidate_model,
                 )
                 candidate = getattr(provider, "capabilities", None)
                 capabilities = (
@@ -1352,7 +1434,47 @@ class ThreadRuntime:
             pending_approval=pending_approval,
             turns=deepcopy(record.turns),
             skills=skills,
+            context_diagnostics=deepcopy(record.context_diagnostics),
         )
+
+    @staticmethod
+    def _context_diagnostics(value: dict[str, object]) -> dict[str, object]:
+        """Keep a bounded, non-model-visible projection of ContextPlan facts."""
+
+        keys = (
+            "epoch_sections",
+            "context_epoch_sections",
+            "late_working_tail_sections",
+            "loaded_skill_names",
+            "canonical_history_messages",
+            "selected_history_messages",
+            "compacted_history_messages",
+            "history_estimate_tokens",
+            "task_state_view_estimate_tokens",
+            "tool_results_pruned",
+            "checkpoint_validation",
+            "checkpoint_reused",
+            "checkpoint_covered_through",
+            "compaction_performed",
+            "final_request_estimate_tokens",
+            "estimated_input_tokens",
+            "final_request_fit",
+            "final_fit",
+            "pressure",
+        )
+        result: dict[str, object] = {}
+        for key in keys:
+            item = value.get(key)
+            if isinstance(item, list):
+                result[key] = [str(child)[:256] for child in item[:32]]
+            elif isinstance(item, dict):
+                result[key] = {
+                    str(child_key)[:128]: str(child_value)[:512]
+                    for child_key, child_value in list(item.items())[:32]
+                }
+            elif isinstance(item, (str, bool, int, float)) or item is None:
+                result[key] = item
+        return result
 
     @staticmethod
     def _finish_turn(

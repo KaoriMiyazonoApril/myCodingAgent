@@ -16,7 +16,7 @@ from agent.tools.types import ToolDefinition, ToolResult
 from .conversation import Conversation
 from .change_tracker import ChangeTracker
 from .task_state import TaskState
-from .evidence import evidence_from_tool_execution
+from .evidence import attach_salient_evidence, evidence_from_tool_execution
 from .errors import ApprovalTimeoutError, TurnLimitReached
 from .events import TurnEventEmitter, public_tool_call, utc_now
 from .policy import PolicyDecision, PolicyResult, ToolPolicy
@@ -396,6 +396,13 @@ class ToolCoordinator:
         # shared Layer-1 reducer can head/tail bound it.  The extractor keeps
         # only bounded summaries; neither raw stdout nor stderr is retained in
         # TaskState.
+        # Persist a bounded provenance handoff on the canonical ToolResult
+        # before either TaskState projection or result reduction. It is the
+        # cross-Turn source of truth for salient diagnostics.
+        try:
+            attach_salient_evidence(call, result)
+        except (TypeError, ValueError):
+            pass
         evidence_values = []
         if self._task_state is not None:
             try:

@@ -17,6 +17,10 @@ MAX_SKILL_DESCRIPTION_CHARS = 1_024
 MAX_SKILL_FILE_BYTES = 64 * 1024
 MAX_SKILL_BODY_CHARS = MAX_SKILL_FILE_BYTES
 MAX_SKILL_CATALOG_CHARS = 8_000
+# Explicitly mentioned skills are projected as one bounded late instruction
+# block.  Tool-loaded bodies are intentionally excluded from this projection:
+# their canonical source is the chronological ToolResult pair.
+MAX_EXPLICIT_SKILL_PROJECTION_CHARS = 16_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +208,7 @@ class SkillTurnState:
             raise ValueError("body_max_chars must be positive")
         self.catalog = catalog
         self._loaded: dict[str, Skill] = {}
+        self._explicit_loaded: dict[str, Skill] = {}
         self._on_loaded = on_loaded
         self.body_max_chars = body_max_chars
         # Body formatting belongs to the loader seam; this object only owns
@@ -228,11 +233,25 @@ class SkillTurnState:
         if skill is None:
             return None
         if name not in self._loaded:
-            self._loaded[name] = skill
-            callback = self._on_loaded
-            if callback is not None:
-                callback(skill)
+            self._mark_loaded(skill, explicit=True)
+        elif name not in self._explicit_loaded:
+            # A caller can explicitly mention a skill after the model has
+            # loaded it.  Metadata remains unified while the late projection
+            # is promoted exactly once.
+            self._explicit_loaded[name] = skill
         return skill
+
+    def _mark_loaded(self, skill: Skill, *, explicit: bool) -> None:
+        if skill.name in self._loaded:
+            if explicit:
+                self._explicit_loaded.setdefault(skill.name, skill)
+            return
+        self._loaded[skill.name] = skill
+        if explicit:
+            self._explicit_loaded[skill.name] = skill
+        callback = self._on_loaded
+        if callback is not None:
+            callback(skill)
 
     def load(self, name: str) -> ToolResult:
         if not isinstance(name, str) or not name.strip():
@@ -255,7 +274,10 @@ class SkillTurnState:
                     "source_path": skill.source_path,
                 },
             )
-        self.activate(normalized)
+        # Model tool loading is represented by the real ToolCall/ToolResult
+        # chronological pair.  It must not be copied into the next request's
+        # late instruction tail.
+        self._mark_loaded(skill, explicit=False)
         return self.loader.load(skill)
 
     def explicit_activation(self, names: Sequence[str]) -> tuple[str, ...]:
@@ -265,18 +287,55 @@ class SkillTurnState:
                 loaded.append(name)
         return tuple(loaded)
 
-    def projection(self) -> str:
-        if not self._loaded:
+    @property
+    def explicit_loaded_names(self) -> tuple[str, ...]:
+        return tuple(self._explicit_loaded)
+
+    def projection(self, *, max_chars: int = MAX_EXPLICIT_SKILL_PROJECTION_CHARS) -> str:
+        """Return only explicit skill bodies as a bounded aggregate.
+
+        ``skill(name)`` tool bodies remain in chronological history.  The
+        distinction is deliberate: repeating a tool result in a late system
+        message makes each subsequent request grow without bound and erases
+        the protocol provenance of the load.
+        """
+
+        if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 64:
+            raise ValueError("max_chars must be at least 64")
+        if not self._explicit_loaded:
             # An empty turn-local projection should not add a synthetic
             # message to otherwise unchanged V1 requests.
             return ""
         lines = ["loaded_skills:"]
-        for skill in self.loaded:
+        omitted = 0
+        for skill in self._explicit_loaded.values():
             body = skill.body[: self.body_max_chars]
-            lines.append(
+            entry = (
                 f"## {skill.name} ({skill.source_path})\n{skill.description}\n{body}"
             )
-        return "\n\n".join(lines)
+            candidate = "\n\n".join((*lines, entry))
+            if len(candidate) <= max_chars:
+                lines.append(entry)
+                continue
+            # Keep the metadata useful even when one explicit body is huge;
+            # never emit an unbounded partial body merely to fit it.
+            metadata_entry = (
+                f"## {skill.name} ({skill.source_path})\n{skill.description}\n"
+                "[body omitted: explicit skill projection budget]"
+            )
+            candidate = "\n\n".join((*lines, metadata_entry))
+            if len(candidate) <= max_chars:
+                lines.append(metadata_entry)
+            omitted += 1
+        if omitted:
+            marker = f"- omitted_explicit_skill_bodies: {omitted}"
+            candidate = "\n\n".join((*lines, marker))
+            if len(candidate) <= max_chars:
+                lines.append(marker)
+        text = "\n\n".join(lines)
+        if len(text) > max_chars:
+            text = text[: max_chars - 1].rstrip() + "…"
+        return text
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -286,11 +345,13 @@ class SkillTurnState:
 
     def reset(self) -> None:
         self._loaded.clear()
+        self._explicit_loaded.clear()
 
 
 __all__ = [
     "MAX_SKILL_BODY_CHARS",
     "MAX_SKILL_CATALOG_CHARS",
+    "MAX_EXPLICIT_SKILL_PROJECTION_CHARS",
     "MAX_SKILL_DESCRIPTION_CHARS",
     "MAX_SKILL_FILE_BYTES",
     "MAX_SKILL_NAME_CHARS",

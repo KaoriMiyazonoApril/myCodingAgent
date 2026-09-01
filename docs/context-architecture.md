@@ -56,7 +56,12 @@ Layer 1 在 ToolResult 进入 Conversation 前对完整 provider-visible payload
 metadata 递归确定性缩减并优先保留 exit/status/error/path 等客观字段。metadata 记录
 original/retained/omitted bytes、partial 与 strategy。Provider 的直接序列化入口也应用同一幂等 reducer，
 因此大 stdout/stderr metadata 不能绕过边界。events 与 canonical Conversation 使用同一 bounded
-model-visible result；V1 不新增 raw artifact store。
+model-visible result；validation/failure 等有语义的结果还写入 bounded `salient_evidence` metadata，
+使诊断、来源工具、验证命令和路径在 Layer 2、compaction、TaskState 清空及后续 Turn 仍可见。
+成功的纯 opaque bulk payload 不附加无意义的重复 handoff。V1 不新增 raw artifact store。
+
+同步工具的异步注册 seam 使用独立的短生命周期 daemon worker，并以事件轮询把结果交回事件循环；它不把
+用户工具任务注册到 Python 的 process-wide default executor，避免 Runtime 关闭时等待不可控的后台池。
 
 Layer 2 只在 pressure 下操作 detached history。旧、已闭合、超过阈值的 result 被替换为 marker，
 但 tool message、call ID、error code 与 pairing 保留。open interaction 以及 transcript 尾部尚未被
@@ -78,7 +83,9 @@ Compaction request 自身按 atomic units 有界，并纳入 Turn execution time
 version、timestamps 与 source metadata。coverage 必须落在 atomic unit 边界；下一次 compaction 只发送
 previous summary 与 coverage 后新进入 old region 的 raw units。成功 checkpoint 由 ThreadStore 保存；
 失败保留旧 checkpoint 和完整 canonical history。恢复时 coverage、atomic boundary 或 append-only prefix
-fingerprint 无效的 checkpoint 被忽略并记录 `CHECKPOINT_INVALID`。
+fingerprint 无效的 checkpoint 被忽略并记录 `CHECKPOINT_INVALID`。缺少 canonical fingerprint 的旧
+checkpoint 仅作为迁移诊断保留，不能隐藏任何 canonical history；只有完整连续 prefix 且 coverage 不
+超过实际发送给 compactor 的 atomic source 才能推进 watermark。
 
 ## Reduction orchestration
 
@@ -113,7 +120,10 @@ compatibility facades so existing integrations do not need a flag day migration:
 
 ```text
 agent/runtime/context.py             compatibility exports
-agent/runtime/context_manager.py     turn-scoped orchestration and rendering
+agent/runtime/context_manager.py     turn-scoped orchestration and public facade
+agent/runtime/context_plan.py        ContextSources/ContextPlan value objects
+agent/runtime/context_renderer.py    model-visible section renderer
+agent/runtime/context_reduction.py   retained-prefix reduction helper
 agent/runtime/context_types.py       ContextSection and source contracts
 agent/runtime/instructions.py        root AGENTS.md provider and bounded diagnostics
 agent/runtime/runtime_environment.py stable runtime section (turn id stays internal)
@@ -126,11 +136,14 @@ agent/runtime/history/
 agent/runtime/context_history.py     compatibility exports for history package
 ```
 
-`ContextManager` owns ordering only.  The model-visible request is assembled in this order: short base
-instructions, root project instructions, the bounded available Skills catalog, stable runtime
-environment, a validated compaction summary, selected chronological history, late turn-local loaded
-Skill bodies, and the bounded `TaskStateView`.  `turn_id` and runtime telemetry are retained for events and
-diagnostics but never enter a model-visible section.
+`ContextManager` owns orchestration while the three context modules above own plan data, rendering, and
+reduction. The model-visible request is assembled in this order: short base instructions, root project
+instructions, bounded available Skills catalog, stable runtime environment, validated compaction summary,
+selected chronological history, explicitly mentioned Skill bodies, and the bounded `TaskStateView`.
+Explicit Skill bodies are the only Skill text projected into that late tail. A model `skill(name)` call is
+represented exactly once by its real assistant/tool pair and bounded ToolResult in chronological history;
+its full body is never copied into the next late tail. `turn_id` and runtime telemetry are retained for
+events and diagnostics but never enter a model-visible section.
 
 ## Skills and turn-local state
 
@@ -140,19 +153,33 @@ parser validates the directory-matching lowercase kebab-case name and bounded de
 deterministic, malformed files fail soft with diagnostics, and the model receives metadata only (bounded
 to 8,000 characters) until it asks for a Skill.
 
-The local `skill(name)` tool loads one known Skill idempotently.  Explicit `$skill-name` mentions are
-activated before the first provider request without a synthetic assistant/tool exchange; subsequent model
-iterations receive loaded bodies in a late projection.  Loaded state and diagnostics are reset for every
-Turn, while durable `skill_loaded` events and the read-only Skills popover expose metadata.  A model-driven
-load remains a real tool call/result in canonical history; an explicit preflight load is projection-only,
-so no fabricated call is added to the thread snapshot.
+The local `skill(name)` tool loads one known Skill idempotently. Explicit `$skill-name` mentions are
+activated before the first provider request without a synthetic assistant/tool exchange and are projected
+as a deterministic, aggregate, bounded late section. Loaded state and diagnostics are reset for every Turn,
+while durable `skill_loaded` events and the read-only Skills popover expose metadata. A model-driven load
+remains a real tool call/result in canonical history (including its bounded body), and is not projected again;
+an explicit preflight load is projection-only, so no fabricated call is added to the thread snapshot.
 
 ## Thread settings and capabilities
 
 Provider, model, temperature, output limit, approval mode, and optional thinking/budget settings are
 thread-scoped.  The Host preserves internal safety limits when a partial settings update omits its
 `limits` object.  `GET /api/threads/{thread_id}/capabilities` exposes conservative capability flags so
-the Web editor disables unsupported thinking controls rather than guessing from provider names.  Thread
-snapshots include Skills metadata and capability projections, never provider credentials.  Explicit Skill
-bodies are not persisted as synthetic messages; model-driven bodies remain in their real bounded ToolResult
-history by design.
+the Web editor disables unsupported thinking controls rather than guessing from provider names. The endpoint
+accepts an optional provider/model candidate and always resolves that pair rather than reusing the current
+Thread capability. The Web editor clears optional thinking fields while a candidate preview is pending; Host
+save validation normalizes unsupported fields before persistence. Thread snapshots include Skills metadata and
+capability projections, never provider credentials. Explicit Skill bodies are not persisted as synthetic
+messages; model-driven bodies remain in their real bounded ToolResult history by design.
+
+## Observability and verification
+
+`ContextPlan.decision_metadata` is copied into a bounded Runtime diagnostic seam and exposed through
+`ThreadRuntime.get_context_diagnostics()`/`ThreadSnapshot.context_diagnostics`; it is not discarded when a
+model request is rendered. The projection records epoch sections, chronological and selected history,
+TaskState estimate, loaded Skills, pruning, checkpoint validation/reuse/coverage, compaction, pressure and
+final fit. It is intentionally non-model-visible. The integration regression
+`tests/test_context_long_scenario.py` exercises two compactions, a validation failure with large output,
+explicit and model Skill lifecycles, SQLite reload, and a scope-changing fresh Turn with a deterministic
+fake provider. Skill discovery tests document the seven root paths, precedence, strict first-line `---`
+parser, malformed/oversize/encoding/path cases, and the permitted canonical-readable symlink policy.

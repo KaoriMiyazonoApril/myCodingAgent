@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 import inspect
 import logging
+import threading
 from typing import TYPE_CHECKING
 
 from agent.core.messages import ToolCallBlock
@@ -211,20 +212,49 @@ class ToolRegistry:
         self.set_execution_profile(execution_profile)
         registered = self._tools.get(call.name)
         if registered is None or registered[2] is None:
-            worker = asyncio.create_task(
-                asyncio.to_thread(
-                    self.execute,
-                    call,
-                    execution_profile=execution_profile,
-                )
-            )
-            cancellation_seen = False
-            while not worker.done():
+            # Do not use asyncio's process-global default executor here.  A
+            # ThreadRuntime is frequently embedded in ``asyncio.run`` and a
+            # long-lived default pool can make loop shutdown wait forever on
+            # Python builds with unreliable worker joins.  A daemon worker
+            # preserves the non-blocking sync-tool seam without registering a
+            # pool that the event loop must join during shutdown.
+            result_holder: list[ToolResult] = []
+            error_holder: list[BaseException] = []
+            settled = threading.Event()
+
+            def run_sync_tool() -> None:
                 try:
-                    await asyncio.shield(worker)
+                    result = self.execute(
+                        call,
+                        execution_profile=execution_profile,
+                    )
+                except BaseException as error:
+                    error_holder.append(error)
+                else:
+                    result_holder.append(result)
+                finally:
+                    settled.set()
+
+            threading.Thread(
+                target=run_sync_tool,
+                name="my-coding-agent-tool",
+                daemon=True,
+            ).start()
+            cancellation_seen = False
+            while not settled.is_set():
+                try:
+                    # Polling a threading.Event avoids depending on the
+                    # interpreter's cross-thread Future wakeup path. The
+                    # short sleep still gives the Host event loop a prompt
+                    # scheduling point while sync tools run off-thread.
+                    await asyncio.sleep(0.005)
                 except asyncio.CancelledError:
                     cancellation_seen = True
-            result = worker.result()
+            if error_holder:
+                raise error_holder[0]
+            if not result_holder:
+                raise RuntimeError("sync tool worker returned no result")
+            result = result_holder[0]
             result._settled_after_cancellation = cancellation_seen
             return result
         if call.arguments_error is not None:

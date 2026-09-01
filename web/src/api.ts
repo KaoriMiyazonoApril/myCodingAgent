@@ -277,12 +277,21 @@ export async function getThread(threadId: string): Promise<ThreadView> {
 
 export async function getThreadCapabilities(
   threadId: string,
+  candidate?: { provider_config_id?: string; model?: string },
 ): Promise<ThreadCapabilities> {
+  const query = new URLSearchParams();
+  if (candidate?.provider_config_id) {
+    query.set("provider_config_id", candidate.provider_config_id);
+  }
+  if (candidate?.model) {
+    query.set("model", candidate.model);
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
   const response = await requestJson<{
     schema_version: number;
     thread_id: string;
     capabilities: ThreadCapabilities;
-  }>(`/api/threads/${threadId}/capabilities`);
+  }>(`/api/threads/${threadId}/capabilities${suffix}`);
   return response.capabilities;
 }
 

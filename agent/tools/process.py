@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 from typing import TYPE_CHECKING
@@ -29,6 +30,38 @@ if TYPE_CHECKING:
 
 
 OUTPUT_LIMIT_BYTES = 100 * 1024
+
+
+async def _write_fd_async(fd: int, data: bytes) -> int:
+    """Write a PTY payload without registering work in asyncio's global pool."""
+
+    result_holder: list[int] = []
+    error_holder: list[BaseException] = []
+    settled = threading.Event()
+
+    def write() -> None:
+        try:
+            result_holder.append(os.write(fd, data))
+        except BaseException as error:
+            error_holder.append(error)
+        finally:
+            settled.set()
+
+    threading.Thread(
+        target=write,
+        name="my-coding-agent-pty-write",
+        daemon=True,
+    ).start()
+    while not settled.is_set():
+        try:
+            await asyncio.sleep(0.005)
+        except asyncio.CancelledError:
+            raise
+    if error_holder:
+        raise error_holder[0]
+    if not result_holder:
+        raise OSError("PTY writer returned no result")
+    return result_holder[0]
 
 
 class CommandSandboxUnavailableError(RuntimeError):
@@ -822,7 +855,7 @@ class ProcessSession:
             if self._spawned.stdin_fd is None:
                 raise ToolOperationError("STDIN_CLOSED", "session stdin is closed")
             try:
-                await asyncio.to_thread(os.write, self._spawned.stdin_fd, chars.encode())
+                await _write_fd_async(self._spawned.stdin_fd, chars.encode())
             except (BrokenPipeError, OSError) as error:
                 raise ToolOperationError("STDIN_CLOSED", "session stdin is closed") from error
             return

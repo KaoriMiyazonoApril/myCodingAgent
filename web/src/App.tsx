@@ -9,6 +9,7 @@ import {
   getProviders,
   getThread,
   getThreads,
+  getThreadCapabilities,
   getWorkspaces,
   HostError,
   saveProvider,
@@ -33,6 +34,12 @@ import {
   type ApprovalRequest,
 } from "./events";
 import "./styles.css";
+
+const DISABLED_CAPABILITIES: ThreadCapabilities = {
+  thinking_supported: false,
+  supports_thinking_budget: false,
+  supported_keep_values: [],
+};
 
 export function App() {
   const [providers, setProviders] = useState<ProviderView[]>([]);
@@ -1219,9 +1226,6 @@ function ActiveThreadView({
   const [settingsThinkingBudget, setSettingsThinkingBudget] = useState<number | null>(
     thread.snapshot.settings.thinking?.budget_tokens ?? null,
   );
-  const [settingsThinkingKeep, setSettingsThinkingKeep] = useState<"none" | "all" | null>(
-    thread.snapshot.settings.thinking?.keep ?? null,
-  );
   const [settingsApprovalMode, setSettingsApprovalMode] = useState<
     "untrusted" | "on_request" | "never"
   >(thread.snapshot.settings.approval_mode ?? "on_request");
@@ -1230,11 +1234,56 @@ function ActiveThreadView({
   const mountedRef = useRef(true);
   const threadId = thread.snapshot.thread_id;
   const submissionActive = thread.submission !== null;
-  const capabilities: ThreadCapabilities = thread.capabilities ?? {
-    thinking_supported: false,
-    supports_thinking_budget: false,
-    supported_keep_values: [],
-  };
+  // Candidate capability previews are authoritative for the draft values.
+  // Start conservatively so opening Settings cannot briefly expose the
+  // previous Thread's optional controls before the candidate request returns.
+  const [capabilities, setCapabilities] = useState<ThreadCapabilities>(
+    DISABLED_CAPABILITIES,
+  );
+
+  useEffect(() => {
+    if (!showSettings) {
+      return;
+    }
+    // A draft provider/model is a different capability candidate. Clear the
+    // old answer on the next task tick, then replace it only with the bounded
+    // Host preview response for this exact pair. Deferring the reset also
+    // keeps this synchronization effect from cascading a render.
+    const resetTimer = window.setTimeout(() => {
+      setCapabilities(DISABLED_CAPABILITIES);
+      setSettingsThinking(false);
+      setSettingsThinkingBudget(null);
+    }, 0);
+    const provider = settingsProvider.trim();
+    const model = settingsModel.trim();
+    if (!provider || !model) {
+      return () => window.clearTimeout(resetTimer);
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void getThreadCapabilities(threadId, {
+        provider_config_id: provider,
+        model,
+      })
+        .then((next) => {
+          if (!cancelled) {
+            setCapabilities(next);
+          }
+        })
+        .catch(() => {
+          // Conservative disabled capabilities keep unsupported fields out of
+          // a save while the candidate endpoint is unavailable.
+          if (!cancelled) {
+            setCapabilities(DISABLED_CAPABILITIES);
+          }
+        });
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(resetTimer);
+      window.clearTimeout(timer);
+    };
+  }, [showSettings, settingsModel, settingsProvider, threadId]);
 
   useEffect(() => () => {
     mountedRef.current = false;
@@ -1398,7 +1447,7 @@ function ActiveThreadView({
               ) : null}
             </div>
             <SkillsPopover
-              skills={thread.snapshot.skills}
+              skills={state.skills}
               open={showSkills}
               onToggle={() => setShowSkills((current) => !current)}
               onClose={() => setShowSkills(false)}
@@ -1493,6 +1542,9 @@ function ActiveThreadView({
                     );
                     setSettingsProvider(event.target.value);
                     setSettingsModel(next?.selected_model ?? "");
+                    setCapabilities(DISABLED_CAPABILITIES);
+                    setSettingsThinking(false);
+                    setSettingsThinkingBudget(null);
                   }}
                 >
                   {providers.map((provider) => (
@@ -1506,7 +1558,12 @@ function ActiveThreadView({
                   id="thread-settings-model"
                   value={settingsModel}
                   disabled={busy || thread.snapshot.status === "closed"}
-                  onChange={(event) => setSettingsModel(event.target.value)}
+                  onChange={(event) => {
+                    setSettingsModel(event.target.value);
+                    setCapabilities(DISABLED_CAPABILITIES);
+                    setSettingsThinking(false);
+                    setSettingsThinkingBudget(null);
+                  }}
                 />
                 <label htmlFor="thread-settings-temperature">温度</label>
                 <input
@@ -1550,7 +1607,6 @@ function ActiveThreadView({
                     setSettingsThinking(event.target.checked);
                     if (!event.target.checked) {
                       setSettingsThinkingBudget(null);
-                      setSettingsThinkingKeep(null);
                     }
                   }}
                 />
@@ -1569,23 +1625,6 @@ function ActiveThreadView({
                         )
                       }
                     />
-                  </>
-                ) : null}
-                {settingsThinking && capabilities.supported_keep_values.length > 0 ? (
-                  <>
-                    <label htmlFor="thread-settings-thinking-keep">Thinking history</label>
-                    <select
-                      id="thread-settings-thinking-keep"
-                      value={settingsThinkingKeep ?? capabilities.supported_keep_values[0]}
-                      disabled={busy || thread.snapshot.status === "closed"}
-                      onChange={(event) =>
-                        setSettingsThinkingKeep(event.target.value === "all" ? "all" : "none")
-                      }
-                    >
-                      {capabilities.supported_keep_values.map((value) => (
-                        <option key={value} value={value}>{value}</option>
-                      ))}
-                    </select>
                   </>
                 ) : null}
                 <label htmlFor="thread-settings-approval">Approval mode</label>
@@ -1624,13 +1663,7 @@ function ActiveThreadView({
                             budget_tokens: capabilities.supports_thinking_budget
                               ? settingsThinkingBudget
                               : null,
-                            keep:
-                              settingsThinkingKeep !== null &&
-                              capabilities.supported_keep_values.includes(
-                                settingsThinkingKeep,
-                              )
-                                ? settingsThinkingKeep
-                                : null,
+                            keep: null,
                           }
                         : null,
                       approval_mode:

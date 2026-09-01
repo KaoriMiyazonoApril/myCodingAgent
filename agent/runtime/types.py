@@ -68,6 +68,9 @@ class ThreadSnapshot:
     pending_approval: dict[str, Any] | None = None
     turns: list[TurnSummary] = field(default_factory=list)
     skills: dict[str, Any] = field(default_factory=dict)
+    # Non-model-visible context diagnostics retained for Host/debug/test
+    # inspection.  It is deliberately detached from canonical messages.
+    context_diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached structure accepted by strict JSON encoders."""

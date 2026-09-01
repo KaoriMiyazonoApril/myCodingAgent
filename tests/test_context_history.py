@@ -14,6 +14,7 @@ from agent.runtime.context_history import (
     canonical_history_fingerprint,
     parse_atomic_history,
 )
+from agent.runtime.history.compaction import _units_matching_source
 
 
 def _text(role: str, value: str) -> Message:
@@ -224,13 +225,17 @@ def test_failed_rolling_compaction_reports_previous_checkpoint_without_mutation(
         async def compact(self, previous, region):
             raise RuntimeError("provider unavailable")
 
-    checkpoint = CompactionCheckpoint(CompactionSummary("old handoff"), covered_through=1)
     history = [
         _text("user", "old"),
         _text("assistant", "answer"),
         _text("user", "new detail"),
         _text("assistant", "new answer"),
     ]
+    checkpoint = CompactionCheckpoint(
+        CompactionSummary("old handoff"),
+        covered_through=1,
+        canonical_fingerprint=canonical_history_fingerprint(history, 1),
+    )
     selection = RecentRawTailSelector(usable_input_tokens=8).select(history)
 
     try:
@@ -246,3 +251,74 @@ def test_failed_rolling_compaction_reports_previous_checkpoint_without_mutation(
     else:
         raise AssertionError("expected semantic compaction failure")
     assert checkpoint.summary.text == "old handoff"
+
+
+def test_missing_checkpoint_fingerprint_cannot_hide_canonical_history() -> None:
+    history = [
+        _text("user", "first request"),
+        _text("assistant", "first answer"),
+        _text("user", "new request"),
+    ]
+    legacy = CompactionCheckpoint(
+        CompactionSummary("legacy handoff"),
+        covered_through=1,
+    )
+
+    assert legacy.valid_for_history(history) is False
+    selection = RecentRawTailSelector(usable_input_tokens=1).select(
+        history,
+        checkpoint=legacy,
+    )
+
+    assert selection.metadata["covered_through"] is None
+    assert selection.compact_candidates
+    assert selection.compact_candidates[0] == history[0]
+    assert selection.compact_candidates[1] == history[1]
+
+
+def test_compactor_source_matching_requires_a_contiguous_complete_prefix() -> None:
+    history = [
+        _text("user", "first"),
+        _text("assistant", "first answer"),
+        _text("user", "second"),
+        *_tool_round("run_command", "call-2", "failure"),
+    ]
+    units = parse_atomic_history(history)
+
+    assert _units_matching_source(units, history[:2]) == units[:2]
+    # A detached source that starts at the second candidate is not a prefix;
+    # accepting it would advance a rolling checkpoint over omitted history.
+    assert _units_matching_source(units, history[2:]) == []
+    # A partial assistant/tool interaction is never a complete source unit.
+    assert _units_matching_source(units, history[:4]) == []
+
+
+def test_checkpoint_coverage_hint_cannot_exceed_bounded_compactor_source() -> None:
+    class BoundedCompactor:
+        last_compaction_source: list[Message] | None = None
+
+        async def compact(self, previous, region):
+            del previous
+            self.last_compaction_source = list(region[:2])
+            return CompactionSummary("bounded handoff")
+
+    history = [
+        _text("user", "one"),
+        _text("assistant", "two"),
+        _text("user", "three"),
+        _text("assistant", "four"),
+    ]
+    selection = RecentRawTailSelector(usable_input_tokens=1).select(history)
+    compactor = BoundedCompactor()
+
+    result = asyncio.run(
+        RollingSemanticCompactor(compactor).compact(
+            history,
+            selection,
+            coverage_end=10_000,
+        )
+    )
+
+    assert result is not None
+    assert result.checkpoint.covered_through == 1
+    assert result.checkpoint.covered_through < 10_000

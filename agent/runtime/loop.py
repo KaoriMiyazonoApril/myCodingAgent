@@ -41,6 +41,7 @@ class AgentLoop:
         compaction_checkpoint: CompactionCheckpoint | None = None,
         history_compactor: AsyncHistoryCompactor | None = None,
         checkpoint_sink: Callable[[CompactionCheckpoint], None] | None = None,
+        context_diagnostics_sink: Callable[[dict[str, object]], None] | None = None,
     ) -> LoopOutcome:
         pending_input = current_input
         current_checkpoint = compaction_checkpoint
@@ -68,6 +69,10 @@ class AgentLoop:
                     current_checkpoint = next_checkpoint
                     if checkpoint_sink is not None:
                         checkpoint_sink(next_checkpoint)
+                if context_diagnostics_sink is not None:
+                    context_diagnostics_sink(
+                        dict(plan.decision_metadata)
+                    )
                 messages = context_manager.render(plan)
             response = await controller.wait(
                 model.stream(

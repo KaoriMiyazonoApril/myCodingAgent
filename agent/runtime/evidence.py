@@ -17,6 +17,10 @@ from .task_state import Evidence, EvidenceKind
 MAX_SALIENT_DIAGNOSTIC_CHARS = 768
 MAX_SALIENT_DIAGNOSTIC_LINES = 12
 MAX_SALIENT_LINE_CHARS = 240
+MAX_SALIENT_COMMAND_CHARS = 512
+MAX_SALIENT_PATHS = 16
+MAX_SALIENT_PATH_CHARS = 512
+MAX_SALIENT_PATH_TOTAL_CHARS = 2_048
 _DIAGNOSTIC_PATTERN = re.compile(
     r"(?:\berror\b|\bfailed\b|\bfailure\b|\bfatal\b|\btraceback\b|"
     r"\bexception\b|\bassert(?:ion)?\b|\bexpected\b|\bactual\b|"
@@ -45,6 +49,28 @@ _READ_ONLY_TOOLS = frozenset(
         "list_directory",
         "search",
         "search_files",
+    }
+)
+_SEMANTIC_RESULT_METADATA_KEYS = frozenset(
+    {
+        "artifact",
+        "artifact_path",
+        "artifacts",
+        "changed_paths",
+        "change_types",
+        "modified_files",
+        "mutation",
+        "mutations",
+    }
+)
+_MUTATING_TOOL_NAMES = frozenset(
+    {
+        "apply_patch",
+        "copy_file",
+        "delete_file",
+        "edit_file",
+        "move_file",
+        "write_file",
     }
 )
 
@@ -133,7 +159,17 @@ def _paths(call: ToolCallBlock | None, result: ToolResult | ToolResultBlock) -> 
         value = call.arguments.get("path")
         if isinstance(value, str) and value.strip():
             values.append(value.strip())
-    return tuple(dict.fromkeys(values))
+    bounded: list[str] = []
+    total = 0
+    for value in dict.fromkeys(values):
+        path = value[:MAX_SALIENT_PATH_CHARS]
+        if total + len(path) > MAX_SALIENT_PATH_TOTAL_CHARS:
+            break
+        bounded.append(path)
+        total += len(path)
+        if len(bounded) >= MAX_SALIENT_PATHS:
+            break
+    return tuple(bounded)
 
 
 def _field(result: ToolResult | ToolResultBlock, key: str) -> object:
@@ -171,7 +207,7 @@ def extract_salient_diagnostics(
         candidate = call.arguments.get("command")
         if isinstance(candidate, str):
             command_value = candidate
-    command_value = command_value or ""
+    command_value = (command_value or "")[:MAX_SALIENT_COMMAND_CHARS]
     raw_status = metadata.get("status")
     if isinstance(raw_status, str) and raw_status.strip():
         status = raw_status.strip()
@@ -401,6 +437,57 @@ def evidence_from_tool_execution(
     return evidence
 
 
+def attach_salient_evidence(
+    call: ToolCallBlock,
+    result: ToolResult,
+) -> ToolResult:
+    """Attach a bounded diagnostic handoff to the canonical ToolResult.
+
+    TaskState is intentionally turn-local. This metadata is the durable,
+    safe provenance bridge that survives task-state clearing, Layer-1/Layer-2
+    result reduction, semantic compaction, and a later scope-changing turn.
+    It contains no raw stdout/stderr and has bounded paths and strings.
+    """
+
+    if not isinstance(call, ToolCallBlock) or not isinstance(result, ToolResult):
+        raise ValueError("call and result must be tool execution values")
+    # A policy/budget placeholder was never executed, so it has no durable
+    # diagnostic or provenance to hand off.  Keep its compact compatibility
+    # metadata exactly as emitted by the coordinator.
+    if result.metadata.get("executed") is False:
+        return result
+    extraction = extract_salient_diagnostics(result, call=call, tool_name=call.name)
+    # A successful opaque payload (for example a deliberately large custom
+    # result) has no diagnostic handoff to preserve.  Avoid adding a sizeable
+    # duplicate metadata object for that case; failures, validation commands,
+    # and explicit mutation/artifact results still get the durable bridge.
+    metadata_keys = {str(key).casefold() for key in result.metadata}
+    semantic_result = bool(metadata_keys & _SEMANTIC_RESULT_METADATA_KEYS)
+    semantic_tool = call.name.casefold().strip() in _MUTATING_TOOL_NAMES or call.name.casefold().strip() in {
+        "run_command",
+        "write_stdin",
+    }
+    if (
+        result.error_code is None
+        and extraction.validation_key is None
+        and extraction.status.casefold() == "success"
+        and not semantic_result
+        and not semantic_tool
+    ):
+        return result
+    metadata = extraction.to_dict()
+    metadata.update(
+        {
+            "tool": call.name[:MAX_SALIENT_COMMAND_CHARS],
+            "source_tool_call_id": call.id[:MAX_SALIENT_COMMAND_CHARS],
+        }
+    )
+    # Keep metadata itself compact before the general result reducer accounts
+    # for arbitrary tool-provided metadata.
+    result.metadata = {**result.metadata, "salient_evidence": metadata}
+    return result
+
+
 # Discoverable aliases for callers that use the domain vocabulary directly.
 SalientEvidenceExtractor = type(
     "SalientEvidenceExtractor",
@@ -415,10 +502,15 @@ __all__ = [
     "MAX_SALIENT_DIAGNOSTIC_CHARS",
     "MAX_SALIENT_DIAGNOSTIC_LINES",
     "MAX_SALIENT_LINE_CHARS",
+    "MAX_SALIENT_COMMAND_CHARS",
+    "MAX_SALIENT_PATHS",
+    "MAX_SALIENT_PATH_CHARS",
+    "MAX_SALIENT_PATH_TOTAL_CHARS",
     "SalientEvidenceExtractor",
     "SalientExtraction",
     "classify_tool_execution",
     "evidence_from_tool_execution",
     "extract_salient_diagnostics",
     "extract_salient_evidence",
+    "attach_salient_evidence",
 ]

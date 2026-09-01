@@ -29,11 +29,12 @@ USER_SKILL_ROOTS: tuple[tuple[str, str], ...] = (
 
 
 def _parse_frontmatter(raw: str) -> tuple[str, str, str] | None:
-    if not raw.startswith("---"):
+    # The delimiter must be the complete first line.  Accept CRLF for files
+    # authored on Windows, but reject ``---extra`` and leading whitespace.
+    first_line, separator, _ = raw.partition("\n")
+    if not separator or first_line.rstrip("\r") != "---":
         return None
-    first_end = raw.find("\n")
-    if first_end < 0:
-        return None
+    first_end = len(first_line)
     lines = raw[first_end + 1 :].splitlines(keepends=True)
     closing = None
     for index, line in enumerate(lines):

@@ -6,10 +6,19 @@ import time
 from fastapi.testclient import TestClient
 
 from agent.host.app import create_app
+from agent.host.thread_service import ThreadHost
 from agent.host.model_catalog import ModelDiscovery
 from agent.host.provider_config import ProviderStore
 from agent.host.workspace import WorkspaceBrowser
-from agent.runtime import ApprovalMode, ModelSettings, ThreadRuntime, UnsafeWorkspaceError
+from agent.model.types import ProviderCapabilities, ThinkingCapabilities
+from agent.runtime import (
+    ApprovalMode,
+    ModelSettings,
+    ThreadRuntime,
+    ThinkingKeep,
+    ThinkingSettings,
+    UnsafeWorkspaceError,
+)
 from agent.tools.registry import ToolRegistry
 
 
@@ -208,6 +217,96 @@ def test_thread_settings_conflict_close_and_closed_mutation_are_stable(
     assert closed_again.json()["thread"]["snapshot"]["status"] == "closed"
     assert closed_update.status_code == 409
     assert closed_update.json()["error"]["code"] == "THREAD_CLOSED"
+
+
+def test_candidate_capabilities_are_authoritative_for_settings_switches(tmp_path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    store = _configured_store(tmp_path / "providers.json")
+    store.save_provider("moonshot", api_key="moonshot-key", selected_model="kimi-k2")
+    capabilities = {
+        ("deepseek", "deepseek-chat"): ProviderCapabilities(
+            thinking=ThinkingCapabilities(
+                supported=True,
+                supports_budget_tokens=True,
+                supported_keep_values=("all",),
+            )
+        ),
+        ("moonshot", "kimi-k2"): ProviderCapabilities(),
+    }
+
+    def resolve(provider_id: str, model: str):
+        del provider_id, model
+        return None
+
+    resolve.capabilities_for = lambda provider_id, model: capabilities[(  # type: ignore[attr-defined]
+        provider_id,
+        model,
+    )]
+
+    def runtime_factory(default_settings: ModelSettings) -> ThreadRuntime:
+        return ThreadRuntime(
+            tool_registry_factory=_empty_tools,
+            provider_resolver=resolve,
+            default_settings=default_settings,
+        )
+
+    browser = WorkspaceBrowser([tmp_path])
+    host = ThreadHost(
+        provider_store=store,
+        workspace_browser=browser,
+        runtime_factory=runtime_factory,
+    )
+    workspace_id = browser.select(str(workspace)).workspace_id
+    created = host.create_thread(workspace_id)
+    thread_id = created["snapshot"]["thread_id"]
+
+    supported = host.capabilities_for(
+        thread_id,
+        provider_config_id="deepseek",
+        model="deepseek-chat",
+    )
+    unsupported = host.capabilities_for(
+        thread_id,
+        provider_config_id="moonshot",
+        model="kimi-k2",
+    )
+    assert supported["supports_thinking_budget"] is True
+    assert unsupported["thinking_supported"] is False
+
+    switched = host.update_settings(
+        thread_id,
+        expected_version=0,
+        settings=ModelSettings(
+            provider_config_id="moonshot",
+            model="kimi-k2",
+            thinking=ThinkingSettings(
+                enabled=True,
+                budget_tokens=512,
+                keep=ThinkingKeep.ALL,
+            ),
+        ),
+    )
+    assert switched["snapshot"]["settings"]["thinking"] is None
+
+    switched_back = host.update_settings(
+        thread_id,
+        expected_version=1,
+        settings=ModelSettings(
+            provider_config_id="deepseek",
+            model="deepseek-chat",
+            thinking=ThinkingSettings(
+                enabled=True,
+                budget_tokens=512,
+                keep=ThinkingKeep.ALL,
+            ),
+        ),
+    )
+    assert switched_back["snapshot"]["settings"]["thinking"] == {
+        "enabled": True,
+        "budget_tokens": 512,
+        "keep": "all",
+    }
 
 
 def test_thread_api_maps_not_found_invalid_workspace_and_provider(tmp_path) -> None:

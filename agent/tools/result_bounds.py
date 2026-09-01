@@ -34,6 +34,10 @@ _OBJECTIVE_METADATA_KEYS = (
     "status",
     "error_code",
     "error",
+    # This is the bounded semantic handoff written before reduction. Keep it
+    # ahead of arbitrary path/extension metadata so pressure cannot erase the
+    # only durable explanation of a middle-of-output failure.
+    "salient_evidence",
     "path",
     "command",
     "tool",
@@ -65,6 +69,11 @@ _OBJECTIVE_METADATA_RANK = {
     name: rank for rank, name in enumerate(_OBJECTIVE_METADATA_KEYS)
 }
 _METADATA_DIAGNOSTIC_RESERVE_BYTES = 768
+# Salient evidence is a bounded semantic handoff and must survive even when
+# arbitrary tool metadata consumes the result envelope.  This reserve is only
+# applied when the handoff is present; ordinary results retain the historical
+# content-first behavior.
+_SEMANTIC_METADATA_RESERVE_BYTES = 2_304
 
 
 def _prefix_at_most(value: bytes, limit: int) -> bytes:
@@ -498,7 +507,12 @@ def _bound_result_values(
         if payload_size <= max_bytes:
             return bounded_content, bounded_metadata
         excess = payload_size - max_bytes
-        next_budget = max(1, content_budget - max(1, excess))
+        semantic_reserve = (
+            _SEMANTIC_METADATA_RESERVE_BYTES
+            if "salient_evidence" in source_metadata
+            else 0
+        )
+        next_budget = max(1, content_budget - max(1, excess + semantic_reserve))
         if next_budget == content_budget:
             break
         content_budget = next_budget

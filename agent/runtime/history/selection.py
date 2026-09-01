@@ -157,17 +157,26 @@ class RecentRawTailSelector:
             if usable_input_tokens is not None:
                 raise ValueError("provide only one usable input budget")
             usable_input_tokens = usable_tokens
+        # A checkpoint is an optimization, never an authority over the
+        # canonical transcript.  Validate it at this public selector seam as
+        # well as in ContextManager/RollingSemanticCompactor so a legacy or
+        # tampered checkpoint cannot hide history when callers use the
+        # selector directly.
+        snapshot = _validate_history(history)
         if checkpoint is not None:
             if covered_through is not None:
                 raise ValueError("provide only one checkpoint coverage")
-            covered_through = checkpoint.covered_through
+            validator = getattr(checkpoint, "valid_for_history", None)
+            if callable(validator) and validator(snapshot):
+                covered_through = checkpoint.covered_through
+            else:
+                covered_through = None
         if covered_through is not None and (
             isinstance(covered_through, bool)
             or not isinstance(covered_through, int)
             or covered_through < -1
         ):
             raise ValueError("covered_through must be an integer at least -1")
-        snapshot = _validate_history(history)
         units = parse_atomic_history(snapshot)
         available = (
             usable_input_tokens

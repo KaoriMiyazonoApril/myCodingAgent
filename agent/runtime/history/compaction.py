@@ -291,8 +291,12 @@ class CompactionCheckpoint:
                 # would make the next request expose an orphan protocol item.
                 if not any(unit.end_index == self.covered_through for unit in units):
                     return False
+            # A checkpoint without a canonical prefix fingerprint is legacy
+            # metadata, not proof that the durable prefix is unchanged.  It
+            # may be retained for diagnostics/migration, but it must never
+            # hide canonical history from a model request.
             if self.canonical_fingerprint is None:
-                return not require_fingerprint
+                return False
             return self.canonical_fingerprint == canonical_history_fingerprint(
                 messages, self.covered_through
             )
@@ -606,11 +610,21 @@ def _units_matching_source(
     cursor = 0
     for unit in units:
         count = len(unit.messages)
-        if source_messages[cursor : cursor + count] == unit.messages:
-            matched.append(unit)
-            cursor += count
-            if cursor == len(source_messages):
-                break
+        # An open unit is not a complete compaction source even when the
+        # detached message slice happens to match it byte-for-byte.  The
+        # caller may compact a shorter prefix before this unit, but may never
+        # claim coverage through the incomplete interaction.
+        if not unit.complete:
+            break
+        # Only a complete prefix beginning at the first candidate is valid.
+        # A permissive search that skipped a mismatching unit could advance a
+        # checkpoint over an atomic interaction never sent to the compactor.
+        if source_messages[cursor : cursor + count] != unit.messages:
+            break
+        matched.append(unit)
+        cursor += count
+        if cursor == len(source_messages):
+            break
     if cursor != len(source_messages):
         return []
     return matched
@@ -706,11 +720,13 @@ class RollingSemanticCompactor:
                 (unit.end_index for unit in actual_units),
                 default=coverage_end if coverage_end is not None else -1,
             )
-            # ``coverage_end`` is only a fallback for a generic sequence input;
-            # when actual unit boundaries are known it must never extend beyond
-            # the source sent to the compactor.
-            if exposed_source is None and coverage_end is not None:
-                candidate_end = max(candidate_end, coverage_end)
+            # ``coverage_end`` is a hint only.  Never let it advance coverage
+            # beyond the final complete atomic unit actually sent to the
+            # compactor, including for generic sequence adapters.
+            if coverage_end is not None:
+                candidate_end = min(candidate_end, coverage_end)
+                if candidate_end not in {unit.end_index for unit in actual_units}:
+                    candidate_end = max(unit.end_index for unit in actual_units)
         except CompactionError as error:
             if error.previous_checkpoint is None:
                 error.previous_checkpoint = previous  # type: ignore[misc]

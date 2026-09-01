@@ -371,6 +371,49 @@ def test_thread_settings_reject_a_stale_version_without_overwriting(
     assert len(runtime.get_events(thread.thread_id).events) == 1
 
 
+def test_runtime_capability_preview_uses_candidate_provider_and_model(tmp_path) -> None:
+    capabilities = {
+        ("provider-a", "model-a"): ProviderCapabilities(
+            thinking=ThinkingCapabilities(
+                supported=True,
+                supports_budget_tokens=True,
+                supported_keep_values=("all",),
+            )
+        ),
+        ("provider-b", "model-b"): ProviderCapabilities(),
+    }
+
+    def resolve(provider_id: str, model: str) -> LLMProvider:
+        del provider_id, model
+        raise AssertionError("candidate capability preview must not create provider")
+
+    resolve.capabilities_for = lambda provider_id, model: capabilities[(  # type: ignore[attr-defined]
+        provider_id,
+        model,
+    )]
+    runtime = ThreadRuntime(
+        provider_resolver=resolve,
+        default_settings=ModelSettings(
+            provider_config_id="provider-a",
+            model="model-a",
+        ),
+        tool_registry_factory=empty_tools,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    first = runtime.capabilities_for(thread.thread_id)
+    candidate = runtime.capabilities_for(
+        thread.thread_id,
+        provider_config_id="provider-b",
+        model="model-b",
+    )
+
+    assert first["thinking_supported"] is True
+    assert first["supports_thinking_budget"] is True
+    assert candidate["thinking_supported"] is False
+    assert candidate["supports_thinking_budget"] is False
+
+
 def test_runtime_public_defaults_are_explicit_and_versioned(tmp_path) -> None:
     runtime = runtime_for_provider(ScriptedProvider([]))
 
@@ -1900,7 +1943,22 @@ def test_multiple_tools_and_a_recoverable_error_preserve_result_order(
                 ToolResultBlock(
                     tool_call_id="call_missing",
                     content="unknown tool: missing",
-                    metadata={"tool": "missing"},
+                    metadata={
+                        "tool": "missing",
+                        "salient_evidence": {
+                            "command": "",
+                            "status": "UNKNOWN_TOOL",
+                            "exit_code": None,
+                            "lines": ["unknown tool: missing"],
+                            "summary": (
+                                "status=UNKNOWN_TOOL; diagnostics=unknown tool: missing"
+                            ),
+                            "validation_key": None,
+                            "paths": [],
+                            "tool": "missing",
+                            "source_tool_call_id": "call_missing",
+                        },
+                    },
                     error_code="UNKNOWN_TOOL",
                 )
             ],

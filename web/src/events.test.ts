@@ -217,6 +217,63 @@ test("applies live messages and safe rejection errors", () => {
   expect(eventRequiresSnapshotRefresh("turn_rejected")).toBe(true);
 });
 
+test("updates loaded Skills from live events and resets them at the next Turn", () => {
+  const initial = view();
+  initial.snapshot.skills = {
+    schema_version: 1,
+    available: [
+      {
+        name: "repo-guide",
+        description: "Repository workflow guidance",
+        source: "workspace .agents",
+        source_path: "/workspace/.agents/skills/repo-guide/SKILL.md",
+        directory: "/workspace/.agents/skills/repo-guide",
+      },
+    ],
+    loaded: [],
+    diagnostics: [],
+  };
+  let state = hydrateThread(initial);
+  expect(state.skills.loaded).toHaveLength(0);
+  state = applyAgentEvent(
+    state,
+    event("skill_loaded", {
+      name: "repo-guide",
+      description: "Repository workflow guidance",
+      source: "workspace .agents",
+      source_path: "/workspace/.agents/skills/repo-guide/SKILL.md",
+      directory: "/workspace/.agents/skills/repo-guide",
+    }),
+  );
+  expect(state.skills.loaded.map(({ name }) => name)).toEqual(["repo-guide"]);
+  state = applyAgentEvent(
+    state,
+    event("skill_loaded", {
+      name: "repo-guide",
+      description: "Repository workflow guidance",
+      source: "workspace .agents",
+      source_path: "/workspace/.agents/skills/repo-guide/SKILL.md",
+    }),
+  );
+  expect(state.skills.loaded).toHaveLength(1);
+  state = applyAgentEvent(
+    state,
+    event("skill_activation_failed", {
+      name: "missing-skill",
+      error_code: "SKILL_NOT_FOUND",
+    }),
+  );
+  expect(state.skills.diagnostics).toEqual([
+    { code: "SKILL_NOT_FOUND", name: "missing-skill" },
+  ]);
+  state = applyAgentEvent(state, event("turn_started", { user_message: "Next" }));
+  expect(state.skills.available.map(({ name }) => name)).toEqual(["repo-guide"]);
+  expect(state.skills.loaded).toEqual([]);
+  expect(state.skills.diagnostics).toEqual([
+    { code: "SKILL_NOT_FOUND", name: "missing-skill" },
+  ]);
+});
+
 test("hydrates a safe Host background failure as a terminal error", () => {
   const state = hydrateThread({
     ...view(),
