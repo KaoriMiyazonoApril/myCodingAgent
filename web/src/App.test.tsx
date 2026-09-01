@@ -1922,3 +1922,263 @@ test("allows retry when failed resolution recovery still shows the same approval
     vi.stubGlobal("EventSource", previousEventSource);
   }
 });
+
+test("sends Reject as false, removes the card, and does not start another request", async () => {
+  const previousEventSource = globalThis.EventSource;
+  AppFakeEventSource.instances = [];
+  vi.stubGlobal("EventSource", AppFakeEventSource);
+  const thread = approvalThread("thread-approval-reject");
+  const refreshed = {
+    ...thread,
+    snapshot: {
+      ...thread.snapshot,
+      status: "idle" as const,
+      active_turn_id: null,
+      pending_approval: null,
+    },
+    submission: null,
+  };
+  const requests: Array<{ path: string; method: string; body?: string }> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ path, method, body: init?.body as string | undefined });
+      if (path === "/api/providers") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            default_provider_id: "deepseek",
+            providers: [
+              {
+                provider_id: "deepseek",
+                display_name: "DeepSeek",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "deepseek-chat",
+                is_default: true,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [thread] }),
+        } as Response;
+      }
+      if (path === `/api/threads/${thread.snapshot.thread_id}`) {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, thread: refreshed }),
+        } as Response;
+      }
+      if (path.endsWith("/approvals/approval-1")) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread_id: thread.snapshot.thread_id,
+            approval_id: "approval-1",
+            approved: false,
+          }),
+        } as Response;
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    }),
+  );
+
+  try {
+    render(<App />);
+    await screen.findByRole("button", { name: /Skills/ });
+    fireEvent.click(screen.getByRole("button", { name: "拒绝" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "拒绝" })).not.toBeInTheDocument(),
+    );
+    const approvalRequests = requests.filter(({ path, method }) =>
+      method === "POST" && path.endsWith("/approvals/approval-1"),
+    );
+    expect(approvalRequests).toHaveLength(1);
+    expect(JSON.parse(approvalRequests[0]?.body ?? "{}")).toEqual({ approved: false });
+    expect(requests.filter(({ method }) => method === "POST")).toHaveLength(1);
+  } finally {
+    vi.stubGlobal("EventSource", previousEventSource);
+  }
+});
+
+test("keeps one approval resolution in flight across snapshot remounts", async () => {
+  const previousEventSource = globalThis.EventSource;
+  AppFakeEventSource.instances = [];
+  vi.stubGlobal("EventSource", AppFakeEventSource);
+  const thread = approvalThread("thread-approval-remount");
+  const remounted = {
+    ...thread,
+    snapshot: {
+      ...thread.snapshot,
+      updated_at: "2026-08-29T00:00:02Z",
+    },
+    event_cursor: "remount-cursor",
+  };
+  const refreshed = {
+    ...remounted,
+    snapshot: {
+      ...remounted.snapshot,
+      status: "idle" as const,
+      active_turn_id: null,
+      pending_approval: null,
+    },
+    submission: null,
+  };
+  const requests: Array<{ path: string; method: string }> = [];
+  let releaseApproval!: (response: Response) => void;
+  const approvalResponse = new Promise<Response>((resolve) => {
+    releaseApproval = resolve;
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ path, method });
+      if (path === "/api/providers") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            default_provider_id: "deepseek",
+            providers: [
+              {
+                provider_id: "deepseek",
+                display_name: "DeepSeek",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "deepseek-chat",
+                is_default: true,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [thread] }),
+        } as Response;
+      }
+      if (path === `/api/threads/${thread.snapshot.thread_id}`) {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, thread: refreshed }),
+        } as Response;
+      }
+      if (path.endsWith("/approvals/approval-1")) {
+        return approvalResponse;
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    }),
+  );
+
+  try {
+    render(<App />);
+    await screen.findByRole("button", { name: /Skills/ });
+    fireEvent.click(screen.getByRole("button", { name: "批准" }));
+    const source = await waitFor(() => {
+      const current = AppFakeEventSource.instances[0];
+      if (current === undefined) {
+        throw new Error("EventSource was not created");
+      }
+      return current;
+    });
+    source.emit("snapshot", {
+      schema_version: 1,
+      thread: remounted,
+      cursor: "remount-cursor",
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "处理中…" })).toBeDisabled(),
+    );
+    expect(screen.getByRole("button", { name: "拒绝" })).toBeDisabled();
+    expect(
+      requests.filter(({ path, method }) =>
+        method === "POST" && path.endsWith("/approvals/approval-1"),
+      ),
+    ).toHaveLength(1);
+    releaseApproval({
+      ok: true,
+      json: async () => ({
+        schema_version: 1,
+        thread_id: thread.snapshot.thread_id,
+        approval_id: "approval-1",
+        approved: true,
+      }),
+    } as Response);
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "批准" })).not.toBeInTheDocument(),
+    );
+  } finally {
+    vi.stubGlobal("EventSource", previousEventSource);
+  }
+});
+
+test("keeps approval controls disabled while a cancelling snapshot is active", async () => {
+  const previousEventSource = globalThis.EventSource;
+  AppFakeEventSource.instances = [];
+  vi.stubGlobal("EventSource", AppFakeEventSource);
+  const base = approvalThread("thread-approval-cancelling");
+  const thread = {
+    ...base,
+    submission: {
+      ...base.submission!,
+      status: "cancelling" as const,
+    },
+  };
+  const requests: Array<{ path: string; method: string }> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ path, method });
+      if (path === "/api/providers") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            default_provider_id: "deepseek",
+            providers: [
+              {
+                provider_id: "deepseek",
+                display_name: "DeepSeek",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "deepseek-chat",
+                is_default: true,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [thread] }),
+        } as Response;
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    }),
+  );
+
+  try {
+    render(<App />);
+    await screen.findByRole("button", { name: /Skills/ });
+    expect(screen.getByRole("button", { name: "批准" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "拒绝" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "批准" }));
+    expect(requests.some(({ method }) => method === "POST")).toBe(false);
+  } finally {
+    vi.stubGlobal("EventSource", previousEventSource);
+  }
+});

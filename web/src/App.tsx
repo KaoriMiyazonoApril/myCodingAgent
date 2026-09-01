@@ -41,6 +41,13 @@ const DISABLED_CAPABILITIES: ThreadCapabilities = {
   supported_keep_values: [],
 };
 
+type ApprovalAction = {
+  threadId: string;
+  approvalId: string;
+  phase: "submitting" | "settled";
+  token: number;
+};
+
 export function App() {
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -861,10 +868,66 @@ function ThreadPanel({
   const [activityCollapsed, setActivityCollapsed] = useState(true);
   const [localTitles, setLocalTitles] = useState<Record<string, string>>({});
   const [pendingUserMessages, setPendingUserMessages] = useState<Record<string, string>>({});
+  // Keep the resolution guard above ActiveThreadView.  Snapshot/SSE updates
+  // intentionally change the child's key, so a local ref would be lost while
+  // its request is still in flight.
+  const [approvalActions, setApprovalActions] = useState<
+    Record<string, ApprovalAction>
+  >({});
+  const approvalActionsRef = useRef<Record<string, ApprovalAction>>({});
+  const approvalActionTokenRef = useRef(0);
 
   const active = threads.find(
     (thread) => thread.snapshot.thread_id === activeId,
   ) ?? null;
+
+  const beginApprovalAction = useCallback(
+    (threadId: string, approvalId: string): ApprovalAction | null => {
+      if (approvalActionsRef.current[threadId] !== undefined) {
+        return null;
+      }
+      const action: ApprovalAction = {
+        threadId,
+        approvalId,
+        phase: "submitting",
+        token: ++approvalActionTokenRef.current,
+      };
+      const next = { ...approvalActionsRef.current, [threadId]: action };
+      approvalActionsRef.current = next;
+      setApprovalActions(next);
+      return action;
+    },
+    [],
+  );
+
+  const updateApprovalAction = useCallback(
+    (
+      expectedThreadId: string,
+      expectedApprovalId: string,
+      expectedToken: number,
+      action: ApprovalAction | null,
+    ) => {
+      const current = approvalActionsRef.current[expectedThreadId];
+      if (
+        current === undefined ||
+        current.threadId !== expectedThreadId ||
+        current.approvalId !== expectedApprovalId ||
+        current.token !== expectedToken
+      ) {
+        return;
+      }
+      const next = { ...approvalActionsRef.current };
+      if (action === null) {
+        delete next[expectedThreadId];
+      } else {
+        next[expectedThreadId] = action;
+      }
+      approvalActionsRef.current = next;
+      setApprovalActions(next);
+    },
+    [],
+  );
+  const approvalAction = activeId === null ? null : approvalActions[activeId] ?? null;
   const configuredProviders = providers.filter((provider) => provider.configured);
   const defaultProvider =
     providers.find((provider) => provider.is_default) ?? configuredProviders[0] ?? null;
@@ -1114,6 +1177,9 @@ function ThreadPanel({
           onStop={() => void stop()}
           onSaveSettings={(settings) => void saveSettings(settings)}
           onThread={replaceThread}
+          approvalAction={approvalAction}
+          onBeginApprovalAction={beginApprovalAction}
+          onUpdateApprovalAction={updateApprovalAction}
           providers={configuredProviders}
           activityCollapsed={activityCollapsed}
           onToggleActivity={() => setActivityCollapsed((current) => !current)}
@@ -1187,6 +1253,9 @@ function ActiveThreadView({
   onStop,
   onSaveSettings,
   onThread,
+  approvalAction,
+  onBeginApprovalAction,
+  onUpdateApprovalAction,
   providers,
   activityCollapsed,
   onToggleActivity,
@@ -1205,6 +1274,17 @@ function ActiveThreadView({
   onStop: () => void;
   onSaveSettings: (settings: ThreadSettings) => void;
   onThread: (thread: ThreadView) => void;
+  approvalAction: ApprovalAction | null;
+  onBeginApprovalAction: (
+    threadId: string,
+    approvalId: string,
+  ) => ApprovalAction | null;
+  onUpdateApprovalAction: (
+    expectedThreadId: string,
+    expectedApprovalId: string,
+    expectedToken: number,
+    action: ApprovalAction | null,
+  ) => void;
   providers: ProviderView[];
   activityCollapsed: boolean;
   onToggleActivity: () => void;
@@ -1245,14 +1325,6 @@ function ActiveThreadView({
     "untrusted" | "on_request" | "never"
   >(thread.snapshot.settings.approval_mode ?? "on_request");
   const [initialCursor] = useState(thread.event_cursor);
-  const [approvalAction, setApprovalAction] = useState<{
-    approvalId: string;
-    phase: "submitting" | "settled";
-  } | null>(null);
-  const approvalActionRef = useRef<{
-    approvalId: string;
-    phase: "submitting" | "settled";
-  } | null>(null);
   const mountedRef = useRef(true);
   const threadId = thread.snapshot.thread_id;
   const submissionActive = thread.submission !== null;
@@ -1321,16 +1393,20 @@ function ActiveThreadView({
     // a delayed SSE event or a failed recovery request cannot re-enable a
     // stale approval card.  A newer approval clears the old settled guard;
     // an in-flight request remains a global lock until its finally path.
-    const action = approvalActionRef.current;
     if (
-      action !== null &&
-      action.phase === "settled" &&
-      state.approval?.approval_id !== action.approvalId
+      approvalAction !== null &&
+      approvalAction.threadId === threadId &&
+      approvalAction.phase === "settled" &&
+      state.approval?.approval_id !== approvalAction.approvalId
     ) {
-      approvalActionRef.current = null;
-      setApprovalAction(null);
+      onUpdateApprovalAction(
+        threadId,
+        approvalAction.approvalId,
+        approvalAction.token,
+        null,
+      );
     }
-  }, [state.approval]);
+  }, [approvalAction, onUpdateApprovalAction, state.approval, threadId]);
 
   useEffect(() => {
     const wasDisconnected = previousConnection.current === "disconnected";
@@ -1776,19 +1852,24 @@ function ActiveThreadView({
             <ApprovalCard
               approval={state.approval}
               busy={approvalAction !== null}
-              disabled={state.cancel_requested || thread.snapshot.status === "closed"}
+              disabled={
+                state.cancel_requested ||
+                thread.submission?.status === "cancelling" ||
+                thread.snapshot.status === "closed"
+              }
               onResolve={(approved) => {
                 const approvalId = state.approval?.approval_id;
                 if (
                   approvalId === undefined ||
-                  approvalActionRef.current !== null ||
-                  state.cancel_requested
+                  state.cancel_requested ||
+                  thread.submission?.status === "cancelling"
                 ) {
                   return;
                 }
-                const action = { approvalId, phase: "submitting" as const };
-                approvalActionRef.current = action;
-                setApprovalAction(action);
+                const action = onBeginApprovalAction(threadId, approvalId);
+                if (action === null) {
+                  return;
+                }
                 void (async () => {
                   let accepted = false;
                   let retryablePending = false;
@@ -1845,21 +1926,18 @@ function ActiveThreadView({
                     // request may settle its own guard, and it settles after
                     // the recovery read so a transient null state cannot
                     // unlock a newer approval while the old request is live.
-                    if (
-                      approvalActionRef.current?.approvalId === approvalId
-                    ) {
-                      if (retryablePending) {
-                        approvalActionRef.current = null;
-                        if (mountedRef.current) {
-                          setApprovalAction(null);
-                        }
-                      } else {
-                        const settled = { approvalId, phase: "settled" as const };
-                        approvalActionRef.current = settled;
-                        if (mountedRef.current) {
-                          setApprovalAction(settled);
-                        }
-                      }
+                    if (retryablePending) {
+                      onUpdateApprovalAction(
+                        threadId,
+                        approvalId,
+                        action.token,
+                        null,
+                      );
+                    } else {
+                      onUpdateApprovalAction(threadId, approvalId, action.token, {
+                        ...action,
+                        phase: "settled",
+                      });
                     }
                   }
                 })();

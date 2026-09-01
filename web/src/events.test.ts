@@ -430,6 +430,38 @@ test("does not let a stale approval resolution clear a newer approval", () => {
   expect(state.approval).toBeNull();
 });
 
+test("ignores an approval resolution without a valid matching id", () => {
+  let state = hydrateThread({
+    ...view(),
+    snapshot: { ...view().snapshot, messages: [], latest_turn: null },
+  });
+  state = applyAgentEvent(
+    state,
+    event("approval_requested", {
+      approval_id: "approval-active",
+      reason_code: "COMMAND_REQUIRES_APPROVAL",
+      message: "command requires approval",
+      tool_call: {
+        id: "call-active",
+        name: "run_command",
+        arguments: { command: "echo safe" },
+      },
+    }),
+  );
+
+  state = applyAgentEvent(
+    state,
+    event("approval_resolved", { resolution: "timeout" }),
+  );
+  expect(state.approval?.approval_id).toBe("approval-active");
+
+  state = applyAgentEvent(
+    state,
+    event("approval_resolved", { approval_id: "" }),
+  );
+  expect(state.approval?.approval_id).toBe("approval-active");
+});
+
 test("hydrates a pending approval from the Thread snapshot", () => {
   const pending = {
     approval_id: "snapshot-approval",

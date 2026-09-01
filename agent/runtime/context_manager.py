@@ -137,7 +137,7 @@ class ContextManager:
         pressure_pruner: ToolResultPruner | None = None,
         recent_tail_ratio: float = 0.20,
         renderer: ContextRenderer | None = None,
-        working_tail_mode: object = "late_system",
+        working_tail_mode: object = "structured_user_tail",
         skill_catalog: object | None = None,
         available_skill_catalog: object | None = None,
         skill_state: object | None = None,
@@ -165,9 +165,9 @@ class ContextManager:
             raise ValueError("recent_tail_ratio must be greater than zero and at most one")
         self.recent_tail_ratio = float(recent_tail_ratio)
         self.renderer = renderer or ContextRenderer()
-        # Keep this policy at the request-rendering seam.  Provider-aware
-        # callers pass a frozen capability value; direct legacy ContextManager
-        # callers retain the historical late-system representation.
+        # Keep this policy at the request-rendering seam. Provider-aware
+        # callers pass a frozen capability value; direct ContextManager callers
+        # use the conservative structured-user representation by default.
         mode = getattr(working_tail_mode, "value", working_tail_mode)
         if mode not in {"late_system", "structured_user_tail"}:
             raise ValueError(

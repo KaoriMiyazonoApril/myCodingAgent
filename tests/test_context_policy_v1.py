@@ -209,7 +209,10 @@ def test_rendered_system_section_boundary_survives_provider_serialization() -> N
         [_message("system", "canonical")],
         runtime_context=RuntimeContext(workspace="/workspace"),
     )
-    messages = ContextRenderer().render(plan)
+    messages = ContextRenderer().render(
+        plan,
+        working_tail_mode=WorkingTailMode.LATE_SYSTEM,
+    )
     provider = OpenAICompatibleProvider(
         ProviderConfig(
             provider="deepseek",
@@ -351,3 +354,28 @@ def test_provider_tail_capability_defaults_are_conservative_and_opt_in_is_explic
         },
     )
     assert profile.capabilities_for("verified").working_tail_mode is WorkingTailMode.LATE_SYSTEM
+
+
+def test_direct_context_rendering_defaults_to_structured_working_tail() -> None:
+    manager = ContextManager()
+    plan = asyncio.run(
+        manager.assemble_with_reduction(
+            [_message("user", "canonical request")],
+            current_input="canonical request",
+            runtime_context=RuntimeContext(workspace="/workspace"),
+            task_state=TaskState(
+                plan=TaskPlan([{"step": "inspect", "status": "in_progress"}])
+            ),
+        )
+    )[0]
+
+    rendered = manager.render(plan)
+    assert rendered[-1].role == "user"
+    tail_text = "".join(
+        block.text for block in rendered[-1].content if isinstance(block, TextBlock)
+    )
+    assert tail_text.startswith("<agent_working_state>")
+    assert "Harness-maintained execution context" in tail_text
+
+    direct_rendered = ContextRenderer().render(plan)
+    assert direct_rendered[-1].role == "user"

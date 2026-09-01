@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agent.core.messages import Message, TextBlock
+from agent.model.types import WorkingTailMode
 from agent.runtime import (
     BaseSystemInstructions,
     ContextBudget,
@@ -72,7 +73,10 @@ def test_noop_context_plan_renders_sources_and_detached_history() -> None:
         "task_state",
     ]
 
-    rendered = ContextRenderer().render(plan)
+    rendered = ContextRenderer().render(
+        plan,
+        working_tail_mode=WorkingTailMode.LATE_SYSTEM,
+    )
     assert [message.role for message in rendered] == [
         "system",
         "user",

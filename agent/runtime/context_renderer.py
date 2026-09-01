@@ -17,16 +17,16 @@ class ContextRenderer:
         self,
         plan: ContextPlan,
         *,
-        working_tail_mode: object = "late_system",
+        working_tail_mode: object = "structured_user_tail",
     ) -> list[Message]:
         """Render one detached plan with an explicit working-tail role.
 
         Context planning deliberately stays provider-independent.  The
         request layer chooses whether the detached, Harness-maintained tail
         is represented as a trailing system message or as a delimited user
-        message.  ``late_system`` remains the compatibility default for
+        message.  ``structured_user_tail`` is the conservative default for
         direct ContextRenderer callers; Runtime provider capabilities pass
-        their frozen mode explicitly.
+        their frozen mode explicitly when a provider opts into ``late_system``.
         """
 
         mode = getattr(working_tail_mode, "value", working_tail_mode)

@@ -325,8 +325,11 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     // a replayed/late SSE connection.  Only the active matching ID may clear
     // the actionable card.
     if (
-      typeof approvalId !== "string" ||
-      next.approval?.approval_id === approvalId
+      typeof approvalId === "string" &&
+      approvalId.length > 0 &&
+      typeof next.approval?.approval_id === "string" &&
+      next.approval.approval_id.length > 0 &&
+      next.approval.approval_id === approvalId
     ) {
       next.approval = null;
     }

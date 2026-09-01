@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from agent.core.messages import Message, TextBlock, ToolCallBlock, ToolResultBlock
+from agent.model.types import WorkingTailMode
 from agent.runtime.context import ContextManager
 from agent.runtime.context_types import ContextSection
 from agent.runtime.evidence import (
@@ -50,7 +51,7 @@ def test_context_v2_modules_are_canonical_and_telemetry_is_not_rendered() -> Non
     state = TaskState(
         plan=TaskPlan([{"step": "ship the change", "status": "in_progress"}])
     )
-    manager = ContextManager()
+    manager = ContextManager(working_tail_mode=WorkingTailMode.LATE_SYSTEM)
     plan, _ = asyncio.run(
         manager.assemble_with_reduction(
             [_message("user", "original constraint")],
