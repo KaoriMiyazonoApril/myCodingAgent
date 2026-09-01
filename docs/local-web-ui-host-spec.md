@@ -227,14 +227,14 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - A normal connection emits retained events strictly in EventBuffer append order. Browser reducers deduplicate by event ID and stable tool-call IDs.
 - A hydratable Thread read captures the latest event cursor and Snapshot without yielding control between those reads, then returns both. The client builds canonical UI from Snapshot and connects after the cursor.
 - When Runtime reports an expired cursor, the adapter emits a `snapshot` recovery event containing a fresh Snapshot and cursor. Its SSE ID advances to the new Runtime cursor, or explicitly clears an obsolete ID when no event exists. Streaming then continues after that cursor.
-- Snapshot recovery rebuilds Conversation from public messages, tool cards from structured message blocks, latest result and diffs from TurnSummary, settings from ThreadSnapshot, and pending transport state from Thread view. Approval recovery is not required in this version.
+- Snapshot recovery rebuilds Conversation from public messages, tool cards from structured message blocks, latest result and diffs from TurnSummary, settings from ThreadSnapshot, and pending transport state (including the active approval) from Thread view.
 - Closing an SSE connection never cancels a Turn. Stop always uses the cancellation command.
 
 ### React Web UI
 
 - The frontend uses React, TypeScript, Vite, React hooks, ordinary CSS/CSS variables, ESLint, Vitest, and React Testing Library. Tailwind, shadcn, Redux, and Zustand are not used.
 - The primary desktop layout has workspace and Thread navigation on the left, Conversation and Composer in the center, and Activity on the right. It is an execution-oriented Coding Agent UI rather than a plain chat clone.
-- Conversation renders user and assistant messages, tool request/running/result cards, file-change cards, Turn errors, Runtime rejection, and Host connection/configuration errors. Approval Card is absent.
+- Conversation renders user and assistant messages, tool request/running/result cards, bounded approval cards recovered from Snapshot/SSE, file-change cards, Turn errors, Runtime rejection, and Host connection/configuration errors.
 - Activity renders current status, submission/Turn metadata, tool calls, changed files, diff completeness, and simplified unified diffs. Tool output and diffs use bounded scrollable monospace regions.
 - Composer supports multiline text, submit, pending/running disable rules, and Stop. It never interprets Policy or treats SSE disconnect as cancellation.
 - Provider settings use a password input with save, clear, masked configured state, automatic model discovery, explicit refresh, manual model entry, and default selection.
@@ -282,7 +282,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 ## Out of Scope
 
 - Native Windows Host execution, Windows command sandboxing, Windows process-tree cancellation, or Windows workspace validation.
-- Approval endpoints, Approval Card, dangerous-command classification, or a new production ToolPolicy.
+- Complex approval policy editors, dangerous-command classification, or a new production ToolPolicy. The thin approval resolution endpoint and card reuse Runtime policy state.
 - Live command stdout/stderr streaming, or provider-hosted execution.
 - WebSocket, Electron, Tauri, PTY, xterm.js, Monaco IDE, drag-and-drop filesystem access, or browser File System API workspace selection.
 Live process/PTY/approval-future reattachment, streaming assembler recovery, and cross-process

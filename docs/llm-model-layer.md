@@ -72,6 +72,12 @@ thinking 启用参数在该底层边界仍通过 `extra_body` 指定。Agent Run
 `context_window_tokens` 声明所选模型的上下文容量；Runtime 用它在每次请求前执行保守
 容量检查，但该字段不改变底层 API payload。
 
+`ProviderCapabilities.working_tail_mode` 控制 Context V2 的 detached working tail，取值为
+`late_system` 或 `structured_user_tail`。后者是保守默认，当前 DeepSeek、Moonshot/Kimi 和
+GLM presets 均显式采用它；`late_system` 只对已验证 Provider opt-in。两种模式都由最终请求
+renderer 在 chronological history 之后追加，fallback user message 使用
+`<agent_working_state>` delimiter，并不会写入 canonical Conversation。
+
 解析响应时，文本变成 `TextBlock`，能力声明匹配到的字符串 reasoning 字段变成
 `ReasoningBlock`。工具调用参数用 `json.loads` 解析为 `dict`。空参数
 变成 `{}`；无效 JSON、非对象 JSON 或非字符串参数不会废弃整条模型响应，而是产生

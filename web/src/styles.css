@@ -982,6 +982,15 @@ textarea:disabled {
   font-size: 12px;
 }
 
+.approval-tool {
+  color: #fff1d4;
+}
+
+.approval-tool code,
+.approval-reason code {
+  overflow-wrap: anywhere;
+}
+
 .approval-reason {
   display: flex;
   flex-wrap: wrap;

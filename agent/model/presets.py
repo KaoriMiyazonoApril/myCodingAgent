@@ -11,6 +11,7 @@ from .types import (
     ProviderProfile,
     ReasoningRetention,
     ThinkingCapabilities,
+    WorkingTailMode,
 )
 
 
@@ -19,6 +20,7 @@ DEEPSEEK_CAPABILITIES = ProviderCapabilities(
     reasoning_input_field="reasoning_content",
     requires_assistant_content_for_tool_calls=True,
     thinking=ThinkingCapabilities(supported=True),
+    working_tail_mode=WorkingTailMode.STRUCTURED_USER_TAIL,
 )
 
 KIMI_CAPABILITIES = ProviderCapabilities(
@@ -28,12 +30,14 @@ KIMI_CAPABILITIES = ProviderCapabilities(
         supported=True,
         supported_keep_values=("none", "all"),
     ),
+    working_tail_mode=WorkingTailMode.STRUCTURED_USER_TAIL,
 )
 
 GLM_CAPABILITIES = ProviderCapabilities(
     reasoning_retention=ReasoningRetention.TOOL_CHAIN_ONLY,
     reasoning_input_field="reasoning_content",
     thinking=ThinkingCapabilities(supported=True),
+    working_tail_mode=WorkingTailMode.STRUCTURED_USER_TAIL,
 )
 
 PROVIDER_PRESETS = MappingProxyType(

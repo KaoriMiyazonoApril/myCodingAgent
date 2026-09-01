@@ -12,6 +12,14 @@ chronological history/current continuation，以及 late loaded-Skill 与 TaskSt
 epoch、dynamic epoch 和 late working tail 保持可观测的独立分区；renderer 在 block 边界显式加入
 换行，Provider 直接拼接 blocks 也不会产生文本粘连。
 
+Working tail 的消息 role 由 Turn 冻结的 Provider capability 决定，而不是由 Context Core
+硬编码：显式验证过的 Provider 可以选择 `late_system`，未知或未确认的 Provider（包括当前
+DeepSeek、Moonshot/Kimi 与 GLM presets）使用 `structured_user_tail`。两种形式都保持
+stable prefix → chronological history → late working tail 的顺序；fallback 是一个有界的
+`<agent_working_state>` user message，明确标注 Harness-maintained working state，且不是新的
+user intent。该消息只存在于 detached model request，不进入 canonical Conversation、compaction
+source 或 checkpoint fingerprint；current user message 仍只在 Turn 开始时追加一次。
+
 ## Project Instructions lifecycle
 
 生产 Runtime 只读取 `<opened workspace root>/AGENTS.md`。不搜索 parent、git root、nested 文件、cwd

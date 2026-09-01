@@ -11,6 +11,7 @@ from .types import (
     ProviderProfile,
     ReasoningRetention,
     ThinkingCapabilities,
+    WorkingTailMode,
     Usage,
 )
 
@@ -26,6 +27,7 @@ __all__ = [
     "ProviderProfile",
     "ReasoningRetention",
     "ThinkingCapabilities",
+    "WorkingTailMode",
     "Usage",
     "create_provider_config",
 ]

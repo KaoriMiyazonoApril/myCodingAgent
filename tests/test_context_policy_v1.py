@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 import json
 
@@ -7,7 +8,15 @@ import pytest
 
 from agent.core.messages import Message, TextBlock, ToolCallBlock, ToolResultBlock
 from agent.model.openai_compatible import OpenAICompatibleProvider
-from agent.model.types import LLMRequest, ProviderConfig
+from agent.model.presets import create_provider_config
+from agent.model.types import (
+    LLMRequest,
+    ModelProfile,
+    ProviderCapabilities,
+    ProviderConfig,
+    ProviderProfile,
+    WorkingTailMode,
+)
 from agent.runtime import (
     BaseSystemInstructions,
     ContextBudgetPolicy,
@@ -220,3 +229,125 @@ def test_rendered_system_section_boundary_survives_provider_serialization() -> N
     assert serialized_system.startswith("stable final response.\n\nruntime_context:")
     assert "response.runtime_context:" not in serialized_system
     assert json.dumps(payload, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "mode,tail_role",
+    [
+        (WorkingTailMode.LATE_SYSTEM, "system"),
+        (WorkingTailMode.STRUCTURED_USER_TAIL, "user"),
+    ],
+)
+def test_provider_working_tail_modes_preserve_history_and_wire_order(
+    mode: WorkingTailMode,
+    tail_role: str,
+) -> None:
+    call = ToolCallBlock(
+        id="call-1",
+        name="run_command",
+        arguments={"command": "pytest -q"},
+    )
+    history = [
+        _message("user", "original request"),
+        Message(role="assistant", content=[call]),
+        Message(
+            role="tool",
+            content=[
+                ToolResultBlock(
+                    tool_call_id="call-1",
+                    content="passed",
+                    metadata={},
+                )
+            ],
+        ),
+    ]
+    manager = ContextManager(working_tail_mode=mode)
+    plan = asyncio.run(
+        manager.assemble_with_reduction(
+            history,
+            current_input="current request",
+            task_state=TaskState(
+                plan=TaskPlan([{"step": "continue", "status": "in_progress"}])
+            ),
+        )
+    )[0]
+    rendered = manager.render(plan)
+
+    # The working tail is detached and comes after the complete atomic
+    # history/current request.  It never duplicates either user message.
+    assert [message.role for message in rendered] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+        tail_role,
+    ]
+    visible_text = "\n".join(
+        block.text
+        for message in rendered
+        for block in message.content
+        if isinstance(block, TextBlock)
+    )
+    assert visible_text.count("current request") == 1
+    assert rendered[1] == history[0]
+    assert rendered[2] == history[1]
+    assert rendered[3] == history[2]
+    tail_text = "".join(
+        block.text for block in rendered[-1].content if isinstance(block, TextBlock)
+    )
+    assert "task_state:" in tail_text
+    if mode is WorkingTailMode.STRUCTURED_USER_TAIL:
+        assert tail_text.startswith("<agent_working_state>")
+        assert "Harness-maintained" in tail_text
+        assert tail_text.endswith("</agent_working_state>")
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(
+            provider="custom",
+            base_url="https://example.invalid/v1",
+            api_key="test",
+            model="model",
+            capabilities=ProviderCapabilities(working_tail_mode=mode),
+        ),
+        client=object(),
+    )
+    payload = provider._build_request_payload(
+        LLMRequest(messages=rendered),
+        stream=False,
+    )
+    wire_messages = payload["messages"]
+    assert [message["role"] for message in wire_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+        tail_role,
+    ]
+    assert wire_messages[1]["content"] == "original request"
+    assert wire_messages[2]["tool_calls"][0]["id"] == "call-1"
+    assert wire_messages[3]["tool_call_id"] == "call-1"
+    assert wire_messages[4]["content"] == "current request"
+    assert "task_state:" in wire_messages[5]["content"]
+
+
+def test_provider_tail_capability_defaults_are_conservative_and_opt_in_is_explicit() -> None:
+    assert ProviderCapabilities().working_tail_mode is WorkingTailMode.STRUCTURED_USER_TAIL
+    assert create_provider_config(
+        "deepseek", api_key="key", model="model"
+    ).capabilities.working_tail_mode is WorkingTailMode.STRUCTURED_USER_TAIL
+    assert create_provider_config(
+        "moonshot", api_key="key", model="model"
+    ).capabilities.working_tail_mode is WorkingTailMode.STRUCTURED_USER_TAIL
+    assert create_provider_config(
+        "glm", api_key="key", model="model"
+    ).capabilities.working_tail_mode is WorkingTailMode.STRUCTURED_USER_TAIL
+    profile = ProviderProfile(
+        base_url="https://example.invalid",
+        default_capabilities=ProviderCapabilities(),
+        model_profiles={
+            "verified": ModelProfile(working_tail_mode=WorkingTailMode.LATE_SYSTEM),
+        },
+    )
+    assert profile.capabilities_for("verified").working_tail_mode is WorkingTailMode.LATE_SYSTEM

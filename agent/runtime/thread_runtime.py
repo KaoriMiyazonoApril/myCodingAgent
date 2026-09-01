@@ -1006,6 +1006,11 @@ class ThreadRuntime:
         return ContextManager(
             base_system_instructions=self._base_system_instructions,
             project_instructions_provider=self._project_instructions_provider,
+            working_tail_mode=(
+                "structured_user_tail"
+                if provider_capabilities is None
+                else provider_capabilities.working_tail_mode
+            ),
             budget=ContextBudget(
                 context_window_tokens=(
                     (
@@ -1469,6 +1474,7 @@ class ThreadRuntime:
             "epoch_sections",
             "context_epoch_sections",
             "late_working_tail_sections",
+            "working_tail_mode",
             "loaded_skill_names",
             "canonical_history_messages",
             "selected_history_messages",

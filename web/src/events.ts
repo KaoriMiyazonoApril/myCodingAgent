@@ -78,6 +78,7 @@ export type ApprovalRequest = {
   tool_call: Record<string, unknown> | null;
   timeout_seconds?: number;
   decision?: string;
+  execution_profile?: string;
   reason_code: string;
   message: string;
 };
@@ -319,7 +320,16 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
       };
     }
   } else if (event.type === "approval_resolved") {
-    next.approval = null;
+    const approvalId = event.payload.approval_id;
+    // Resolution events can race with a replacement approval or arrive from
+    // a replayed/late SSE connection.  Only the active matching ID may clear
+    // the actionable card.
+    if (
+      typeof approvalId !== "string" ||
+      next.approval?.approval_id === approvalId
+    ) {
+      next.approval = null;
+    }
   } else if (
     event.type === "turn_completed" ||
     event.type === "turn_cancelled" ||

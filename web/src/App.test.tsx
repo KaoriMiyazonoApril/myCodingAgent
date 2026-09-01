@@ -65,6 +65,36 @@ function appThread(
   };
 }
 
+function approvalThread(threadId = "thread-approval") {
+  const base = appThread(threadId);
+  return {
+    ...base,
+    snapshot: {
+      ...base.snapshot,
+      status: "waiting_approval" as const,
+      active_turn_id: "turn-approval",
+      pending_approval: {
+        approval_id: "approval-1",
+        tool_call: {
+          id: "call-1",
+          name: "run_command",
+          arguments: { command: "rm -rf build" },
+        },
+        timeout_seconds: 30,
+        reason_code: "DESTRUCTIVE_COMMAND",
+        message: "command requires approval",
+        execution_profile: "workspace_write",
+      },
+    },
+    event_cursor: "approval-cursor",
+    submission: {
+      thread_id: threadId,
+      status: "running" as const,
+      accepted_at: "2026-08-29T00:00:01Z",
+    },
+  };
+}
+
 class AppFakeEventSource {
   static instances: AppFakeEventSource[] = [];
   readonly listeners = new Map<
@@ -1624,6 +1654,270 @@ test("updates the Skills button from a live skill_loaded event", async () => {
     await waitFor(() =>
       expect(skillsButton).toHaveTextContent("Loaded 1 / Available 1"),
     );
+  } finally {
+    vi.stubGlobal("EventSource", previousEventSource);
+  }
+});
+
+test("hydrates an approval card, shows its risk summary, and resolves once", async () => {
+  const previousEventSource = globalThis.EventSource;
+  AppFakeEventSource.instances = [];
+  vi.stubGlobal("EventSource", AppFakeEventSource);
+  const thread = approvalThread();
+  const refreshed = {
+    ...thread,
+    snapshot: {
+      ...thread.snapshot,
+      status: "idle" as const,
+      active_turn_id: null,
+      pending_approval: null,
+    },
+    submission: null,
+  };
+  const requests: Array<{ path: string; method: string; body?: string }> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ path, method, body: init?.body as string | undefined });
+      if (path === "/api/providers") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            default_provider_id: "deepseek",
+            providers: [
+              {
+                provider_id: "deepseek",
+                display_name: "DeepSeek",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "deepseek-chat",
+                is_default: true,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [thread] }),
+        } as Response;
+      }
+      if (path === `/api/threads/${thread.snapshot.thread_id}`) {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, thread: refreshed }),
+        } as Response;
+      }
+      if (path.endsWith("/approvals/approval-1")) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread_id: thread.snapshot.thread_id,
+            approval_id: "approval-1",
+            approved: true,
+          }),
+        } as Response;
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    }),
+  );
+
+  try {
+    render(<App />);
+    await screen.findByRole("button", { name: /Skills/ });
+    expect(screen.getByText("run_command")).toBeInTheDocument();
+    expect(screen.getByRole("alert", { name: "等待确认" })).toHaveTextContent(
+      "rm -rf build",
+    );
+    expect(screen.getByText("command requires approval")).toBeInTheDocument();
+    const approve = screen.getByRole("button", { name: "批准" });
+    const reject = screen.getByRole("button", { name: "拒绝" });
+    fireEvent.click(approve);
+    fireEvent.click(approve);
+    expect(
+      requests.filter(({ path, method }) =>
+        method === "POST" && path.endsWith("/approvals/approval-1"),
+      ),
+    ).toHaveLength(1);
+    expect(approve).toBeDisabled();
+    expect(reject).toBeDisabled();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "批准" })).not.toBeInTheDocument(),
+    );
+    const resolution = requests.find(({ path, method }) =>
+      method === "POST" && path.endsWith("/approvals/approval-1"),
+    );
+    expect(JSON.parse(resolution?.body ?? "{}")).toEqual({ approved: true });
+  } finally {
+    vi.stubGlobal("EventSource", previousEventSource);
+  }
+});
+
+test("disables approval controls immediately after Turn cancellation", async () => {
+  const previousEventSource = globalThis.EventSource;
+  AppFakeEventSource.instances = [];
+  vi.stubGlobal("EventSource", AppFakeEventSource);
+  const thread = approvalThread("thread-approval-cancel");
+  const requests: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      requests.push(path);
+      if (path === "/api/providers") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            default_provider_id: "deepseek",
+            providers: [
+              {
+                provider_id: "deepseek",
+                display_name: "DeepSeek",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "deepseek-chat",
+                is_default: true,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [thread] }),
+        } as Response;
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    }),
+  );
+
+  try {
+    render(<App />);
+    await screen.findByRole("button", { name: /Skills/ });
+    const source = await waitFor(() => {
+      const current = AppFakeEventSource.instances[0];
+      if (current === undefined) {
+        throw new Error("EventSource was not created");
+      }
+      return current;
+    });
+    source.emit("turn_cancel_requested", {
+      schema_version: 1,
+      event_id: "cancel-requested",
+      thread_id: thread.snapshot.thread_id,
+      turn_id: "turn-approval",
+      sequence: 1,
+      type: "turn_cancel_requested",
+      timestamp: "2026-08-29T00:00:01Z",
+      payload: {},
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "批准" })).toBeDisabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "批准" }));
+    expect(requests.some((path) => path.includes("/approvals/"))).toBe(false);
+  } finally {
+    vi.stubGlobal("EventSource", previousEventSource);
+  }
+});
+
+test("allows retry when failed resolution recovery still shows the same approval", async () => {
+  const previousEventSource = globalThis.EventSource;
+  AppFakeEventSource.instances = [];
+  vi.stubGlobal("EventSource", AppFakeEventSource);
+  const thread = approvalThread("thread-approval-retry");
+  const refreshed = {
+    ...thread,
+    snapshot: {
+      ...thread.snapshot,
+      status: "idle" as const,
+      active_turn_id: null,
+      pending_approval: null,
+    },
+    submission: null,
+  };
+  let resolutionAttempts = 0;
+  let snapshotReads = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/api/providers") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            default_provider_id: "deepseek",
+            providers: [
+              {
+                provider_id: "deepseek",
+                display_name: "DeepSeek",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "deepseek-chat",
+                is_default: true,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [thread] }),
+        } as Response;
+      }
+      if (path === `/api/threads/${thread.snapshot.thread_id}`) {
+        snapshotReads += 1;
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread: snapshotReads === 1 ? thread : refreshed,
+          }),
+        } as Response;
+      }
+      if (path.endsWith("/approvals/approval-1")) {
+        resolutionAttempts += 1;
+        if (resolutionAttempts === 1) {
+          throw new Error("network disconnected");
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread_id: thread.snapshot.thread_id,
+            approval_id: "approval-1",
+            approved: true,
+          }),
+        } as Response;
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    }),
+  );
+
+  try {
+    render(<App />);
+    await screen.findByRole("button", { name: /Skills/ });
+    const approve = screen.getByRole("button", { name: "批准" });
+    fireEvent.click(approve);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "批准" })).toBeEnabled(),
+    );
+    expect(screen.getByText("network disconnected")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "批准" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "批准" })).not.toBeInTheDocument(),
+    );
+    expect(resolutionAttempts).toBe(2);
   } finally {
     vi.stubGlobal("EventSource", previousEventSource);
   }

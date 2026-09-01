@@ -20,6 +20,13 @@ class ReasoningRetention(str, Enum):
     ALWAYS = "always"
 
 
+class WorkingTailMode(str, Enum):
+    """How detached Harness working state is represented at request tail."""
+
+    LATE_SYSTEM = "late_system"
+    STRUCTURED_USER_TAIL = "structured_user_tail"
+
+
 class _Unset:
     """Sentinel separating inheritance from an explicit ``None`` override."""
 
@@ -67,6 +74,10 @@ class ProviderCapabilities:
     requires_assistant_content_for_tool_calls: bool = False
     thinking: ThinkingCapabilities = field(default_factory=ThinkingCapabilities)
     context_window_tokens: int | None = None
+    # Unknown OpenAI-compatible providers use the conservative user-message
+    # envelope.  A trailing system message is an explicit opt-in because
+    # provider schemas do not guarantee its semantics after tool history.
+    working_tail_mode: WorkingTailMode = WorkingTailMode.STRUCTURED_USER_TAIL
 
     def __post_init__(self) -> None:
         if not isinstance(self.reasoning_retention, ReasoningRetention):
@@ -94,6 +105,17 @@ class ProviderCapabilities:
             raise LLMConfigurationError(
                 "context_window_tokens must be a positive integer or None"
             )
+        if not isinstance(self.working_tail_mode, WorkingTailMode):
+            try:
+                object.__setattr__(
+                    self,
+                    "working_tail_mode",
+                    WorkingTailMode(self.working_tail_mode),
+                )
+            except (TypeError, ValueError) as error:
+                raise LLMConfigurationError(
+                    "working_tail_mode must be late_system or structured_user_tail"
+                ) from error
         if not isinstance(self.reasoning_output_fields, tuple) or any(
             not isinstance(field_name, str) or not field_name
             for field_name in self.reasoning_output_fields
@@ -113,6 +135,7 @@ class ModelProfile:
     requires_assistant_content_for_tool_calls: bool | None = None
     thinking: ThinkingCapabilities | None = None
     context_window_tokens: int | None | _Unset = _UNSET
+    working_tail_mode: WorkingTailMode | str | _Unset = _UNSET
 
     def apply(self, defaults: ProviderCapabilities) -> ProviderCapabilities:
         return ProviderCapabilities(
@@ -143,6 +166,11 @@ class ModelProfile:
                 defaults.context_window_tokens
                 if self.context_window_tokens is _UNSET
                 else self.context_window_tokens
+            ),
+            working_tail_mode=(
+                defaults.working_tail_mode
+                if self.working_tail_mode is _UNSET
+                else WorkingTailMode(self.working_tail_mode)
             ),
         )
 

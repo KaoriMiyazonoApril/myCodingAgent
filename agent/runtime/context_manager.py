@@ -137,6 +137,7 @@ class ContextManager:
         pressure_pruner: ToolResultPruner | None = None,
         recent_tail_ratio: float = 0.20,
         renderer: ContextRenderer | None = None,
+        working_tail_mode: object = "late_system",
         skill_catalog: object | None = None,
         available_skill_catalog: object | None = None,
         skill_state: object | None = None,
@@ -164,6 +165,15 @@ class ContextManager:
             raise ValueError("recent_tail_ratio must be greater than zero and at most one")
         self.recent_tail_ratio = float(recent_tail_ratio)
         self.renderer = renderer or ContextRenderer()
+        # Keep this policy at the request-rendering seam.  Provider-aware
+        # callers pass a frozen capability value; direct legacy ContextManager
+        # callers retain the historical late-system representation.
+        mode = getattr(working_tail_mode, "value", working_tail_mode)
+        if mode not in {"late_system", "structured_user_tail"}:
+            raise ValueError(
+                "working_tail_mode must be late_system or structured_user_tail"
+            )
+        self.working_tail_mode = mode
         self.skill_catalog = (
             skill_catalog if skill_catalog is not None else available_skill_catalog
         )
@@ -234,7 +244,13 @@ class ContextManager:
             include_late_tail=False,
         )
         if plan.final_fit == "overflow":
-            self.budget.ensure_fits(self.renderer.render(plan), list(tools))
+            self.budget.ensure_fits(
+                self.renderer.render(
+                    plan,
+                    working_tail_mode=self.working_tail_mode,
+                ),
+                list(tools),
+            )
         return plan
 
     async def assemble_with_reduction(
@@ -386,7 +402,13 @@ class ContextManager:
             )
             metadata["post_compaction_estimated_input_tokens"] = candidate.estimated_tokens
             if candidate.final_fit == "overflow":
-                self.budget.ensure_fits(self.renderer.render(candidate), list(tools))
+                self.budget.ensure_fits(
+                    self.renderer.render(
+                        candidate,
+                        working_tail_mode=self.working_tail_mode,
+                    ),
+                    list(tools),
+                )
             return self._with_metadata(candidate, metadata), valid_checkpoint
 
         if semantic_compactor is None:
@@ -394,7 +416,13 @@ class ContextManager:
             # semantic seam.  Soft pressure still fits safely; a hard request
             # remains an explicit limit rather than silently dropping history.
             if after_prune.final_fit == "overflow":
-                self.budget.ensure_fits(self.renderer.render(after_prune), list(tools))
+                self.budget.ensure_fits(
+                    self.renderer.render(
+                        after_prune,
+                        working_tail_mode=self.working_tail_mode,
+                    ),
+                    list(tools),
+                )
             return self._with_metadata(after_prune, metadata), valid_checkpoint
 
         metadata["reduction_attempts"] = {"tool_prune": 1, "compaction": 1}
@@ -418,7 +446,13 @@ class ContextManager:
             raise
         if compacted is None:
             if after_prune.final_fit == "overflow":
-                self.budget.ensure_fits(self.renderer.render(after_prune), list(tools))
+                self.budget.ensure_fits(
+                    self.renderer.render(
+                        after_prune,
+                        working_tail_mode=self.working_tail_mode,
+                    ),
+                    list(tools),
+                )
             return self._with_metadata(after_prune, metadata), valid_checkpoint
 
         metadata.update(
@@ -447,7 +481,13 @@ class ContextManager:
         metadata["post_compaction_estimated_input_tokens"] = final.estimated_tokens
         metadata["final_fits"] = final.final_fit == "fits"
         if final.final_fit == "overflow":
-            self.budget.ensure_fits(self.renderer.render(final), list(tools))
+            self.budget.ensure_fits(
+                self.renderer.render(
+                    final,
+                    working_tail_mode=self.working_tail_mode,
+                ),
+                list(tools),
+            )
         return self._with_metadata(final, metadata), compacted.checkpoint
 
     def _build_plan(
@@ -538,6 +578,7 @@ class ContextManager:
                     section.name for section in source_sections if section.name != "task_state"
                 ],
                 "late_working_tail_sections": [section.name for section in late_sections],
+                "working_tail_mode": self.working_tail_mode,
                 "loaded_skill_names": list(
                     getattr(selected_skill_state, "loaded_names", ())
                 ),
@@ -574,7 +615,13 @@ class ContextManager:
             decision_metadata=plan_metadata,
             late_sections=late_sections,
         )
-        estimated = self.budget.estimate_tokens(self.renderer.render(provisional), list(tools))
+        estimated = self.budget.estimate_tokens(
+            self.renderer.render(
+                provisional,
+                working_tail_mode=self.working_tail_mode,
+            ),
+            list(tools),
+        )
         assessment = self.budget.assess(estimated)
         plan_metadata.update(
             {
@@ -633,7 +680,10 @@ class ContextManager:
         )
 
     def render(self, plan: ContextPlan) -> list[Message]:
-        return self.renderer.render(plan)
+        return self.renderer.render(
+            plan,
+            working_tail_mode=self.working_tail_mode,
+        )
 
 
 def _path_text(value: str | Path, name: str) -> str:

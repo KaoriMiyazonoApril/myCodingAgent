@@ -390,6 +390,73 @@ test("keeps policy reason in the approval state until runtime resolves it", () =
   expect(state.approval).toBeNull();
 });
 
+test("does not let a stale approval resolution clear a newer approval", () => {
+  let state = hydrateThread({
+    ...view(),
+    snapshot: { ...view().snapshot, messages: [], latest_turn: null },
+  });
+  state = applyAgentEvent(
+    state,
+    event("approval_requested", {
+      approval_id: "approval-new",
+      reason_code: "COMMAND_REQUIRES_APPROVAL",
+      message: "command requires approval",
+      tool_call: {
+        id: "call-new",
+        name: "run_command",
+        arguments: { command: "echo safe" },
+      },
+    }),
+  );
+  state = applyAgentEvent(
+    state,
+    event("approval_resolved", {
+      approval_id: "approval-old",
+      resolution: "timeout",
+    }),
+  );
+  expect(state.approval?.approval_id).toBe("approval-new");
+
+  state = applyAgentEvent(
+    state,
+    {
+      ...event("approval_resolved", {
+        approval_id: "approval-new",
+        resolution: "timeout",
+      }),
+      event_id: "approval-new-resolved",
+    },
+  );
+  expect(state.approval).toBeNull();
+});
+
+test("hydrates a pending approval from the Thread snapshot", () => {
+  const pending = {
+    approval_id: "snapshot-approval",
+    tool_call: {
+      id: "snapshot-call",
+      name: "write_file",
+      arguments: { path: "src/app.py", content: "..." },
+    },
+    timeout_seconds: 30,
+    reason_code: "WORKSPACE_WRITE",
+    message: "writing a workspace file requires approval",
+    execution_profile: "workspace_write",
+  };
+  const hydrated = hydrateThread({
+    ...view(),
+    snapshot: {
+      ...view().snapshot,
+      status: "waiting_approval",
+      active_turn_id: "turn-snapshot",
+      messages: [],
+      latest_turn: null,
+      pending_approval: pending,
+    },
+  });
+  expect(hydrated.approval).toEqual(pending);
+});
+
 test("renders streaming deltas provisionally and clears them on canonical response", () => {
   let state = hydrateThread({
     ...view(),

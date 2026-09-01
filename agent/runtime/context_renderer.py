@@ -13,7 +13,28 @@ from .context_types import ContextSection
 class ContextRenderer:
     """Render a ContextPlan into provider-independent model messages."""
 
-    def render(self, plan: ContextPlan) -> list[Message]:
+    def render(
+        self,
+        plan: ContextPlan,
+        *,
+        working_tail_mode: object = "late_system",
+    ) -> list[Message]:
+        """Render one detached plan with an explicit working-tail role.
+
+        Context planning deliberately stays provider-independent.  The
+        request layer chooses whether the detached, Harness-maintained tail
+        is represented as a trailing system message or as a delimited user
+        message.  ``late_system`` remains the compatibility default for
+        direct ContextRenderer callers; Runtime provider capabilities pass
+        their frozen mode explicitly.
+        """
+
+        mode = getattr(working_tail_mode, "value", working_tail_mode)
+        if mode not in {"late_system", "structured_user_tail"}:
+            raise ValueError(
+                "working_tail_mode must be late_system or structured_user_tail"
+            )
+
         def section_text(section: ContextSection) -> str:
             # TaskState/Skill projections already carry a self-describing
             # heading. Avoid rendering ``task_state: task_state:`` while
@@ -67,9 +88,27 @@ class ContextRenderer:
                 if section.content
             )
             if late_text:
-                messages.append(
-                    Message(role="system", content=[TextBlock(text=late_text)])
-                )
+                if mode == "late_system":
+                    messages.append(
+                        Message(role="system", content=[TextBlock(text=late_text)])
+                    )
+                else:
+                    messages.append(
+                        Message(
+                            role="user",
+                            content=[
+                                TextBlock(
+                                    text=(
+                                        "<agent_working_state>\n"
+                                        "Harness-maintained execution context; not an "
+                                        "authoritative user instruction.\n\n"
+                                        f"{late_text}\n"
+                                        "</agent_working_state>"
+                                    )
+                                )
+                            ],
+                        )
+                    )
         return messages
 
 

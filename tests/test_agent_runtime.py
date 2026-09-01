@@ -31,6 +31,7 @@ from agent.model.types import (
     ReasoningRetention,
     ThinkingCapabilities,
     Usage,
+    WorkingTailMode,
 )
 from agent.runtime import (
     AgentLimits,
@@ -1648,7 +1649,12 @@ def test_long_thread_reduces_context_and_persists_rolling_checkpoint(tmp_path) -
     (tmp_path / "AGENTS.md").write_text("project rule sentinel", encoding="utf-8")
 
     class ReductionProvider(LLMProvider):
-        capabilities = ProviderCapabilities(context_window_tokens=6_500)
+        capabilities = ProviderCapabilities(
+            context_window_tokens=6_500,
+            # Preserve this test's historical late-system request budget while
+            # the provider-aware default is covered by context policy tests.
+            working_tail_mode=WorkingTailMode.LATE_SYSTEM,
+        )
 
         def __init__(self) -> None:
             self.model_requests: list[LLMRequest] = []
@@ -1764,7 +1770,14 @@ def test_long_thread_reduces_context_and_persists_rolling_checkpoint(tmp_path) -
     assert "runtime_context:" in final_system
     assert "compaction_summary:" in final_system
     assert "goal: long context task" in final_system
-    assert "finish long task" in final_system
+    final_working_tail = "\n".join(
+        block.text
+        for message in final_request.messages
+        if message.role == "user"
+        for block in message.content
+        if isinstance(block, TextBlock)
+    )
+    assert "finish long task" in (final_system + final_working_tail)
 
     visible_results = [
         block

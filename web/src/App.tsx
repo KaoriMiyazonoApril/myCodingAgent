@@ -709,6 +709,21 @@ function toolTarget(argumentsValue: unknown): string | null {
   return null;
 }
 
+function approvalToolName(toolCall: unknown): string {
+  if (isRecord(toolCall) && typeof toolCall.name === "string" && toolCall.name.trim()) {
+    return toolCall.name.trim();
+  }
+  return "unknown_tool";
+}
+
+function approvalToolTarget(toolCall: unknown): string | null {
+  if (!isRecord(toolCall)) {
+    return null;
+  }
+  const target = toolTarget(toolCall.arguments);
+  return target === null ? null : target.slice(0, 320);
+}
+
 function ProviderSettingsView({
   providers,
   loading,
@@ -1230,7 +1245,14 @@ function ActiveThreadView({
     "untrusted" | "on_request" | "never"
   >(thread.snapshot.settings.approval_mode ?? "on_request");
   const [initialCursor] = useState(thread.event_cursor);
-  const [approvalBusy, setApprovalBusy] = useState(false);
+  const [approvalAction, setApprovalAction] = useState<{
+    approvalId: string;
+    phase: "submitting" | "settled";
+  } | null>(null);
+  const approvalActionRef = useRef<{
+    approvalId: string;
+    phase: "submitting" | "settled";
+  } | null>(null);
   const mountedRef = useRef(true);
   const threadId = thread.snapshot.thread_id;
   const submissionActive = thread.submission !== null;
@@ -1293,6 +1315,22 @@ function ActiveThreadView({
   useEffect(() => () => {
     mountedRef.current = false;
   }, []);
+
+  useEffect(() => {
+    // A settled action is retained until Runtime/Snapshot state converges so
+    // a delayed SSE event or a failed recovery request cannot re-enable a
+    // stale approval card.  A newer approval clears the old settled guard;
+    // an in-flight request remains a global lock until its finally path.
+    const action = approvalActionRef.current;
+    if (
+      action !== null &&
+      action.phase === "settled" &&
+      state.approval?.approval_id !== action.approvalId
+    ) {
+      approvalActionRef.current = null;
+      setApprovalAction(null);
+    }
+  }, [state.approval]);
 
   useEffect(() => {
     const wasDisconnected = previousConnection.current === "disconnected";
@@ -1737,16 +1775,94 @@ function ActiveThreadView({
           {state.approval ? (
             <ApprovalCard
               approval={state.approval}
-              busy={approvalBusy}
+              busy={approvalAction !== null}
+              disabled={state.cancel_requested || thread.snapshot.status === "closed"}
               onResolve={(approved) => {
-                setApprovalBusy(true);
-                void resolveApproval(threadId, state.approval?.approval_id ?? "", approved)
-                  .catch((reason: unknown) => {
-                    setStreamError(
-                      reason instanceof Error ? reason.message : "确认请求失败",
-                    );
-                  })
-                  .finally(() => setApprovalBusy(false));
+                const approvalId = state.approval?.approval_id;
+                if (
+                  approvalId === undefined ||
+                  approvalActionRef.current !== null ||
+                  state.cancel_requested
+                ) {
+                  return;
+                }
+                const action = { approvalId, phase: "submitting" as const };
+                approvalActionRef.current = action;
+                setApprovalAction(action);
+                void (async () => {
+                  let accepted = false;
+                  let retryablePending = false;
+                  try {
+                    await resolveApproval(threadId, approvalId, approved);
+                    accepted = true;
+                    // The Host response is the Runtime's accepted resolution;
+                    // clear the old card immediately while the SSE event and
+                    // snapshot catch up.  A newer approval is never cleared.
+                    if (mountedRef.current) {
+                      setState((current) =>
+                        current.approval?.approval_id === approvalId
+                          ? { ...current, approval: null }
+                          : current,
+                      );
+                    }
+                  } catch (reason: unknown) {
+                    if (mountedRef.current) {
+                      setStreamError(
+                        reason instanceof Error ? reason.message : "确认请求失败",
+                      );
+                    }
+                  } finally {
+                    // Accepted resolutions are followed by a hydratable
+                    // Snapshot read.  This also converges after an SSE gap.
+                    // A rejected/stale response must refresh as well so a
+                    // timeout, cancellation, or race cannot leave a stale
+                    // card actionable.
+                    try {
+                      const next = await getThread(threadId);
+                      if (mountedRef.current) {
+                        onThread(next);
+                        setState(initialThreadState(next));
+                        if (accepted) {
+                          setStreamError(null);
+                        }
+                      }
+                      // A failed/unconfirmed resolution must not permanently
+                      // disable an approval that the authoritative snapshot
+                      // still says is pending.  The Runtime's exact-ID
+                      // resolver remains the source of truth, so a retry is
+                      // safe even if the first request reached the Host but
+                      // its response was lost in transit.
+                      retryablePending =
+                        !accepted &&
+                        next.snapshot.pending_approval?.approval_id === approvalId;
+                    } catch {
+                      // The settled guard remains in place until the normal
+                      // SSE/Snapshot recovery path supplies authoritative
+                      // state; never re-enable a possibly stale approval.
+                    }
+                    // Keep this approval non-actionable after both accepted
+                    // and stale/duplicate responses.  Only the matching
+                    // request may settle its own guard, and it settles after
+                    // the recovery read so a transient null state cannot
+                    // unlock a newer approval while the old request is live.
+                    if (
+                      approvalActionRef.current?.approvalId === approvalId
+                    ) {
+                      if (retryablePending) {
+                        approvalActionRef.current = null;
+                        if (mountedRef.current) {
+                          setApprovalAction(null);
+                        }
+                      } else {
+                        const settled = { approvalId, phase: "settled" as const };
+                        approvalActionRef.current = settled;
+                        if (mountedRef.current) {
+                          setApprovalAction(settled);
+                        }
+                      }
+                    }
+                  }
+                })();
               }}
             />
           ) : null}
@@ -2194,36 +2310,46 @@ function ConversationFeed({
 function ApprovalCard({
   approval,
   busy,
+  disabled,
   onResolve,
 }: {
   approval: ApprovalRequest;
   busy: boolean;
+  disabled: boolean;
   onResolve: (approved: boolean) => void;
 }) {
-  const target = toolTarget(approval.tool_call);
+  const target = approvalToolTarget(approval.tool_call);
+  const toolName = approvalToolName(approval.tool_call);
   return (
     <aside className="approval-card" role="alert" aria-label="等待确认">
       <div>
         <strong>需要确认后继续</strong>
+        <p className="approval-tool">
+          工具 <code>{toolName}</code>
+          {approval.execution_profile ? (
+            <span> · 执行配置 <code>{approval.execution_profile}</code></span>
+          ) : null}
+        </p>
         <p>{approval.message}</p>
         <p className="approval-reason">
           <code>{approval.reason_code}</code>
-          {target ? <code title={target}>{target}</code> : null}
+          {target ? <code title={target}>操作：{target}</code> : null}
+          {!target ? <span>操作摘要不可用</span> : null}
         </p>
       </div>
       <div className="approval-actions">
         <button
           type="button"
           className="primary-button"
-          disabled={busy}
+          disabled={busy || disabled}
           onClick={() => onResolve(true)}
         >
-          批准
+          {busy ? "处理中…" : "批准"}
         </button>
         <button
           type="button"
           className="quiet-button"
-          disabled={busy}
+          disabled={busy || disabled}
           onClick={() => onResolve(false)}
         >
           拒绝

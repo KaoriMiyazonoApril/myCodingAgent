@@ -110,7 +110,8 @@ Agent loop ── Conversation ── local Tools / LLM client
 
 依赖方向始终为 `Web → Host → ThreadRuntime → Agent Core`。当前 Runtime 已通过本地 SQLite
 持久化 Thread、canonical Conversation、Turn/event/idempotency 状态与 Context compaction
-checkpoint。V1 不包含 approval UI、WebSocket、认证、远程多用户服务或 Electron/Tauri；既有
+checkpoint。V1 通过既有 Runtime approval state machine 提供 Web approval UI；仍不包含
+WebSocket、认证、远程多用户服务或 Electron/Tauri；既有
 SSE/streaming 与 PTY 能力保持在现有 Runtime/ProcessManager seam 内。
 
 ## Context V2
@@ -129,3 +130,8 @@ Web 工作区的对话设置支持 provider/model、temperature、output limit�
 Skills 面板消费实时事件状态，只显示当前 Turn 已加载和可用 Skill 的元数据。
 预算、ToolResult hard bound、atomic history、rolling compaction 与 checkpoint 约束详见
 [`docs/context-architecture.md`](docs/context-architecture.md)。
+
+Context V2 的 working tail 由当前 Provider capability 选择表示方式：DeepSeek、Moonshot/Kimi
+和 GLM 默认使用有界的 `structured_user_tail`（`<agent_working_state>`），只有显式验证过的
+Provider 才使用 `late_system`。两者都位于 chronological history 之后，working state 不会
+写入 canonical Conversation，也不会覆盖最新的真实用户指令。
