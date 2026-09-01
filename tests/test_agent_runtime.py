@@ -35,6 +35,9 @@ from agent.model.types import (
 from agent.runtime import (
     AgentLimits,
     AllowAllPolicy,
+    CompactionCheckpoint,
+    CompactionSummary,
+    canonical_history_fingerprint,
     ContextLimitError,
     IdempotencyConflictError,
     InMemoryThreadStore,
@@ -412,6 +415,55 @@ def test_runtime_capability_preview_uses_candidate_provider_and_model(tmp_path) 
     assert first["supports_thinking_budget"] is True
     assert candidate["thinking_supported"] is False
     assert candidate["supports_thinking_budget"] is False
+
+    # Empty drafts are invalid candidates, not a request to inherit the
+    # current Thread values.  A capability preview must fail closed before a
+    # later Settings save can accidentally target the old provider/model.
+    empty = runtime.capabilities_for(
+        thread.thread_id,
+        provider_config_id="",
+        model="",
+    )
+    unknown = runtime.capabilities_for(
+        thread.thread_id,
+        provider_config_id="provider-missing",
+        model="model-missing",
+    )
+    assert empty["thinking_supported"] is False
+    assert empty["supports_thinking_budget"] is False
+    assert unknown["thinking_supported"] is False
+    assert unknown["supports_thinking_budget"] is False
+
+
+def test_checkpoint_save_rolls_back_memory_when_persistence_fails(tmp_path) -> None:
+    runtime = runtime_for_provider(ScriptedProvider([]))
+    thread = runtime.create_thread(tmp_path)
+    record = runtime._threads[thread.thread_id]  # type: ignore[attr-defined]
+    fingerprint = canonical_history_fingerprint([], -1)
+    previous = CompactionCheckpoint(
+        CompactionSummary("previous handoff"),
+        covered_through=-1,
+        canonical_fingerprint=fingerprint,
+    )
+    replacement = CompactionCheckpoint(
+        CompactionSummary("replacement handoff"),
+        covered_through=-1,
+        canonical_fingerprint=fingerprint,
+    )
+    record.compaction_checkpoint = previous
+    runtime._persist_record(record)
+
+    def fail_persist(_record) -> None:
+        raise OSError("store unavailable")
+
+    runtime._store.save_thread = fail_persist  # type: ignore[method-assign, attr-defined]
+    with pytest.raises(OSError, match="store unavailable"):
+        runtime._save_checkpoint(record, replacement)  # type: ignore[attr-defined]
+
+    assert record.compaction_checkpoint == previous
+    stored = runtime._store.get_thread(thread.thread_id)  # type: ignore[attr-defined]
+    assert stored is not None
+    assert stored.compaction_checkpoint == previous
 
 
 def test_runtime_public_defaults_are_explicit_and_versioned(tmp_path) -> None:

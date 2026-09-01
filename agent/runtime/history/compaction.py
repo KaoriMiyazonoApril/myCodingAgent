@@ -275,8 +275,6 @@ class CompactionCheckpoint:
     def valid_for_history(
         self,
         history: Sequence[Message],
-        *,
-        require_fingerprint: bool = False,
     ) -> bool:
         if self.version != COMPACTION_CHECKPOINT_SCHEMA_VERSION or not self.summary.synthetic:
             return False

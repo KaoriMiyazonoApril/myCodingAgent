@@ -3,6 +3,98 @@ import { beforeEach, expect, test, vi } from "vitest";
 
 import { App } from "./App";
 
+function appThread(
+  threadId: string,
+  thinking: { enabled: boolean; budget_tokens: number | null; keep: null } | null = null,
+) {
+  return {
+    schema_version: 1,
+    snapshot: {
+      schema_version: 1,
+      thread_id: threadId,
+      workspace: "/workspace",
+      status: "idle" as const,
+      active_turn_id: null,
+      completed_turns: 0,
+      settings: {
+        provider_config_id: "deepseek",
+        model: "deepseek-chat",
+        temperature: null,
+        max_tokens: null,
+        thinking,
+        limits: {
+          max_iterations: 20,
+          max_tool_calls: 50,
+          max_execution_seconds: 900,
+        },
+        approval_mode: "on_request" as const,
+        version: 0,
+      },
+      messages: [],
+      created_at: "2026-08-29T00:00:00Z",
+      updated_at: "2026-08-29T00:00:00Z",
+      latest_turn: null,
+      skills: {
+        schema_version: 1,
+        available: [
+          {
+            name: "repo-guide",
+            description: "Repository workflow guidance",
+            source: "workspace .agents",
+            source_path: "/workspace/.agents/skills/repo-guide/SKILL.md",
+            directory: "/workspace/.agents/skills/repo-guide",
+          },
+        ],
+        loaded: [],
+        diagnostics: [],
+      },
+    },
+    event_cursor: null,
+    submission: null,
+    workspace: {
+      workspace_id: "workspace-1",
+      path: "/workspace",
+      canonical_path: "/workspace",
+      display_name: "workspace",
+    },
+    capabilities: {
+      thinking_supported: true,
+      supports_thinking_budget: true,
+      supported_keep_values: ["none", "all"],
+    },
+  };
+}
+
+class AppFakeEventSource {
+  static instances: AppFakeEventSource[] = [];
+  readonly listeners = new Map<
+    string,
+    Array<(event: MessageEvent<string>) => void>
+  >();
+  onopen: ((event: Event) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+
+  constructor(readonly url: string) {
+    AppFakeEventSource.instances.push(this);
+  }
+
+  addEventListener(
+    type: string,
+    listener: (event: MessageEvent<string>) => void,
+  ) {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  close() {}
+
+  emit(type: string, payload: Record<string, unknown>) {
+    const message = new MessageEvent<string>(type, {
+      data: JSON.stringify(payload),
+    });
+    this.listeners.get(type)?.forEach((listener) => listener(message));
+  }
+}
+
 beforeEach(() => {
   vi.stubGlobal(
     "fetch",
@@ -1153,4 +1245,165 @@ test("shows Skills metadata and capability-gated thread settings", async () => {
     target: { value: "deepseek" },
   });
   await waitFor(() => expect(screen.getByLabelText("Thinking")).not.toBeDisabled());
+});
+
+test("opening and saving unchanged Settings preserves enabled Thinking", async () => {
+  const thread = appThread("thread-thinking", {
+    enabled: true,
+    budget_tokens: 1_024,
+    keep: null,
+  });
+  const requests: Array<{ path: string; method: string; body?: string }> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ path, method, body: init?.body as string | undefined });
+      if (path === "/api/providers") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            default_provider_id: "deepseek",
+            providers: [
+              {
+                provider_id: "deepseek",
+                display_name: "DeepSeek",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "deepseek-chat",
+                is_default: true,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [thread] }),
+        } as Response;
+      }
+      if (path.startsWith(`/api/threads/${thread.snapshot.thread_id}/capabilities`)) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            thread_id: thread.snapshot.thread_id,
+            capabilities: thread.capabilities,
+          }),
+        } as Response;
+      }
+      if (path === `/api/threads/${thread.snapshot.thread_id}/settings` && method === "PATCH") {
+        return {
+          ok: true,
+          json: async () => ({ thread }),
+        } as Response;
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    }),
+  );
+
+  render(<App />);
+  await screen.findByRole("button", { name: /Skills/ });
+  fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
+  await waitFor(() => expect(screen.getByLabelText("Thinking")).not.toBeDisabled());
+  expect(screen.getByLabelText("Thinking")).toBeChecked();
+  expect(screen.getByLabelText("Thinking budget")).toHaveValue(1_024);
+
+  fireEvent.click(screen.getByRole("button", { name: "保存对话设置" }));
+  await waitFor(() =>
+    expect(
+      requests.some(
+        ({ path, method }) =>
+          path === `/api/threads/${thread.snapshot.thread_id}/settings` &&
+          method === "PATCH",
+      ),
+    ).toBe(true),
+  );
+  const patch = requests.find(
+    ({ path, method }) =>
+      path === `/api/threads/${thread.snapshot.thread_id}/settings` && method === "PATCH",
+  );
+  expect(JSON.parse(patch?.body ?? "{}").thinking).toEqual({
+    enabled: true,
+    budget_tokens: 1_024,
+    keep: null,
+  });
+});
+
+test("updates the Skills button from a live skill_loaded event", async () => {
+  const previousEventSource = globalThis.EventSource;
+  AppFakeEventSource.instances = [];
+  vi.stubGlobal("EventSource", AppFakeEventSource);
+  const thread = appThread("thread-live-skills");
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/api/providers") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            default_provider_id: "deepseek",
+            providers: [
+              {
+                provider_id: "deepseek",
+                display_name: "DeepSeek",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "deepseek-chat",
+                is_default: true,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [thread] }),
+        } as Response;
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    }),
+  );
+
+  try {
+    render(<App />);
+    const skillsButton = await screen.findByRole("button", { name: /Skills/ });
+    expect(skillsButton).toHaveTextContent("Loaded 0 / Available 1");
+    const source = await waitFor(() => {
+      const current = AppFakeEventSource.instances[0];
+      if (current === undefined) {
+        throw new Error("EventSource was not created");
+      }
+      return current;
+    });
+    source.onopen?.(new Event("open"));
+    source.emit("skill_loaded", {
+      schema_version: 1,
+      event_id: "skill-loaded-live",
+      thread_id: thread.snapshot.thread_id,
+      turn_id: "turn-live",
+      sequence: 1,
+      type: "skill_loaded",
+      timestamp: "2026-08-29T00:00:01Z",
+      payload: {
+        name: "repo-guide",
+        description: "Repository workflow guidance",
+        source: "workspace .agents",
+        source_path: "/workspace/.agents/skills/repo-guide/SKILL.md",
+        directory: "/workspace/.agents/skills/repo-guide",
+      },
+    });
+    await waitFor(() =>
+      expect(skillsButton).toHaveTextContent("Loaded 1 / Available 1"),
+    );
+  } finally {
+    vi.stubGlobal("EventSource", previousEventSource);
+  }
 });

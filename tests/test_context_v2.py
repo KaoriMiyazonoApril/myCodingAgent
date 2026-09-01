@@ -15,7 +15,15 @@ from agent.runtime.evidence import (
 from agent.runtime.history import RecentRawTailSelector, RollingSemanticCompactor, ToolResultPruner
 from agent.runtime.history.compaction import CompactionSummary
 from agent.runtime.runtime_environment import RuntimeContext
-from agent.runtime.task_state import Evidence, EvidenceKind, PlanStepStatus, TaskPlan, TaskState
+from agent.runtime.task_state import (
+    Evidence,
+    EvidenceKind,
+    MAX_EVIDENCE_PATH_TOTAL_CHARS,
+    MAX_EVIDENCE_PATHS,
+    PlanStepStatus,
+    TaskPlan,
+    TaskState,
+)
 from agent.runtime.thread_runtime import ThreadRuntime
 from agent.tools.types import ToolResult
 from agent.tools.result_bounds import reduce_tool_result_block
@@ -259,6 +267,26 @@ def test_failed_file_write_is_failure_evidence_without_claiming_mutation() -> No
         timestamp="now",
     )
     assert [item.kind for item in evidence] == [EvidenceKind.FAILURE]
+
+
+def test_evidence_paths_are_bounded_before_model_projection() -> None:
+    paths = [f"src/{index}-{'x' * 700}.py" for index in range(100)]
+    evidence = Evidence(
+        kind=EvidenceKind.FAILURE,
+        status="failed",
+        summary="bounded path evidence",
+        source_tool_call_id="path-call",
+        paths=paths,
+        metadata={"paths": ["metadata-only-secret" * 1_000]},
+    )
+
+    assert len(evidence.paths) <= MAX_EVIDENCE_PATHS
+    assert sum(map(len, evidence.paths)) <= MAX_EVIDENCE_PATH_TOTAL_CHARS
+    assert evidence.paths == tuple(path[:512] for path in paths[:4])
+
+    view = TaskState(evidence=[evidence]).view(budget_tokens=128)
+    assert len(view.text) <= 128 * 4
+    assert "metadata-only-secret" not in view.text
 
 
 def test_salient_handoff_keeps_successful_mutation_and_artifact_provenance() -> None:

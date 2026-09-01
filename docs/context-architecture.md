@@ -43,8 +43,9 @@ TaskState 不保存 goal 或 constraints。当前目标仍来自 current user me
 CompactionSummary。它只包含可选 TaskPlan 与 Harness-owned mutation/validation/failure/artifact
 evidence。TaskPlan 最多 20 个 `pending` / `in_progress` / `completed` / `blocked` steps，最多一个
 `in_progress`；evidence 最多 100 条，只记录 tool、command、status、exit code、result ID 与 timestamp
-等客观事实。step 与 evidence 字符串字段均有集中、确定性的长度校验，非法更新会被拒绝而不会
-静默裁剪。
+等客观事实。step 与 evidence 的标量字符串字段均有集中、确定性的长度校验，非法更新会被拒绝；
+provenance paths 则按输入顺序最多保留 16 项、单项 512 字符、总计 2,048 字符，超出部分确定性截断，
+不会让路径 metadata 绕过 model-visible TaskState budget。
 
 模型通过普通本地 `update_plan` tool 原子替换 plan；Harness 只做 schema/invariant 校验，不根据工具
 名猜测步骤是否完成，也不把 command exit 0 推导为“整个项目正确”。
@@ -81,7 +82,8 @@ Compaction request 自身按 atomic units 有界，并纳入 Turn execution time
 
 `CompactionCheckpoint` 独立记录 summary、inclusive canonical coverage、canonical-prefix fingerprint、
 version、timestamps 与 source metadata。coverage 必须落在 atomic unit 边界；下一次 compaction 只发送
-previous summary 与 coverage 后新进入 old region 的 raw units。成功 checkpoint 由 ThreadStore 保存；
+previous summary 与 coverage 后新进入 old region 的 raw units。成功 checkpoint 由 ThreadStore 保存，内存
+checkpoint 只在 durable transition 成功后保持；
 失败保留旧 checkpoint 和完整 canonical history。恢复时 coverage、atomic boundary 或 append-only prefix
 fingerprint 无效的 checkpoint 被忽略并记录 `CHECKPOINT_INVALID`。缺少 canonical fingerprint 的旧
 checkpoint 仅作为迁移诊断保留，不能隐藏任何 canonical history；只有完整连续 prefix 且 coverage 不

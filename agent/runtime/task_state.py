@@ -34,6 +34,12 @@ MAX_EVIDENCE_SUMMARY_CHARS = 1_024
 MAX_EVIDENCE_KIND_CHARS = 32
 MAX_EVIDENCE_CALL_ID_CHARS = 256
 MAX_EVIDENCE_STEP_CHARS = MAX_PLAN_STEP_TEXT_CHARS
+# Evidence is copied into durable ToolResult metadata and may later be
+# projected into model-visible context.  Keep the path aggregate aligned with
+# salient extraction so a caller cannot create an unbounded provenance tail.
+MAX_EVIDENCE_PATHS = 16
+MAX_EVIDENCE_PATH_CHARS = 512
+MAX_EVIDENCE_PATH_TOTAL_CHARS = 2_048
 MAX_TASK_STATE_VIEW_TOKENS = 2_048
 MAX_TASK_STATE_VIEW_CHARS = MAX_TASK_STATE_VIEW_TOKENS * 4
 # A plan can legally contain twenty steps, but a completed history of every
@@ -309,10 +315,20 @@ class Evidence:
         ):
             raise ValueError("evidence exit_code must be an integer or None")
         normalized_paths: list[str] = []
+        path_chars = 0
         for path in paths:
-            normalized_paths.append(
-                _bounded_text(path, name="path", maximum=MAX_EVIDENCE_COMMAND_CHARS, required=True)
-            )
+            if len(normalized_paths) >= MAX_EVIDENCE_PATHS:
+                break
+            bounded_path = _bounded_text(
+                path,
+                name="path",
+                maximum=MAX_EVIDENCE_COMMAND_CHARS,
+                required=True,
+            )[:MAX_EVIDENCE_PATH_CHARS]
+            if path_chars + len(bounded_path) > MAX_EVIDENCE_PATH_TOTAL_CHARS:
+                break
+            normalized_paths.append(bounded_path)
+            path_chars += len(bounded_path)
         if metadata is not None and not isinstance(metadata, Mapping):
             raise ValueError("evidence metadata must be an object")
         object.__setattr__(self, "kind", normalized_kind)
@@ -662,6 +678,9 @@ __all__ = [
     "MAX_EVIDENCE_CALL_ID_CHARS",
     "MAX_EVIDENCE_COMMAND_CHARS",
     "MAX_EVIDENCE_KIND_CHARS",
+    "MAX_EVIDENCE_PATH_CHARS",
+    "MAX_EVIDENCE_PATH_TOTAL_CHARS",
+    "MAX_EVIDENCE_PATHS",
     "MAX_EVIDENCE_RESULT_ID_CHARS",
     "MAX_EVIDENCE_STATUS_CHARS",
     "MAX_EVIDENCE_STEP_CHARS",

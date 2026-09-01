@@ -1251,8 +1251,6 @@ function ActiveThreadView({
     // keeps this synchronization effect from cascading a render.
     const resetTimer = window.setTimeout(() => {
       setCapabilities(DISABLED_CAPABILITIES);
-      setSettingsThinking(false);
-      setSettingsThinkingBudget(null);
     }, 0);
     const provider = settingsProvider.trim();
     const model = settingsModel.trim();

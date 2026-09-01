@@ -675,6 +675,27 @@ class ThreadRuntime:
         else:
             self._store.save_thread(state)
 
+    def _save_checkpoint(
+        self,
+        record: _ThreadRecord,
+        checkpoint: CompactionCheckpoint,
+    ) -> None:
+        """Persist a rolling checkpoint without splitting memory and store.
+
+        Compaction invokes this callback while a Turn is active.  The
+        in-memory record must not advertise a new checkpoint when the durable
+        transition fails; otherwise a later request could incorrectly reuse a
+        prefix that was never committed to the ThreadStore.
+        """
+
+        previous = record.compaction_checkpoint
+        try:
+            record.compaction_checkpoint = deepcopy(checkpoint)
+            self._persist_record(record)
+        except BaseException:
+            record.compaction_checkpoint = previous
+            raise
+
     async def run_turn(
         self,
         thread_id: str,
@@ -1078,8 +1099,7 @@ class ThreadRuntime:
         )
 
         def save_checkpoint(checkpoint: CompactionCheckpoint) -> None:
-            record.compaction_checkpoint = deepcopy(checkpoint)
-            self._persist_record(record)
+            self._save_checkpoint(record, checkpoint)
 
         def save_context_diagnostics(value: dict[str, object]) -> None:
             diagnostics = self._context_diagnostics(value)
@@ -1215,8 +1235,12 @@ class ThreadRuntime:
 
         record = self._threads[thread_id]
         try:
-            candidate_provider = provider_config_id or record.settings.provider_config_id
-            candidate_model = model or record.settings.model
+            candidate_provider = (
+                record.settings.provider_config_id
+                if provider_config_id is None
+                else provider_config_id
+            )
+            candidate_model = record.settings.model if model is None else model
             # Validate the candidate at this seam so a draft cannot silently
             # fall back to the current Thread's provider/model.
             candidate_settings = ModelSettings(
