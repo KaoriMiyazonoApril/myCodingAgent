@@ -108,6 +108,7 @@ ThreadRuntime
 Agent loop ── Conversation ── local Tools / LLM client
 ```
 
-依赖方向始终为 `Web → Host → ThreadRuntime → Agent Core`。V1 不包含 approval UI、WebSocket、
-认证、远程多用户服务、Electron/Tauri 或持久化 Thread 数据库；既有 SSE/streaming 与 PTY
-能力保持在现有 Runtime/ProcessManager seam 内。
+依赖方向始终为 `Web → Host → ThreadRuntime → Agent Core`。当前 Runtime 已通过本地 SQLite
+持久化 Thread、canonical Conversation、Turn/event/idempotency 状态与 Context compaction
+checkpoint。V1 不包含 approval UI、WebSocket、认证、远程多用户服务或 Electron/Tauri；既有
+SSE/streaming 与 PTY 能力保持在现有 Runtime/ProcessManager seam 内。

@@ -27,6 +27,7 @@ from agent.core.messages import (
 )
 
 from .events import AgentEvent, json_safe
+from .context_history import CompactionCheckpoint
 from .settings import (
     AgentLimits,
     ApprovalMode,
@@ -39,7 +40,10 @@ from .settings import (
 from .types import ThreadStatus, TurnStatus, TurnSummary
 
 
-STORE_SCHEMA_VERSION = 1
+# Version 2 adds a detached rolling CompactionCheckpoint to each Thread state.
+# The checkpoint is deliberately kept in the state snapshot rather than mixed
+# into canonical Conversation messages; v1 rows migrate with a null value.
+STORE_SCHEMA_VERSION = 2
 DEFAULT_DATABASE_FILENAME = "threads.sqlite3"
 
 
@@ -88,6 +92,24 @@ class ThreadState:
     event_sequence: int = 0
     active_turn: StoredActiveTurn | None = None
     idempotency: dict[str, StoredIdempotency] = field(default_factory=dict)
+    checkpoint: CompactionCheckpoint | None = None
+    checkpoint_diagnostics: tuple[str, ...] = ()
+
+    @property
+    def diagnostics(self) -> tuple[str, ...]:
+        """Checkpoint recovery diagnostics exposed without a new subsystem."""
+
+        return self.checkpoint_diagnostics
+
+    @property
+    def compaction_checkpoint(self) -> CompactionCheckpoint | None:
+        """Descriptive alias used by Context integrations."""
+
+        return self.checkpoint
+
+    @compaction_checkpoint.setter
+    def compaction_checkpoint(self, value: CompactionCheckpoint | None) -> None:
+        self.checkpoint = value
 
 
 class ThreadStore(Protocol):
@@ -262,9 +284,16 @@ class LocalThreadStore:
                     FOREIGN KEY (thread_id) REFERENCES threads(thread_id)
                         ON DELETE CASCADE
                 );
-                PRAGMA user_version = 1;
+                PRAGMA user_version = 2;
                 """
             )
+            self._connection.commit()
+        elif version == 1:
+            # Schema v1 stored the complete Thread state in ``state_json`` but
+            # had no checkpoint field.  There is no table shape to alter; the
+            # state decoder supplies ``None`` for the new optional field and
+            # this watermark records that migration has been observed.
+            self._connection.execute("PRAGMA user_version = 2")
             self._connection.commit()
 
     def list_threads(self) -> list[ThreadState]:
@@ -456,6 +485,18 @@ def _validate_state(state: ThreadState) -> None:
         raise ValueError("Thread settings must be ThreadSettings")
     if not isinstance(state.status, ThreadStatus):
         raise ValueError("Thread status must be ThreadStatus")
+    if state.checkpoint is not None and not isinstance(
+        state.checkpoint, CompactionCheckpoint
+    ):
+        raise ValueError("Thread checkpoint must be CompactionCheckpoint or None")
+    if state.checkpoint is not None and not state.checkpoint.valid_for_history(
+        state.messages
+    ):
+        raise ValueError("Thread checkpoint does not cover a valid canonical position")
+    if not isinstance(state.checkpoint_diagnostics, tuple) or any(
+        not isinstance(item, str) for item in state.checkpoint_diagnostics
+    ):
+        raise ValueError("checkpoint_diagnostics must be a tuple of text")
 
 
 def _settings_to_dict(settings: ModelSettings | ThreadSettings) -> dict[str, object]:
@@ -744,6 +785,10 @@ def _state_to_dict(
         "turns": [_summary_to_dict(summary) for summary in state.turns],
         "event_sequence": state.event_sequence,
         "active_turn": _active_to_dict(state.active_turn),
+        "checkpoint": (
+            None if state.checkpoint is None else state.checkpoint.to_dict()
+        ),
+        "checkpoint_diagnostics": list(state.checkpoint_diagnostics),
         "events": [json_safe(event.to_dict()) for event in state.events]
         if include_events
         else [],
@@ -759,8 +804,16 @@ def _state_to_dict(
 def _state_from_dict(raw: object) -> ThreadState:
     if not isinstance(raw, dict):
         raise ValueError("Thread state must be an object")
-    if raw.get("schema_version") != STORE_SCHEMA_VERSION:
+    schema_version = raw.get("schema_version", 1)
+    if schema_version not in {1, STORE_SCHEMA_VERSION}:
         raise ValueError("unsupported Thread state schema version")
+    checkpoint_raw = raw.get("checkpoint", raw.get("compaction_checkpoint"))
+    checkpoint: CompactionCheckpoint | None = None
+    checkpoint_diagnostics = tuple(
+        item
+        for item in raw.get("checkpoint_diagnostics", [])
+        if isinstance(item, str)
+    )
     latest = _summary_from_dict(raw.get("latest_turn"))
     turns = [
         summary
@@ -771,12 +824,22 @@ def _state_from_dict(raw: object) -> ThreadState:
     idempotency_raw = raw.get("idempotency", {})
     if not isinstance(idempotency_raw, dict):
         raise ValueError("idempotency must be an object")
+    messages = [_message_from_dict(item) for item in raw.get("messages", [])]
+    if checkpoint_raw is not None:
+        try:
+            candidate = CompactionCheckpoint.from_dict(checkpoint_raw)
+            if candidate.valid_for_history(messages):
+                checkpoint = candidate
+            else:
+                checkpoint_diagnostics = (*checkpoint_diagnostics, "CHECKPOINT_INVALID")
+        except (KeyError, TypeError, ValueError):
+            checkpoint_diagnostics = (*checkpoint_diagnostics, "CHECKPOINT_INVALID")
     return ThreadState(
         thread_id=raw["thread_id"],
         workspace=raw["workspace"],
         status=ThreadStatus(raw["status"]),
         settings=_settings_from_dict(raw["settings"], versioned=True),  # type: ignore[arg-type]
-        messages=[_message_from_dict(item) for item in raw.get("messages", [])],
+        messages=messages,
         completed_turns=raw["completed_turns"],
         created_at=raw["created_at"],
         updated_at=raw["updated_at"],
@@ -785,6 +848,8 @@ def _state_from_dict(raw: object) -> ThreadState:
         events=events,
         event_sequence=raw.get("event_sequence", max((event.sequence for event in events), default=0)),
         active_turn=_active_from_dict(raw.get("active_turn")),
+        checkpoint=checkpoint,
+        checkpoint_diagnostics=checkpoint_diagnostics,
         idempotency={
             key: _idempotency_from_dict(value)
             for key, value in idempotency_raw.items()

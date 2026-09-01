@@ -21,7 +21,7 @@ client、Future、task、lock、PTY、subprocess 或 pickle 数据。
 
 ## Schema 与序列化
 
-SQLite 使用 PRAGMA user_version，当前 STORE_SCHEMA_VERSION 为 1。Thread 的快照
+SQLite 使用 PRAGMA user_version，当前 STORE_SCHEMA_VERSION 为 2。Thread 的快照
 保存在 threads，事件和幂等请求分别保存在 thread_events 与 thread_idempotency。
 每次 Runtime 语义转换在一个事务中 UPSERT 当前快照，并只 INSERT 新增 durable event；
 事件表是 append-only 的幂等日志，不会随着 Thread 长度反复 DELETE/重建，因此写入量
@@ -40,12 +40,22 @@ mark；只有 range 用尽时才写一次 Store，因此 transient delta 不会�
 可能留下未使用的 sequence 间隙，但恢复会从已保存的 high-water mark 之后继续分配，
 不会复用客户端已经观察到的 transient sequence，event ID 也不会与旧记录冲突。
 
+Schema v2 在 Thread state JSON 中加入可选 rolling `CompactionCheckpoint`，包含 synthetic summary、
+inclusive canonical coverage、canonical-prefix fingerprint、版本与 source metadata；表结构不变。v1 数据库升级只推进 user_version，
+旧 state 按空 checkpoint 恢复。checkpoint 与 canonical messages 在同一 Thread transition 中持久化，
+不替换或删除 message。恢复时 coverage、atomic boundary、prefix fingerprint、版本或 summary 非法的 checkpoint 会被忽略，并记录
+`CHECKPOINT_INVALID` diagnostic。
+
 ## 重启语义
 
 Runtime 构造时从 Store 枚举并恢复 Thread。可用 workspace 会重建新的工具 registry；
 ProcessManager/session、PTY、pending approval future、in-flight model request、stream
 assembler 和未完成 assistant/tool arguments 永不恢复。只有已经进入 canonical
 Conversation 的完整消息会进入数据库。
+
+恢复出的 canonical user、assistant、tool history 始终完整保留；模型请求若有有效 checkpoint，则使用
+synthetic summary 加 coverage 之后的 raw history。ProjectInstructions 每 Turn 从 workspace root
+刷新一次，runtime/task sections 按本次请求重新收集。
 
 如果加载到 running 或 waiting_approval 的 Thread，Runtime 会把对应未完成 Turn
 一次性转为 FAILED，stop_reason=runtime_restarted，追加 terminal turn_failed

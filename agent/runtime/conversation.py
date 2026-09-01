@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 from agent.core.messages import Message, TextBlock, ToolCallBlock, ToolResultBlock
+from agent.tools.result_bounds import reduce_tool_result_block
 
 from .events import public_message
 
@@ -36,7 +37,10 @@ class Conversation:
         self._messages.append(message)
 
     def append_tool_result(self, result: ToolResultBlock) -> None:
-        self._messages.append(Message(role="tool", content=[result]))
+        # Layer-1 reduction happens before a result enters canonical history,
+        # so every future detached snapshot is already hard-bounded.
+        bounded = reduce_tool_result_block(result)
+        self._messages.append(Message(role="tool", content=[bounded]))
 
     def request_messages(self) -> list[Message]:
         return list(self._messages)

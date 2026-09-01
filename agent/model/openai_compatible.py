@@ -19,6 +19,7 @@ from agent.core.messages import (
     ToolCallBlock,
     ToolResultBlock,
 )
+from agent.tools.result_bounds import reduce_tool_result_block
 from agent.tools.types import ToolDefinition
 
 from .errors import (
@@ -309,6 +310,10 @@ class OpenAICompatibleProvider(LLMProvider):
         for result in results:
             if not result.tool_call_id:
                 raise LLMRequestError("ToolResultBlock.tool_call_id must not be empty")
+            # Keep direct provider callers on the same model-visible boundary
+            # as Conversation.append_tool_result.  The reducer is detached
+            # and idempotent, so canonical callers pay no semantic cost.
+            result = reduce_tool_result_block(result)
             try:
                 content = json.dumps(
                     {

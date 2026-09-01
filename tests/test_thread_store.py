@@ -15,6 +15,11 @@ from agent.runtime import (
     TurnStatus,
     TurnSummary,
 )
+from agent.runtime.context_history import (
+    CompactionCheckpoint,
+    CompactionSummary,
+    canonical_history_fingerprint,
+)
 from agent.runtime.thread_store import (
     InMemoryThreadStore,
     LocalThreadStore,
@@ -217,3 +222,168 @@ def test_local_store_full_save_replaces_the_complete_event_set(tmp_path) -> None
     assert restored.events == []
     assert restored.event_sequence == 0
     store.close()
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryThreadStore, LocalThreadStore])
+def test_thread_store_round_trips_rolling_compaction_checkpoint(store_factory, tmp_path) -> None:
+    store = (
+        store_factory()
+        if store_factory is InMemoryThreadStore
+        else store_factory(tmp_path / "checkpoint.db")
+    )
+    state = _state()
+    state.checkpoint = CompactionCheckpoint(
+        CompactionSummary(
+            "goal: inspect app.py\nvalidation: pytest passed",
+            covered_start=1,
+            covered_end=3,
+            source_estimate=22,
+            metadata={"synthetic": True},
+        ),
+        covered_through=3,
+        source_estimate=22,
+        canonical_fingerprint=canonical_history_fingerprint(state.messages, 3),
+        metadata={"source_messages": 3},
+    )
+
+    store.save_thread(state)
+    restored = store.get_thread(state.thread_id)
+
+    assert restored is not None
+    assert restored.checkpoint == state.checkpoint
+    assert restored.checkpoint is not None
+    assert restored.checkpoint.summary.synthetic is True
+    store.close()
+
+
+def test_local_store_migrates_v1_state_without_checkpoint(tmp_path) -> None:
+    import json
+    import sqlite3
+
+    database = tmp_path / "v1.db"
+    store = LocalThreadStore(database)
+    state = _state()
+    store.save_thread(state)
+    store.close()
+
+    connection = sqlite3.connect(database)
+    row = connection.execute(
+        "SELECT state_json FROM threads WHERE thread_id = ?", (state.thread_id,)
+    ).fetchone()
+    assert row is not None
+    raw = json.loads(row[0])
+    raw["schema_version"] = 1
+    raw.pop("checkpoint", None)
+    connection.execute(
+        "UPDATE threads SET state_json = ? WHERE thread_id = ?",
+        (json.dumps(raw, ensure_ascii=False), state.thread_id),
+    )
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+
+    reopened = LocalThreadStore(database)
+    restored = reopened.get_thread(state.thread_id)
+    assert restored is not None
+    assert restored.checkpoint is None
+    reopened.close()
+
+
+def test_local_store_ignores_checkpoint_beyond_restored_history_with_diagnostic(tmp_path) -> None:
+    import json
+    import sqlite3
+
+    database = tmp_path / "invalid-checkpoint.db"
+    store = LocalThreadStore(database)
+    state = _state()
+    store.save_thread(state)
+    store.close()
+
+    connection = sqlite3.connect(database)
+    row = connection.execute(
+        "SELECT state_json FROM threads WHERE thread_id = ?", (state.thread_id,)
+    ).fetchone()
+    assert row is not None
+    raw = json.loads(row[0])
+    raw["checkpoint"] = CompactionCheckpoint(
+        CompactionSummary("stale handoff"), covered_through=999
+    ).to_dict()
+    connection.execute(
+        "UPDATE threads SET state_json = ? WHERE thread_id = ?",
+        (json.dumps(raw, ensure_ascii=False), state.thread_id),
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = LocalThreadStore(database)
+    restored = reopened.get_thread(state.thread_id)
+    assert restored is not None
+    assert restored.checkpoint is None
+    assert "CHECKPOINT_INVALID" in restored.checkpoint_diagnostics
+    reopened.close()
+
+
+def test_checkpoint_fingerprint_is_append_only_and_requires_atomic_boundary() -> None:
+    state = _state()
+    fingerprint = canonical_history_fingerprint(state.messages, 3)
+    checkpoint = CompactionCheckpoint(
+        CompactionSummary("stable handoff"),
+        covered_through=3,
+        canonical_fingerprint=fingerprint,
+    )
+
+    assert checkpoint.valid_for_history(state.messages)
+    appended = [
+        *state.messages,
+        Message(role="user", content=[TextBlock(text="new tail")]),
+    ]
+    assert checkpoint.valid_for_history(appended)
+
+    tampered = list(state.messages)
+    tampered[1] = Message(role="user", content=[TextBlock(text="rewritten")])
+    assert not checkpoint.valid_for_history(tampered)
+
+    mid_interaction = CompactionCheckpoint(
+        CompactionSummary("unsafe handoff"),
+        covered_through=2,
+        canonical_fingerprint=canonical_history_fingerprint(state.messages, 2),
+    )
+    assert not mid_interaction.valid_for_history(state.messages)
+
+
+def test_local_store_discards_checkpoint_when_restored_prefix_is_tampered(tmp_path) -> None:
+    import json
+    import sqlite3
+
+    database = tmp_path / "tampered-checkpoint.db"
+    store = LocalThreadStore(database)
+    state = _state()
+    state.checkpoint = CompactionCheckpoint(
+        CompactionSummary("stable handoff"),
+        covered_through=3,
+        canonical_fingerprint=canonical_history_fingerprint(state.messages, 3),
+    )
+    store.save_thread(state)
+    store.close()
+
+    connection = sqlite3.connect(database)
+    row = connection.execute(
+        "SELECT state_json FROM threads WHERE thread_id = ?", (state.thread_id,)
+    ).fetchone()
+    assert row is not None
+    raw = json.loads(row[0])
+    raw["messages"][1]["content"][0]["text"] = "tampered canonical prefix"
+    connection.execute(
+        "UPDATE threads SET state_json = ? WHERE thread_id = ?",
+        (json.dumps(raw, ensure_ascii=False), state.thread_id),
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = LocalThreadStore(database)
+    restored = reopened.get_thread(state.thread_id)
+    assert restored is not None
+    assert restored.checkpoint is None
+    assert "CHECKPOINT_INVALID" in restored.checkpoint_diagnostics
+    assert restored.messages[1].content[0].text == "tampered canonical prefix"
+    reopened.close()

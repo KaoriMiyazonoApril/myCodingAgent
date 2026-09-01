@@ -45,7 +45,7 @@ class ToolDefinition:
                     f"tool schema for {name!r} must be an object"
                 )
             expected_type = property_schema.get("type")
-            if expected_type not in {"string", "integer", "boolean", "object"}:
+            if expected_type not in {"string", "integer", "boolean", "object", "array"}:
                 raise ToolArgumentsValidationError(
                     f"tool schema for {name!r} has unsupported schema type "
                     f"{expected_type!r}"
@@ -74,6 +74,7 @@ class ToolDefinition:
             and not isinstance(candidate, bool),
             "boolean": lambda candidate: isinstance(candidate, bool),
             "object": lambda candidate: isinstance(candidate, dict),
+            "array": lambda candidate: isinstance(candidate, list),
         }.get(expected_type)
         if valid_type is not None and not valid_type(value):
             raise ToolArgumentsValidationError(
@@ -92,6 +93,50 @@ class ToolDefinition:
                 raise ToolArgumentsValidationError(
                     f"argument {name!r} must be at most {schema['maximum']}"
                 )
+        enum = schema.get("enum")
+        if isinstance(enum, list) and value not in enum:
+            raise ToolArgumentsValidationError(
+                f"argument {name!r} must be one of: {', '.join(map(str, enum))}"
+            )
+        if isinstance(value, list):
+            if "minItems" in schema and len(value) < schema["minItems"]:
+                raise ToolArgumentsValidationError(
+                    f"argument {name!r} must contain at least {schema['minItems']} item(s)"
+                )
+            if "maxItems" in schema and len(value) > schema["maxItems"]:
+                raise ToolArgumentsValidationError(
+                    f"argument {name!r} must contain at most {schema['maxItems']} item(s)"
+                )
+            item_schema = schema.get("items")
+            if isinstance(item_schema, dict):
+                for index, item in enumerate(value):
+                    ToolDefinition._validate_value(
+                        f"{name}[{index}]", item, item_schema
+                    )
+        if isinstance(value, dict):
+            properties = schema.get("properties", {})
+            required = schema.get("required", [])
+            if not isinstance(properties, dict) or not isinstance(required, list):
+                raise ToolArgumentsValidationError(
+                    f"argument {name!r} has an invalid object schema"
+                )
+            unknown = set(value) - set(properties)
+            if schema.get("additionalProperties") is False and unknown:
+                names = ", ".join(sorted(unknown))
+                raise ToolArgumentsValidationError(
+                    f"unknown arguments in {name!r}: {names}"
+                )
+            for required_name in required:
+                if required_name not in value:
+                    raise ToolArgumentsValidationError(
+                        f"missing required argument {required_name!r} in {name!r}"
+                    )
+            for child_name, child_value in value.items():
+                child_schema = properties.get(child_name)
+                if isinstance(child_schema, dict):
+                    ToolDefinition._validate_value(
+                        f"{name}.{child_name}", child_value, child_schema
+                    )
 
 
 @dataclass(slots=True)

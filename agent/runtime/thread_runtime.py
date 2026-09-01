@@ -15,17 +15,25 @@ from agent.model.errors import LLMError
 from agent.model.provider import LLMProvider
 from agent.model.types import ProviderCapabilities
 from agent.tools.registry import ToolRegistry
+from agent.tools.types import ToolDefinition, ToolResult
 
 from .conversation import Conversation
 from .change_tracker import ChangeTracker
 from .context import (
     BaseSystemInstructions,
     ContextManager,
+    ProjectInstructionsProvider,
+    RootProjectInstructionsProvider,
     RuntimeContext,
-    StaticProjectInstructionsProvider,
+    TaskPlan,
     TaskState,
 )
 from .context_budget import ContextBudget
+from .context_history import (
+    CompactionCheckpoint,
+    CompactionError,
+    LLMHistoryCompactor,
+)
 from .errors import (
     ApprovalTimeoutError,
     ContextLimitError,
@@ -116,6 +124,9 @@ class _ThreadRecord:
     )
     preflight_turn_id: str | None = None
     closing: bool = False
+    task_state: TaskState | None = None
+    compaction_checkpoint: CompactionCheckpoint | None = None
+    checkpoint_diagnostics: tuple[str, ...] = ()
 
 
 class ThreadRuntime:
@@ -128,6 +139,7 @@ class ThreadRuntime:
         provider_resolver: ProviderResolver,
         default_settings: ModelSettings,
         additional_system_instructions: str | None = None,
+        project_instructions_provider: ProjectInstructionsProvider | None = None,
         prompt_builder: PromptBuilder | None = None,
         event_buffer_capacity: int = 512,
         reasoning_visibility: str = "hidden",
@@ -182,8 +194,8 @@ class ThreadRuntime:
         self._base_system_instructions = BaseSystemInstructions(
             (prompt_builder or PromptBuilder()).build()
         )
-        self._project_instructions_provider = StaticProjectInstructionsProvider(
-            additional_system_instructions
+        self._project_instructions_provider = project_instructions_provider or RootProjectInstructionsProvider(
+            additional_instructions=additional_system_instructions,
         )
         # Conversation persists the stable base only. Project/runtime/task
         # sections are assembled into detached model requests by ContextManager.
@@ -229,6 +241,7 @@ class ThreadRuntime:
             updated_at=created_at,
             events=EventBuffer(self._event_buffer_capacity),
         )
+        self._register_update_plan_tool(record)
         set_context = getattr(record.tools, "set_session_context", None)
         if callable(set_context):
             set_context(thread_id=thread_id, turn_id=None)
@@ -247,6 +260,76 @@ class ThreadRuntime:
         """Enumerate all durable Threads in stable creation order."""
 
         return [self._snapshot(record) for record in self._threads.values()]
+
+    @staticmethod
+    def _register_update_plan_tool(record: _ThreadRecord) -> None:
+        """Install the narrow model plan capability on one Thread registry."""
+
+        if record.tools.lookup("update_plan") is not None:
+            return
+
+        definition = ToolDefinition(
+            name="update_plan",
+            description=(
+                "Replace the optional current task plan with ordered steps. "
+                "Use pending, in_progress, or completed statuses."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "minItems": 0,
+                        "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step": {"type": "string", "minLength": 1},
+                                "status": {
+                                    "type": "string",
+                                    "enum": [
+                                        "pending",
+                                        "in_progress",
+                                        "completed",
+                                    ],
+                                },
+                            },
+                            "required": ["step", "status"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["steps"],
+                "additionalProperties": False,
+            },
+        )
+
+        def execute(arguments: dict[str, object]) -> ToolResult:
+            state = record.task_state
+            if state is None:
+                return ToolResult(
+                    content="update_plan is available only during an active Turn",
+                    metadata={},
+                    error_code="PLAN_UNAVAILABLE",
+                )
+            try:
+                plan = TaskPlan.from_payload(arguments.get("steps"))
+                state.replace_plan(plan)
+            except (TypeError, ValueError) as error:
+                return ToolResult(
+                    content=str(error),
+                    metadata={},
+                    error_code="INVALID_ARGUMENTS",
+                )
+            return ToolResult(
+                content="task plan updated",
+                metadata={"plan_steps": len(plan.steps)},
+            )
+
+        async def execute_async(arguments: dict[str, object]) -> ToolResult:
+            return execute(arguments)
+
+        record.tools.register(definition, execute, async_executor=execute_async)
 
     def open_thread(self, thread_id: str) -> ThreadSnapshot:
         """Open a restored Thread through the same public Snapshot seam."""
@@ -294,7 +377,10 @@ class ThreadRuntime:
                     )
                     for key, value in state.idempotency.items()
                 },
+                compaction_checkpoint=deepcopy(state.checkpoint),
+                checkpoint_diagnostics=state.checkpoint_diagnostics,
             )
+            self._register_update_plan_tool(record)
             set_context = getattr(record.tools, "set_session_context", None)
             if callable(set_context):
                 set_context(thread_id=record.thread_id, turn_id=None)
@@ -483,6 +569,8 @@ class ThreadRuntime:
                 )
                 for key, value in record.idempotent_submissions.items()
             },
+            checkpoint=deepcopy(record.compaction_checkpoint),
+            checkpoint_diagnostics=record.checkpoint_diagnostics,
         )
         transition = getattr(self._store, "save_thread_transition", None)
         if callable(transition):
@@ -577,16 +665,27 @@ class ThreadRuntime:
                     turn_config.model,
                 )
                 provider_capabilities = provider.capabilities
-            task_state = TaskState(goal=user_text)
+            # User text remains canonical Conversation intent.  TaskState is
+            # deliberately limited to model-maintained plan plus objective
+            # Harness evidence and never mirrors that goal.
+            task_state = TaskState()
             context_manager = self._context_manager_for(
                 record,
                 turn_config,
                 provider_capabilities,
             )
+            # Preflight only the irreducible request prefix.  Reducible
+            # durable history is handled after provider resolution by the
+            # one-pass Context reduction pipeline; an oversized current user
+            # input/system/tool schema still rejects without allocating a
+            # transport.
+            canonical = record.conversation.canonical_messages()
             context_manager.assemble(
-                record.conversation.canonical_messages(),
+                canonical[:1],
                 current_input=user_text,
-                runtime_context=self._runtime_context_for(record, turn_config),
+                runtime_context=self._runtime_context_for(
+                    record, turn_config, turn_id=turn_id
+                ),
                 task_state=task_state,
                 tools=record.tools.definitions(),
             )
@@ -631,6 +730,7 @@ class ThreadRuntime:
                 set_waiting=lambda waiting: self._set_waiting(record, waiting),
                 change_tracker=changes,
                 approval_mode=turn_config.approval_mode,
+                task_state=task_state,
             )
             active_turn = _ActiveTurn(
                 turn_id=turn_id,
@@ -642,6 +742,7 @@ class ThreadRuntime:
                 idempotency_key=idempotency_key,
             )
             record.active_turn = active_turn
+            record.task_state = task_state
             if idempotency_key is not None:
                 submission = _IdempotentSubmission(
                     user_text=user_text,
@@ -669,8 +770,10 @@ class ThreadRuntime:
                 record,
                 active_turn,
                 model,
+                provider,
                 context_manager,
                 task_state,
+                user_text,
                 turn_config,
             )
             if submission is not None:
@@ -692,6 +795,7 @@ class ThreadRuntime:
                     ThreadStatus.CLOSED if record.closing else ThreadStatus.IDLE
                 )
                 record.active_turn = None
+                record.task_state = None
                 record.updated_at = utc_now()
                 self._persist_record(record)
             finally:
@@ -776,6 +880,8 @@ class ThreadRuntime:
     def _runtime_context_for(
         record: _ThreadRecord,
         turn_config: TurnConfig,
+        *,
+        turn_id: str | None = None,
     ) -> RuntimeContext:
         """Collect cheap environment facts without scanning the workspace."""
 
@@ -787,6 +893,7 @@ class ThreadRuntime:
             capabilities=tuple(
                 definition.name for definition in record.tools.definitions()
             ),
+            turn_id=turn_id,
         )
 
     async def _execute_active_turn(
@@ -794,11 +901,23 @@ class ThreadRuntime:
         record: _ThreadRecord,
         active_turn: _ActiveTurn,
         model: ModelInvoker,
+        provider: LLMProvider,
         context_manager: ContextManager,
         task_state: TaskState,
+        current_input: str,
         turn_config: TurnConfig,
     ) -> TurnSummary:
         controller = active_turn.controller
+        history_compactor = LLMHistoryCompactor(
+            provider,
+            estimator=context_manager.budget.estimator,
+            request_budget_tokens=context_manager.budget.usable_input_tokens,
+        )
+
+        def save_checkpoint(checkpoint: CompactionCheckpoint) -> None:
+            record.compaction_checkpoint = deepcopy(checkpoint)
+            self._persist_record(record)
+
         try:
             outcome = await self._loop.run(
                 record.conversation,
@@ -808,10 +927,13 @@ class ThreadRuntime:
                 controller,
                 context_manager=context_manager,
                 runtime_context_factory=lambda: self._runtime_context_for(
-                    record, turn_config
+                    record, turn_config, turn_id=active_turn.turn_id
                 ),
                 task_state=task_state,
-                current_input=task_state.goal,
+                current_input=current_input,
+                compaction_checkpoint=record.compaction_checkpoint,
+                history_compactor=history_compactor,
+                checkpoint_sink=save_checkpoint,
             )
             return self._finish_turn(
                 record,
@@ -867,6 +989,19 @@ class ThreadRuntime:
                 error={
                     "code": "CONTEXT_LIMIT",
                     "message": "conversation exceeds the model context budget",
+                },
+            )
+        except CompactionError:
+            return self._finish_turn(
+                record,
+                active_turn,
+                status=TurnStatus.FAILED,
+                stop_reason="context_compaction_failed",
+                final_text=controller.last_assistant_text,
+                event_type="turn_failed",
+                error={
+                    "code": "CONTEXT_COMPACTION_FAILED",
+                    "message": "conversation history compaction failed",
                 },
             )
         except Exception as error:

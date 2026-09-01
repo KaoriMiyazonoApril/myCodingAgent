@@ -12,6 +12,8 @@ from agent.runtime import (
     AgentEvent,
     AllowAllPolicy,
     ApprovalMode,
+    CompactionCheckpoint,
+    CompactionSummary,
     IdempotencyConflictError,
     IdempotencyInterruptedError,
     ModelSettings,
@@ -211,6 +213,63 @@ def test_runtime_restart_preserves_real_tool_history_and_continues_turns(
     assert resumed_request[5].content[0].text == "Continue after restart."
     asyncio.run(second.aclose())
     second_store.close()
+
+
+def test_runtime_restart_reuses_persisted_compaction_checkpoint(tmp_path: Path) -> None:
+    store = LocalThreadStore(tmp_path / "state" / "threads.db")
+    first_provider = _Provider("old exact answer")
+    first = _runtime(store, first_provider)
+    thread = first.create_thread(tmp_path)
+    asyncio.run(first.run_turn(thread.thread_id, "old exact request"))
+    asyncio.run(first.aclose())
+    state = store.get_thread(thread.thread_id)
+    assert state is not None
+    state.checkpoint = CompactionCheckpoint(
+        CompactionSummary(
+            "goal: preserve old request\ncompleted work: old answer recorded"
+        ),
+        covered_through=1,
+    )
+    store.save_thread(state)
+    store.close()
+
+    reopened = LocalThreadStore(tmp_path / "state" / "threads.db")
+    second_provider = _Provider("continued")
+    second = _runtime(reopened, second_provider)
+
+    summary = asyncio.run(second.run_turn(thread.thread_id, "continue now"))
+
+    assert summary.status is TurnStatus.COMPLETED
+    request = second_provider.requests[0]
+    system_text = "".join(
+        block.text
+        for block in request.messages[0].content
+        if isinstance(block, TextBlock)
+    )
+    assert "compaction_summary:" in system_text
+    assert "goal: preserve old request" in system_text
+    assert [message.role for message in request.messages[1:]] == [
+        "assistant",
+        "user",
+    ]
+    assert request.messages[1].content[0].text == "old exact answer"
+    assert request.messages[2].content[0].text == "continue now"
+    assert all(
+        not (
+            message.role == "user"
+            and any(
+                isinstance(block, TextBlock) and block.text == "old exact request"
+                for block in message.content
+            )
+        )
+        for message in request.messages
+    )
+    reopened_state = reopened.get_thread(thread.thread_id)
+    assert reopened_state is not None
+    assert reopened_state.checkpoint is not None
+    assert reopened_state.checkpoint.covered_through == 1
+    asyncio.run(second.aclose())
+    reopened.close()
 
 
 def test_completed_idempotency_replays_after_restart_without_provider_call(tmp_path) -> None:

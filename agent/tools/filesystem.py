@@ -137,15 +137,20 @@ class WorkspaceFilesystem:
         self, raw_path: object, *, max_bytes: int | None = None
     ) -> tuple[Path, str]:
         target, relative = self.resolve(raw_path)
-        if not target.exists():
-            raise ToolOperationError("NOT_FOUND", f"file not found: {relative}")
-        if not target.is_file():
-            raise ToolOperationError("NOT_A_FILE", f"not a regular file: {relative}")
         byte_limit = MAX_TEXT_FILE_BYTES if max_bytes is None else max_bytes
         try:
-            size = target.stat().st_size
+            # ``Path.exists()`` intentionally is not used here: on several
+            # platforms it converts ELOOP/other symlink resolution failures
+            # into ``False`` and would misclassify an inspection error as
+            # NOT_FOUND.  Follow the link explicitly and preserve IO_ERROR.
+            metadata = os.stat(target, follow_symlinks=True)
+        except FileNotFoundError as error:
+            raise ToolOperationError("NOT_FOUND", f"file not found: {relative}") from error
         except OSError as error:
             raise ToolOperationError("IO_ERROR", f"could not inspect file: {relative}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ToolOperationError("NOT_A_FILE", f"not a regular file: {relative}")
+        size = metadata.st_size
         if size > byte_limit:
             raise ToolOperationError(
                 "FILE_TOO_LARGE",

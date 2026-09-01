@@ -1197,7 +1197,7 @@ def test_tool_schema_validation_fails_closed_for_unsupported_types() -> None:
             description="unsupported schema",
             parameters={
                 "type": "object",
-                "properties": {"items": {"type": "array"}},
+                "properties": {"items": {"type": "number"}},
                 "required": [],
                 "additionalProperties": False,
             },

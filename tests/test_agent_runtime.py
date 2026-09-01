@@ -37,6 +37,7 @@ from agent.runtime import (
     AllowAllPolicy,
     ContextLimitError,
     IdempotencyConflictError,
+    InMemoryThreadStore,
     ModelSettings,
     PolicyDecision,
     SettingsConflictError,
@@ -1486,7 +1487,7 @@ def test_preflight_validation_is_async_and_cancellation_releases_lease(
     ]
 
 
-def test_context_is_checked_again_after_a_large_tool_result(tmp_path) -> None:
+def test_token_estimation_allows_large_ascii_tool_result_that_safely_fits(tmp_path) -> None:
     provider = ScriptedProvider(
         [
             tool_response(
@@ -1522,14 +1523,175 @@ def test_context_is_checked_again_after_a_large_tool_result(tmp_path) -> None:
 
     summary = asyncio.run(runtime.run_turn(thread.thread_id, "Use the tool."))
 
-    assert summary.status is TurnStatus.FAILED
-    assert summary.stop_reason == "context_limit"
-    assert summary.error == {
-        "code": "CONTEXT_LIMIT",
-        "message": "conversation exceeds the model context budget",
+    assert summary.status is TurnStatus.COMPLETED
+    assert summary.stop_reason == "completed"
+    assert summary.error is None
+    # The V1 estimator no longer treats each ASCII byte as a token, so this
+    # result remains safely inside a 4k model window with output reserve.
+    assert len(provider.requests) == 2
+    assert len(runtime.get_snapshot(thread.thread_id).messages) == 4
+
+
+def test_long_thread_reduces_context_and_persists_rolling_checkpoint(tmp_path) -> None:
+    (tmp_path / "AGENTS.md").write_text("project rule sentinel", encoding="utf-8")
+
+    class ReductionProvider(LLMProvider):
+        capabilities = ProviderCapabilities(context_window_tokens=6_500)
+
+        def __init__(self) -> None:
+            self.model_requests: list[LLMRequest] = []
+            self.compaction_requests: list[LLMRequest] = []
+
+        async def chat(self, request: LLMRequest) -> LLMResponse:
+            system_text = "".join(
+                block.text
+                for block in request.messages[0].content
+                if isinstance(block, TextBlock)
+            )
+            if "semantic history compactor" in system_text:
+                self.compaction_requests.append(request)
+                return final_response(
+                    "goal: long context task\n"
+                    "completed work: inspected three outputs\n"
+                    "validation: none\n"
+                    "open work: finish"
+                )
+            self.model_requests.append(request)
+            if len(self.model_requests) == 1:
+                return LLMResponse(
+                    message=Message(
+                        role="assistant",
+                        content=[
+                            ToolCallBlock(
+                                id=f"large-{index}",
+                                name="large_result",
+                                arguments={"value": str(index)},
+                            )
+                            for index in range(3)
+                        ]
+                        + [
+                            ToolCallBlock(
+                                id="plan",
+                                name="update_plan",
+                                arguments={
+                                    "steps": [
+                                        {
+                                            "step": "finish long task",
+                                            "status": "in_progress",
+                                        }
+                                    ]
+                                },
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                    usage=Usage(),
+                )
+            if len(self.model_requests) == 2:
+                return tool_response(
+                    ToolCallBlock(id="small", name="small_result", arguments={})
+                )
+            return final_response("Long task complete.")
+
+    def tools(_: Path) -> ToolRegistry:
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="large_result",
+                description="Return pressure-sized deterministic output",
+                parameters={
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            ),
+            lambda arguments: ToolResult(
+                content=str(arguments["value"]) * 5_000,
+                metadata={"kind": "large"},
+            ),
+        )
+        registry.register(
+            ToolDefinition(
+                name="small_result",
+                description="Return a small current interaction",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            ),
+            lambda _: ToolResult(content="current exact output", metadata={}),
+        )
+        return registry
+
+    provider = ReductionProvider()
+    store = InMemoryThreadStore()
+    runtime = runtime_for_provider(
+        provider,
+        tool_registry_factory=tools,
+        tool_policy=AllowAllPolicy(),
+        store=store,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "long context task"))
+
+    assert summary.status is TurnStatus.COMPLETED
+    assert len(provider.compaction_requests) == 1
+    assert len(provider.model_requests) == 3
+    final_request = provider.model_requests[-1]
+    final_system = "".join(
+        block.text
+        for block in final_request.messages[0].content
+        if isinstance(block, TextBlock)
+    )
+    assert "project rule sentinel" in final_system
+    assert "runtime_context:" in final_system
+    assert "compaction_summary:" in final_system
+    assert "goal: long context task" in final_system
+    assert "finish long task" in final_system
+
+    visible_results = [
+        block
+        for message in final_request.messages
+        if message.role == "tool"
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert sum(block.metadata.get("pruned") is True for block in visible_results) == 3
+    assert any(block.content == "current exact output" for block in visible_results)
+    visible_calls = {
+        block.id
+        for message in final_request.messages
+        if message.role == "assistant"
+        for block in message.content
+        if isinstance(block, ToolCallBlock)
     }
-    assert len(provider.requests) == 1
-    assert len(runtime.get_snapshot(thread.thread_id).messages) == 3
+    assert {block.tool_call_id for block in visible_results} == visible_calls
+    assert not any(
+        message.role == "user"
+        and any(
+            isinstance(block, TextBlock) and block.text == "long context task"
+            for block in message.content
+        )
+        for message in final_request.messages
+    )
+
+    snapshot = runtime.get_snapshot(thread.thread_id)
+    canonical_large_results = [
+        block
+        for message in snapshot.messages
+        if message["role"] == "tool"
+        for block in message["content"]
+        if block["tool_call_id"].startswith("large-")
+    ]
+    assert len(canonical_large_results) == 3
+    assert all(len(block["content"]) == 5_000 for block in canonical_large_results)
+    persisted = store.get_thread(thread.thread_id)
+    assert persisted is not None
+    assert persisted.checkpoint is not None
+    assert persisted.checkpoint.summary.synthetic is True
 
 
 def test_completed_idempotent_submission_returns_the_original_summary(tmp_path) -> None:

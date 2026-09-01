@@ -636,6 +636,7 @@ class CommandRunner:
             ),
         )
         metadata = {
+            "command": command,
             "cwd": relative_cwd,
             "duration_ms": execution.duration_ms,
             "exit_code": execution.exit_code,

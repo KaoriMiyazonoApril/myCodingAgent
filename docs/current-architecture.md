@@ -13,8 +13,9 @@ these rules.
   persistence and freeze acceptance.
 - [Thread persistence](thread-persistence.md): provider-independent snapshots, incremental
   durable events and truthful restart recovery.
-- [Context architecture](context-architecture.md): complete canonical history with NoOp selector
-  and compactor; context policy work is deferred.
+- [Context architecture](context-architecture.md): complete canonical history with root Project
+  Instructions, heuristic token budgeting, bounded ToolResults, TaskPlan, atomic recent-tail
+  selection and durable rolling semantic compaction.
 
 ## Historical / superseded
 

@@ -14,6 +14,7 @@ from agent.runtime import (
     ProjectInstructions,
     StaticProjectInstructionsProvider,
     RuntimeContext,
+    TaskPlan,
     TaskState,
 )
 from agent.runtime.prompt import DEFAULT_SYSTEM_PROMPT
@@ -46,11 +47,12 @@ def test_noop_context_plan_renders_sources_and_detached_history() -> None:
             capabilities=("read_file",),
         ),
         task_state=TaskState(
-            goal="finish the task",
-            constraints=("keep the API stable",),
-            progress=("read the source",),
-            validation_state="pending",
-            checkpoints=("initial",),
+            plan=TaskPlan(
+                [
+                    {"step": "read the source", "status": "completed"},
+                    {"step": "finish the task", "status": "in_progress"},
+                ]
+            ),
         ),
     )
 

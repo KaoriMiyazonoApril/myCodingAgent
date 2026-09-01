@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
 import inspect
 from uuid import uuid4
 
@@ -15,11 +16,13 @@ from agent.tools.types import ToolDefinition, ToolResult
 
 from .conversation import Conversation
 from .change_tracker import ChangeTracker
+from .context import CommandEvidence, TaskState
 from .errors import ApprovalTimeoutError, TurnLimitReached
-from .events import TurnEventEmitter, public_tool_call
+from .events import TurnEventEmitter, public_tool_call, utc_now
 from .policy import PolicyDecision, PolicyResult, ToolPolicy
 from .run_controller import RunController
 from .settings import ApprovalMode
+from agent.tools.result_bounds import reduce_tool_result
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +53,7 @@ class ToolCoordinator:
         set_waiting: Callable[[bool], None],
         change_tracker: ChangeTracker,
         approval_mode: ApprovalMode = ApprovalMode.ON_REQUEST,
+        task_state: TaskState | None = None,
     ) -> None:
         self._turn_id = turn_id
         self._registry = registry
@@ -61,6 +65,7 @@ class ToolCoordinator:
         self._set_waiting = set_waiting
         self._change_tracker = change_tracker
         self._approval_mode = approval_mode
+        self._task_state = task_state
         self._pending_approval: _PendingApproval | None = None
 
     def definitions(self) -> list[ToolDefinition]:
@@ -368,5 +373,59 @@ class ToolCoordinator:
         )
 
     def _record(self, call: ToolCallBlock, result: ToolResult) -> None:
-        self._conversation.append_tool_result(result.to_message_block(call.id))
-        self._events.tool_finished(call, result)
+        bounded = reduce_tool_result(result)
+        # Preserve internal cancellation bookkeeping while replacing the
+        # model-visible result with its bounded detached value.
+        bounded._settled_after_cancellation = result._settled_after_cancellation
+        self._conversation.append_tool_result(bounded.to_message_block(call.id))
+        if self._task_state is not None:
+            evidence = self._command_evidence(call, bounded)
+            if evidence is not None:
+                self._task_state.record_evidence(evidence)
+        self._events.tool_finished(call, bounded)
+
+    @staticmethod
+    def _command_evidence(
+        call: ToolCallBlock,
+        result: ToolResult,
+    ) -> CommandEvidence | None:
+        """Extract only facts the command-capable tool actually returned."""
+
+        if result.metadata.get("executed") is False:
+            return None
+        metadata_command = result.metadata.get("command")
+        argument_command = (
+            call.arguments.get("command")
+            if isinstance(call.arguments, dict)
+            else None
+        )
+        command = metadata_command or argument_command
+        if call.name not in {"run_command", "exec_command", "write_stdin"} and not command:
+            return None
+        if not isinstance(command, str) or not command:
+            return None
+        raw_status = result.metadata.get("status")
+        if isinstance(raw_status, str) and raw_status:
+            status = raw_status
+        elif result.error_code:
+            status = result.error_code
+        elif result.metadata.get("timed_out"):
+            status = "timed_out"
+        else:
+            status = "completed"
+        raw_exit = result.metadata.get("exit_code")
+        exit_code = raw_exit if isinstance(raw_exit, int) and not isinstance(raw_exit, bool) else None
+        raw_result_id = result.metadata.get("result_id")
+        result_id = (
+            raw_result_id
+            if isinstance(raw_result_id, str) and raw_result_id
+            else hashlib.sha256(result.content.encode("utf-8")).hexdigest()
+        )
+        return CommandEvidence(
+            tool=call.name,
+            command=command,
+            status=status,
+            exit_code=exit_code,
+            result_id=result_id,
+            timestamp=utc_now(),
+        )
