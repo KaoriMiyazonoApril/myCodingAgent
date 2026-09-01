@@ -18,6 +18,9 @@ import {
   resolveApproval,
   updateThreadSettings,
   type ProviderView,
+  type ThreadCapabilities,
+  type ThreadSettings,
+  type ThreadSkills,
   type ThreadView,
   type WorkspaceRecord,
   type WorkspaceListing,
@@ -163,7 +166,7 @@ export function App() {
             providers={providers}
             providerReady={providerReady}
             workspace={workspace}
-        onWorkspaceRecovered={setWorkspace}
+            onWorkspaceRecovered={setWorkspace}
             selectedProviderId={effectiveProviderId}
             selectedModel={effectiveModel}
             onOpenProject={() => setWorkspaceDialogOpen(true)}
@@ -969,17 +972,13 @@ function ThreadPanel({
       replaceThread({ ...active, submission });
     });
 
-  const saveSettings = (providerId: string, model: string) =>
+  const saveSettings = (settings: ThreadSettings) =>
     run("更新对话设置失败", async () => {
       if (active === null) {
         throw new Error("当前没有活动对话");
       }
       replaceThread(
-        await updateThreadSettings(active.snapshot.thread_id, {
-          ...active.snapshot.settings,
-          provider_config_id: providerId,
-          model,
-        }),
+        await updateThreadSettings(active.snapshot.thread_id, settings),
       );
     });
 
@@ -1091,9 +1090,7 @@ function ThreadPanel({
           onClose={() => void close()}
           onSubmit={() => void submit()}
           onStop={() => void stop()}
-          onSaveSettings={(providerId, model) =>
-            void saveSettings(providerId, model)
-          }
+          onSaveSettings={(settings) => void saveSettings(settings)}
           onThread={replaceThread}
           providers={configuredProviders}
           activityCollapsed={activityCollapsed}
@@ -1184,7 +1181,7 @@ function ActiveThreadView({
   onClose: () => void;
   onSubmit: () => void;
   onStop: () => void;
-  onSaveSettings: (providerId: string, model: string) => void;
+  onSaveSettings: (settings: ThreadSettings) => void;
   onThread: (thread: ThreadView) => void;
   providers: ProviderView[];
   activityCollapsed: boolean;
@@ -1199,6 +1196,7 @@ function ActiveThreadView({
   const [streamError, setStreamError] = useState<string | null>(null);
   const [showMenu, setShowMenu] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showSkills, setShowSkills] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
   const [contextTab, setContextTab] = useState<"activity" | "changes">(
     state.files.length > 0 ? "changes" : "activity",
@@ -1209,11 +1207,34 @@ function ActiveThreadView({
   const [settingsModel, setSettingsModel] = useState(
     thread.snapshot.settings.model,
   );
+  const [settingsTemperature, setSettingsTemperature] = useState<number | null>(
+    thread.snapshot.settings.temperature,
+  );
+  const [settingsMaxTokens, setSettingsMaxTokens] = useState<number | null>(
+    thread.snapshot.settings.max_tokens,
+  );
+  const [settingsThinking, setSettingsThinking] = useState(
+    thread.snapshot.settings.thinking?.enabled ?? false,
+  );
+  const [settingsThinkingBudget, setSettingsThinkingBudget] = useState<number | null>(
+    thread.snapshot.settings.thinking?.budget_tokens ?? null,
+  );
+  const [settingsThinkingKeep, setSettingsThinkingKeep] = useState<"none" | "all" | null>(
+    thread.snapshot.settings.thinking?.keep ?? null,
+  );
+  const [settingsApprovalMode, setSettingsApprovalMode] = useState<
+    "untrusted" | "on_request" | "never"
+  >(thread.snapshot.settings.approval_mode ?? "on_request");
   const [initialCursor] = useState(thread.event_cursor);
   const [approvalBusy, setApprovalBusy] = useState(false);
   const mountedRef = useRef(true);
   const threadId = thread.snapshot.thread_id;
   const submissionActive = thread.submission !== null;
+  const capabilities: ThreadCapabilities = thread.capabilities ?? {
+    thinking_supported: false,
+    supports_thinking_budget: false,
+    supported_keep_values: [],
+  };
 
   useEffect(() => () => {
     mountedRef.current = false;
@@ -1376,6 +1397,12 @@ function ActiveThreadView({
                 </p>
               ) : null}
             </div>
+            <SkillsPopover
+              skills={thread.snapshot.skills}
+              open={showSkills}
+              onToggle={() => setShowSkills((current) => !current)}
+              onClose={() => setShowSkills(false)}
+            />
             <div className="conversation-menu-wrap">
               <button
                 type="button"
@@ -1481,6 +1508,101 @@ function ActiveThreadView({
                   disabled={busy || thread.snapshot.status === "closed"}
                   onChange={(event) => setSettingsModel(event.target.value)}
                 />
+                <label htmlFor="thread-settings-temperature">温度</label>
+                <input
+                  id="thread-settings-temperature"
+                  type="number"
+                  min="0"
+                  max="2"
+                  step="0.1"
+                  value={settingsTemperature ?? ""}
+                  disabled={busy || thread.snapshot.status === "closed"}
+                  onChange={(event) =>
+                    setSettingsTemperature(
+                      event.target.value === "" ? null : Number(event.target.value),
+                    )
+                  }
+                />
+                <label htmlFor="thread-settings-max-tokens">最大输出令牌</label>
+                <input
+                  id="thread-settings-max-tokens"
+                  type="number"
+                  min="1"
+                  value={settingsMaxTokens ?? ""}
+                  disabled={busy || thread.snapshot.status === "closed"}
+                  onChange={(event) =>
+                    setSettingsMaxTokens(
+                      event.target.value === "" ? null : Number(event.target.value),
+                    )
+                  }
+                />
+                <label htmlFor="thread-settings-thinking">Thinking</label>
+                <input
+                  id="thread-settings-thinking"
+                  type="checkbox"
+                  checked={settingsThinking}
+                  disabled={
+                    busy ||
+                    thread.snapshot.status === "closed" ||
+                    !capabilities.thinking_supported
+                  }
+                  onChange={(event) => {
+                    setSettingsThinking(event.target.checked);
+                    if (!event.target.checked) {
+                      setSettingsThinkingBudget(null);
+                      setSettingsThinkingKeep(null);
+                    }
+                  }}
+                />
+                {settingsThinking && capabilities.supports_thinking_budget ? (
+                  <>
+                    <label htmlFor="thread-settings-thinking-budget">Thinking budget</label>
+                    <input
+                      id="thread-settings-thinking-budget"
+                      type="number"
+                      min="1"
+                      value={settingsThinkingBudget ?? ""}
+                      disabled={busy || thread.snapshot.status === "closed"}
+                      onChange={(event) =>
+                        setSettingsThinkingBudget(
+                          event.target.value === "" ? null : Number(event.target.value),
+                        )
+                      }
+                    />
+                  </>
+                ) : null}
+                {settingsThinking && capabilities.supported_keep_values.length > 0 ? (
+                  <>
+                    <label htmlFor="thread-settings-thinking-keep">Thinking history</label>
+                    <select
+                      id="thread-settings-thinking-keep"
+                      value={settingsThinkingKeep ?? capabilities.supported_keep_values[0]}
+                      disabled={busy || thread.snapshot.status === "closed"}
+                      onChange={(event) =>
+                        setSettingsThinkingKeep(event.target.value === "all" ? "all" : "none")
+                      }
+                    >
+                      {capabilities.supported_keep_values.map((value) => (
+                        <option key={value} value={value}>{value}</option>
+                      ))}
+                    </select>
+                  </>
+                ) : null}
+                <label htmlFor="thread-settings-approval">Approval mode</label>
+                <select
+                  id="thread-settings-approval"
+                  value={settingsApprovalMode}
+                  disabled={busy || thread.snapshot.status === "closed"}
+                  onChange={(event) =>
+                    setSettingsApprovalMode(
+                      event.target.value as "untrusted" | "on_request" | "never",
+                    )
+                  }
+                >
+                  <option value="untrusted">Untrusted</option>
+                  <option value="on_request">On request</option>
+                  <option value="never">Never</option>
+                </select>
                 <button
                   type="button"
                   className="primary-button"
@@ -1489,7 +1611,34 @@ function ActiveThreadView({
                     thread.snapshot.status === "closed" ||
                     !settingsModel.trim()
                   }
-                  onClick={() => onSaveSettings(settingsProvider, settingsModel.trim())}
+                  onClick={() =>
+                    onSaveSettings({
+                      ...thread.snapshot.settings,
+                      provider_config_id: settingsProvider,
+                      model: settingsModel.trim(),
+                      temperature: settingsTemperature,
+                      max_tokens: settingsMaxTokens,
+                      thinking: settingsThinking && capabilities.thinking_supported
+                        ? {
+                            enabled: true,
+                            budget_tokens: capabilities.supports_thinking_budget
+                              ? settingsThinkingBudget
+                              : null,
+                            keep:
+                              settingsThinkingKeep !== null &&
+                              capabilities.supported_keep_values.includes(
+                                settingsThinkingKeep,
+                              )
+                                ? settingsThinkingKeep
+                                : null,
+                          }
+                        : null,
+                      approval_mode:
+                        thread.snapshot.settings.approval_mode === undefined
+                          ? undefined
+                          : settingsApprovalMode,
+                    })
+                  }
                 >
                   保存对话设置
                 </button>
@@ -1740,6 +1889,84 @@ function ActiveThreadView({
         )}
       </aside>
     </>
+  );
+}
+
+function SkillsPopover({
+  skills,
+  open,
+  onToggle,
+  onClose,
+}: {
+  skills: ThreadSkills | undefined;
+  open: boolean;
+  onToggle: () => void;
+  onClose: () => void;
+}) {
+  const value: ThreadSkills = skills ?? {
+    schema_version: 1,
+    available: [],
+    loaded: [],
+    diagnostics: [],
+  };
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose, open]);
+  return (
+    <div className="skills-popover-wrap">
+      <button
+        type="button"
+        className="quiet-button skills-toggle"
+        aria-label="Skills"
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        onClick={onToggle}
+      >
+        Skills · Loaded {value.loaded.length} / Available {value.available.length}
+      </button>
+      {open ? (
+        <div className="skills-popover" role="dialog" aria-label="Skills">
+          <div className="skills-popover-heading">
+            <div>
+              <p className="step-label">Runtime context</p>
+              <h4>Skills</h4>
+            </div>
+            <button type="button" className="icon-button" aria-label="关闭 Skills" onClick={onClose}>×</button>
+          </div>
+          <section aria-labelledby="loaded-skills-heading">
+            <h5 id="loaded-skills-heading">Loaded Skills ({value.loaded.length})</h5>
+            {value.loaded.length > 0 ? value.loaded.map((skill) => (
+              <article className="skill-popover-item" key={`loaded-${skill.name}`}>
+                <strong>{skill.name}</strong>
+                <small>{skill.source}</small>
+                <code>{skill.source_path}</code>
+                <p>{skill.description}</p>
+              </article>
+            )) : <p className="thread-empty">No Skills loaded this Turn.</p>}
+          </section>
+          <section aria-labelledby="available-skills-heading">
+            <h5 id="available-skills-heading">Available Skills ({value.available.length})</h5>
+            {value.available.length > 0 ? value.available.map((skill) => (
+              <article className="skill-popover-item" key={`available-${skill.name}`}>
+                <strong>{skill.name}</strong>
+                <small>{skill.source}</small>
+                <code>{skill.source_path}</code>
+                <p>{skill.description}</p>
+              </article>
+            )) : <p className="thread-empty">No Skills discovered.</p>}
+          </section>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

@@ -118,6 +118,20 @@ def test_thread_create_list_and_get_use_runtime_snapshot_and_lazy_singleton(
     assert first_view["snapshot"]["settings"]["version"] == 0
     assert first_view["event_cursor"] is None
     assert first_view["submission"] is None
+    capabilities = client.get(
+        f"/api/threads/{first_view['snapshot']['thread_id']}/capabilities"
+    )
+    assert capabilities.status_code == 200
+    assert capabilities.json()["capabilities"] == {
+        "thinking_supported": False,
+        "supports_thinking_budget": False,
+        "supported_keep_values": [],
+        "thinking": {
+            "supported": False,
+            "supports_budget_tokens": False,
+            "supported_keep_values": [],
+        },
+    }
     assert second.status_code == 201
     assert second.json()["thread"]["snapshot"]["settings"]["model"] == "kimi-k2"
     assert len(calls) == 1
@@ -181,6 +195,11 @@ def test_thread_settings_conflict_close_and_closed_mutation_are_stable(
     settings = updated.json()["thread"]["snapshot"]["settings"]
     assert settings["version"] == 1
     assert settings["provider_config_id"] == "glm"
+    assert settings["limits"] == {
+        "max_iterations": 20,
+        "max_tool_calls": 50,
+        "max_execution_seconds": 900,
+    }
     assert stale.status_code == 409
     assert stale.json()["error"]["code"] == "SETTINGS_CONFLICT"
     assert closed.status_code == 200

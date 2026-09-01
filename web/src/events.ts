@@ -1,4 +1,4 @@
-import type { ThreadView } from "./api";
+import type { SkillMetadata, ThreadSkills, ThreadView } from "./api";
 
 const SNAPSHOT_REFRESH_EVENT_TYPES = new Set([
   "turn_completed",
@@ -70,6 +70,7 @@ export type EventState = {
   approval: ApprovalRequest | null;
   provisional: ProvisionalAssistant | null;
   seen_event_ids: string[];
+  skills: ThreadSkills;
 };
 
 export type ApprovalRequest = {
@@ -92,6 +93,7 @@ export function hydrateThread(view: ThreadView): EventState {
     approval: null,
     provisional: null,
     seen_event_ids: [],
+    skills: normalizeSkills(view.snapshot.skills),
   };
   view.snapshot.messages.forEach((message, index) => {
     hydrateMessage(state, message, `snapshot-${index}`);
@@ -152,6 +154,12 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
             tool_calls: state.provisional.tool_calls.map((call) => ({ ...call })),
           },
     seen_event_ids: [...state.seen_event_ids, event.event_id],
+    skills: {
+      schema_version: state.skills.schema_version,
+      available: [...state.skills.available],
+      loaded: [...state.skills.loaded],
+      diagnostics: state.skills.diagnostics.map((item) => ({ ...item })),
+    },
   };
 
   if (event.type === "turn_started") {
@@ -160,6 +168,9 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     next.files = [];
     next.cancel_requested = false;
     next.approval = null;
+    // Loaded Skills are turn-local.  Keep the complete available catalog but
+    // never carry a prior Turn's bodies/metadata into the next execution.
+    next.skills.loaded = [];
     next.provisional = {
       turn_id: event.turn_id,
       text: "",
@@ -261,6 +272,22 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     const change = safeFileChange(event.payload);
     if (change !== null) {
       mergeFile(next, change);
+    }
+  } else if (event.type === "skill_loaded") {
+    const skill = safeSkill(event.payload);
+    if (skill !== null && !next.skills.loaded.some((item) => item.name === skill.name)) {
+      next.skills.loaded.push(skill);
+    }
+  } else if (event.type === "skill_activation_failed") {
+    const name = event.payload.name;
+    if (typeof name === "string" && name.trim()) {
+      next.skills.diagnostics.push({
+        code:
+          typeof event.payload.error_code === "string"
+            ? event.payload.error_code
+            : "SKILL_NOT_FOUND",
+        name,
+      });
     }
   } else if (event.type === "turn_cancel_requested") {
     next.cancel_requested = true;
@@ -456,6 +483,49 @@ function safeError(value: Record<string, unknown>) {
   return {
     code: typeof value.code === "string" ? value.code : "RUNTIME_ERROR",
     message: typeof value.message === "string" ? value.message : "Turn failed",
+  };
+}
+
+function normalizeSkills(value: unknown): ThreadSkills {
+  if (!isRecord(value)) {
+    return { schema_version: 1, available: [], loaded: [], diagnostics: [] };
+  }
+  const available = Array.isArray(value.available)
+    ? value.available.map(safeSkill).filter((item): item is SkillMetadata => item !== null)
+    : [];
+  const loaded = Array.isArray(value.loaded)
+    ? value.loaded.map(safeSkill).filter((item): item is SkillMetadata => item !== null)
+    : [];
+  const diagnostics = Array.isArray(value.diagnostics)
+    ? value.diagnostics.filter(isRecord).map((item) => ({ ...item }))
+    : [];
+  return {
+    schema_version: typeof value.schema_version === "number" ? value.schema_version : 1,
+    available,
+    loaded,
+    diagnostics,
+  };
+}
+
+function safeSkill(value: unknown): SkillMetadata | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (
+    typeof value.name !== "string" ||
+    typeof value.description !== "string" ||
+    typeof value.source !== "string" ||
+    typeof value.source_path !== "string"
+  ) {
+    return null;
+  }
+  return {
+    name: value.name,
+    description: value.description,
+    source: value.source,
+    source_path: value.source_path,
+    directory:
+      typeof value.directory === "string" ? value.directory : value.source_path,
   };
 }
 

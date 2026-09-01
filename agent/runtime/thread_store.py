@@ -27,7 +27,7 @@ from agent.core.messages import (
 )
 
 from .events import AgentEvent, json_safe
-from .context_history import CompactionCheckpoint
+from .history import CompactionCheckpoint
 from .settings import (
     AgentLimits,
     ApprovalMode,

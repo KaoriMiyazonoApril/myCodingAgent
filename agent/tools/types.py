@@ -84,6 +84,10 @@ class ToolDefinition:
             raise ToolArgumentsValidationError(
                 f"argument {name!r} must contain at least {schema['minLength']} character(s)"
             )
+        if isinstance(value, str) and "maxLength" in schema and len(value) > schema["maxLength"]:
+            raise ToolArgumentsValidationError(
+                f"argument {name!r} must contain at most {schema['maxLength']} character(s)"
+            )
         if isinstance(value, int) and not isinstance(value, bool):
             if "minimum" in schema and value < schema["minimum"]:
                 raise ToolArgumentsValidationError(

@@ -40,6 +40,8 @@ const EVENT_TYPES = [
   "command_completed",
   "file_changed",
   "settings_updated",
+  "skill_loaded",
+  "skill_activation_failed",
   "turn_cancel_requested",
   "thread_close_requested",
   "turn_completed",

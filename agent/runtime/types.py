@@ -67,6 +67,7 @@ class ThreadSnapshot:
     latest_turn: TurnSummary | None = None
     pending_approval: dict[str, Any] | None = None
     turns: list[TurnSummary] = field(default_factory=list)
+    skills: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached structure accepted by strict JSON encoders."""

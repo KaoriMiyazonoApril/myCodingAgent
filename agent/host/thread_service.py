@@ -52,6 +52,8 @@ class RuntimeView(Protocol):
 
     def get_snapshot(self, thread_id: str): ...
 
+    def capabilities_for(self, thread_id: str) -> dict[str, object]: ...
+
     def get_events(self, thread_id: str, *, after_event_id: str | None = None): ...
 
     def subscribe_events(
@@ -251,8 +253,28 @@ class ThreadHost:
             "snapshot": snapshot.to_dict(),
             "workspace": workspace.to_dict(),
             "event_cursor": events.latest_event_id,
+            "capabilities": self._capabilities(runtime, thread_id),
             "submission": None,
         }
+
+    @staticmethod
+    def _capabilities(runtime: RuntimeView, thread_id: str) -> dict[str, object]:
+        capabilities = getattr(runtime, "capabilities_for", None)
+        if not callable(capabilities):
+            capabilities = getattr(runtime, "get_capabilities", None)
+        if not callable(capabilities):
+            return {
+                "thinking_supported": False,
+                "supports_thinking_budget": False,
+                "supported_keep_values": [],
+                "thinking": {
+                    "supported": False,
+                    "supports_budget_tokens": False,
+                    "supported_keep_values": [],
+                },
+            }
+        value = capabilities(thread_id)
+        return value if isinstance(value, dict) else {}
 
     def _require_thread(self, thread_id: str) -> RuntimeView:
         self._ensure_persistent_runtime()

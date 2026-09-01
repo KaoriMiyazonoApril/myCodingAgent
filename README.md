@@ -112,3 +112,18 @@ Agent loop ── Conversation ── local Tools / LLM client
 持久化 Thread、canonical Conversation、Turn/event/idempotency 状态与 Context compaction
 checkpoint。V1 不包含 approval UI、WebSocket、认证、远程多用户服务或 Electron/Tauri；既有
 SSE/streaming 与 PTY 能力保持在现有 Runtime/ProcessManager seam 内。
+
+## Context V2
+
+Context 组装、历史选择/裁剪/压缩、项目指令、运行时环境和任务状态位于独立模块；旧的
+`agent.runtime.context` 与 `agent.runtime.context_history` 入口仅保留兼容导出。每个 Turn 都会在
+发送模型前固定 root `AGENTS.md`、有界 Skills catalog、运行时环境、压缩摘要、选中的原始历史、
+late loaded Skill projection 与确定性 `TaskStateView`。Task plan 通过 `update_plan` 原子替换，命令
+执行产生受限的 mutation/validation/failure/artifact evidence；模型可通过本地 `skill(name)` 工具
+按需加载本地 `SKILL.md`。显式 `$skill-name` 会在首个模型请求前加载且不伪造 tool call；模型实际
+调用产生的 bounded ToolResult 仍按 canonical history 规则保留。
+
+Web 工作区的对话设置支持 provider/model、temperature、output limit、approval mode 与 capability
+驱动的 thinking budget；对话标题旁的 Skills 面板只显示当前 Turn 已加载和可用 Skill 的元数据。
+预算、ToolResult hard bound、atomic history、rolling compaction 与 checkpoint 约束详见
+[`docs/context-architecture.md`](docs/context-architecture.md)。

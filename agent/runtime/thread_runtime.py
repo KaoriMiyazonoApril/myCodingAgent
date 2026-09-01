@@ -19,7 +19,7 @@ from agent.tools.types import ToolDefinition, ToolResult
 
 from .conversation import Conversation
 from .change_tracker import ChangeTracker
-from .context import (
+from .context_manager import (
     BaseSystemInstructions,
     ContextManager,
     ProjectInstructionsProvider,
@@ -29,11 +29,12 @@ from .context import (
     TaskState,
 )
 from .context_budget import ContextBudget
-from .context_history import (
+from .history import (
     CompactionCheckpoint,
     CompactionError,
     LLMHistoryCompactor,
 )
+from .skills import SkillDiscovery, SkillCatalog, SkillTurnState, explicit_skill_names
 from .errors import (
     ApprovalTimeoutError,
     ContextLimitError,
@@ -90,6 +91,7 @@ class _ActiveTurn:
     tools: ToolCoordinator
     changes: ChangeTracker
     events: TurnEventEmitter
+    skills: SkillTurnState
     started_at: str
     idempotency_key: str | None = None
 
@@ -127,6 +129,7 @@ class _ThreadRecord:
     task_state: TaskState | None = None
     compaction_checkpoint: CompactionCheckpoint | None = None
     checkpoint_diagnostics: tuple[str, ...] = ()
+    skill_catalog: SkillCatalog = field(default_factory=SkillCatalog)
 
 
 class ThreadRuntime:
@@ -240,8 +243,10 @@ class ThreadRuntime:
             created_at=created_at,
             updated_at=created_at,
             events=EventBuffer(self._event_buffer_capacity),
+            skill_catalog=SkillDiscovery().discover(normalized_workspace),
         )
         self._register_update_plan_tool(record)
+        self._register_skill_tool(record)
         set_context = getattr(record.tools, "set_session_context", None)
         if callable(set_context):
             set_context(thread_id=thread_id, turn_id=None)
@@ -272,7 +277,7 @@ class ThreadRuntime:
             name="update_plan",
             description=(
                 "Replace the optional current task plan with ordered steps. "
-                "Use pending, in_progress, or completed statuses."
+                "Use pending, in_progress, completed, or blocked statuses."
             ),
             parameters={
                 "type": "object",
@@ -284,13 +289,18 @@ class ThreadRuntime:
                         "items": {
                             "type": "object",
                             "properties": {
-                                "step": {"type": "string", "minLength": 1},
+                                "step": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 2_000,
+                                },
                                 "status": {
                                     "type": "string",
                                     "enum": [
                                         "pending",
                                         "in_progress",
                                         "completed",
+                                        "blocked",
                                     ],
                                 },
                             },
@@ -325,6 +335,51 @@ class ThreadRuntime:
                 content="task plan updated",
                 metadata={"plan_steps": len(plan.steps)},
             )
+
+        async def execute_async(arguments: dict[str, object]) -> ToolResult:
+            return execute(arguments)
+
+        record.tools.register(definition, execute, async_executor=execute_async)
+
+    @staticmethod
+    def _register_skill_tool(record: _ThreadRecord) -> None:
+        """Install the real local ``skill(name)`` capability once per Thread."""
+
+        if record.tools.lookup("skill") is not None:
+            return
+        definition = ToolDefinition(
+            name="skill",
+            description="Load Skill instructions.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                    }
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        )
+
+        def execute(arguments: dict[str, object]) -> ToolResult:
+            active = record.active_turn
+            if active is None:
+                return ToolResult(
+                    content="skill is available only during an active Turn",
+                    metadata={"status": "unavailable"},
+                    error_code="SKILL_UNAVAILABLE",
+                )
+            name = arguments.get("name")
+            if not isinstance(name, str):
+                return ToolResult(
+                    content="skill name must be a string",
+                    metadata={"status": "invalid"},
+                    error_code="INVALID_ARGUMENTS",
+                )
+            return active.skills.load(name)
 
         async def execute_async(arguments: dict[str, object]) -> ToolResult:
             return execute(arguments)
@@ -379,8 +434,10 @@ class ThreadRuntime:
                 },
                 compaction_checkpoint=deepcopy(state.checkpoint),
                 checkpoint_diagnostics=state.checkpoint_diagnostics,
+                skill_catalog=SkillDiscovery().discover(workspace),
             )
             self._register_update_plan_tool(record)
+            self._register_skill_tool(record)
             set_context = getattr(record.tools, "set_session_context", None)
             if callable(set_context):
                 set_context(thread_id=record.thread_id, turn_id=None)
@@ -669,10 +726,47 @@ class ThreadRuntime:
             # deliberately limited to model-maintained plan plus objective
             # Harness evidence and never mirrors that goal.
             task_state = TaskState()
+            pending_skill_events: list[tuple[str, dict[str, object]]] = []
+            def skill_loaded(skill) -> None:
+                payload = {
+                    "name": skill.name,
+                    "source": skill.source,
+                    "source_path": skill.source_path,
+                    "description": skill.description,
+                }
+                # Explicit mentions are loaded during provider-free preflight,
+                # so hold their event until after ``turn_started``.  A model
+                # ``skill(name)`` call happens during an active Turn and must
+                # be emitted immediately so Host/SSE consumers see both
+                # activation paths as one live state transition.
+                if record.active_turn is None:
+                    pending_skill_events.append(("skill_loaded", payload))
+                else:
+                    events.emit("skill_loaded", payload)
+
+            skill_state = SkillTurnState(
+                record.skill_catalog,
+                on_loaded=skill_loaded,
+            )
+            explicit_names = explicit_skill_names(user_text)
+            explicit_loaded = skill_state.explicit_activation(explicit_names)
+            for name in explicit_names:
+                if name not in explicit_loaded:
+                    pending_skill_events.append(
+                        (
+                            "skill_activation_failed",
+                            {
+                                "name": name,
+                                "error_code": "SKILL_NOT_FOUND",
+                            },
+                        )
+                    )
             context_manager = self._context_manager_for(
                 record,
                 turn_config,
                 provider_capabilities,
+                skill_catalog=record.skill_catalog,
+                skill_state=skill_state,
             )
             # Preflight only the irreducible request prefix.  Reducible
             # durable history is handled after provider resolution by the
@@ -738,6 +832,7 @@ class ThreadRuntime:
                 tools=tools,
                 changes=changes,
                 events=events,
+                skills=skill_state,
                 started_at=utc_now(),
                 idempotency_key=idempotency_key,
             )
@@ -766,6 +861,12 @@ class ThreadRuntime:
                     },
                 },
             )
+            # Explicit Skill activation happened during provider-free
+            # preflight, but its durable UI events belong after the Turn
+            # boundary.  This keeps the frontend's turn-local reset followed
+            # by the actual loaded state, without fabricating a tool call.
+            for event_type, payload in pending_skill_events:
+                events.emit(event_type, payload)
             summary = await self._execute_active_turn(
                 record,
                 active_turn,
@@ -830,6 +931,9 @@ class ThreadRuntime:
         record: _ThreadRecord,
         turn_config: TurnConfig,
         provider_capabilities: ProviderCapabilities | None,
+        *,
+        skill_catalog: SkillCatalog | None = None,
+        skill_state: SkillTurnState | None = None,
     ) -> ContextManager:
         """Create one request-context assembler for a frozen Turn config."""
 
@@ -847,6 +951,8 @@ class ThreadRuntime:
                 ),
                 output_tokens=turn_config.max_tokens,
             ),
+            skill_catalog=skill_catalog or record.skill_catalog,
+            skill_state=skill_state,
         )
 
     def _provider_capabilities_for(
@@ -1005,6 +1111,7 @@ class ThreadRuntime:
                 },
             )
         except Exception as error:
+            logger.exception("Unexpected Turn failure")
             is_model_error = isinstance(error, LLMError)
             public_error = {
                 "code": "LLM_ERROR" if is_model_error else "RUNTIME_ERROR",
@@ -1024,6 +1131,59 @@ class ThreadRuntime:
 
     def get_snapshot(self, thread_id: str) -> ThreadSnapshot:
         return self._snapshot(self._threads[thread_id])
+
+    def capabilities_for(self, thread_id: str) -> dict[str, object]:
+        """Return a safe Host-facing projection for the Thread's model.
+
+        Capability lookup deliberately uses the resolver's provider-independent
+        hook.  If an embedder does not expose that hook, the conservative
+        projection disables optional controls instead of guessing from names.
+        """
+
+        record = self._threads[thread_id]
+        try:
+            turn_config = TurnConfig.from_thread_settings(
+                record.settings,
+                system_prompt=self._system_prompt,
+                reasoning_visibility=self._reasoning_visibility,
+            )
+            capabilities = self._provider_capabilities_for(turn_config)
+            if capabilities is None:
+                # Lightweight test/embedder resolvers may not expose the
+                # optional provider-independent hook.  Their provider object
+                # is still the authoritative capability source; production
+                # factories provide the hook above and therefore avoid
+                # constructing a transport for this read-only endpoint.
+                provider = self._provider_resolver(
+                    turn_config.provider_config_id,
+                    turn_config.model,
+                )
+                candidate = getattr(provider, "capabilities", None)
+                capabilities = (
+                    candidate if isinstance(candidate, ProviderCapabilities) else None
+                )
+        except Exception:
+            capabilities = None
+        thinking = None if capabilities is None else capabilities.thinking
+        supported = bool(thinking is not None and thinking.supported)
+        budget = bool(
+            thinking is not None
+            and thinking.supported
+            and thinking.supports_budget_tokens
+        )
+        keep_values = () if thinking is None else thinking.supported_keep_values
+        return {
+            "thinking_supported": supported,
+            "supports_thinking_budget": budget,
+            "supported_keep_values": list(keep_values),
+            "thinking": {
+                "supported": supported,
+                "supports_budget_tokens": budget,
+                "supported_keep_values": list(keep_values),
+            },
+        }
+
+    get_capabilities = capabilities_for
 
     def get_events(
         self,
@@ -1169,6 +1329,14 @@ class ThreadRuntime:
             if record.active_turn is None
             else record.active_turn.tools.pending_approval()
         )
+        loaded = () if record.active_turn is None else record.active_turn.skills.loaded
+        catalog = record.skill_catalog
+        skills = {
+            "schema_version": 1,
+            "available": [skill.metadata for skill in catalog.skills],
+            "loaded": [skill.metadata for skill in loaded],
+            "diagnostics": [diagnostic.to_dict() for diagnostic in catalog.diagnostics],
+        }
         return ThreadSnapshot(
             schema_version=SCHEMA_VERSION,
             thread_id=record.thread_id,
@@ -1183,6 +1351,7 @@ class ThreadRuntime:
             latest_turn=deepcopy(record.latest_turn),
             pending_approval=pending_approval,
             turns=deepcopy(record.turns),
+            skills=skills,
         )
 
     @staticmethod

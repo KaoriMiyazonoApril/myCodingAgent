@@ -164,8 +164,7 @@ def test_task_plan_is_optional_bounded_and_has_one_in_progress() -> None:
     assert state.plan is not None
     assert state.plan.steps[0].status.value == "completed"
     assert history == before
-    with pytest.raises(ValueError, match="status"):
-        PlanStep("invalid", "blocked")
+    assert PlanStep("blocked", "blocked").status.value == "blocked"
     with pytest.raises(ValueError, match="one in_progress"):
         TaskPlan(
             [

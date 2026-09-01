@@ -305,9 +305,12 @@ def test_completed_thread_accepts_a_second_turn_with_preserved_history(
     assert provider.requests[1].messages[0].content[0] == (
         provider.requests[0].messages[0].content[0]
     )
-    assert provider.requests[0].messages[0].content[1] != (
+    # Runtime telemetry such as turn_id is intentionally excluded from the
+    # model-visible stable epoch, so equivalent Turns share this block.
+    assert provider.requests[0].messages[0].content[1] == (
         provider.requests[1].messages[0].content[1]
     )
+    assert "turn_id" not in provider.requests[0].messages[0].content[1].text
     assert "runtime_context:" in provider.requests[0].messages[0].content[1].text
     assert "task_state:" in provider.requests[0].messages[0].content[1].text
 
@@ -1212,7 +1215,14 @@ def test_acceptance_read_edit_test_and_diff_loop_uses_real_local_tools(
     assert "-    return 1" in summary.file_diffs[0]["diff"]
     assert "+    return 2" in summary.file_diffs[0]["diff"]
     assert summary.diff_complete is False
-    command_result = provider.requests[3].messages[-1].content[0]
+    command_result = next(
+        block
+        for message in provider.requests[3].messages
+        if message.role == "tool"
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+        and block.tool_call_id == "accept-test"
+    )
     assert isinstance(command_result, ToolResultBlock)
     assert command_result.error_code is None
     assert command_result.metadata["exit_code"] == 0
@@ -1248,7 +1258,14 @@ def test_acceptance_failed_validation_is_returned_to_the_model_and_reported(
 
     summary = asyncio.run(runtime.run_turn(thread.thread_id, "Run validation."))
 
-    result = provider.requests[1].messages[-1].content[0]
+    result = next(
+        block
+        for message in provider.requests[1].messages
+        if message.role == "tool"
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+        and block.tool_call_id == "failed-test"
+    )
     assert isinstance(result, ToolResultBlock)
     assert result.error_code == "COMMAND_FAILED"
     assert result.metadata["exit_code"] == 3
@@ -1643,7 +1660,9 @@ def test_long_thread_reduces_context_and_persists_rolling_checkpoint(tmp_path) -
     final_request = provider.model_requests[-1]
     final_system = "".join(
         block.text
-        for block in final_request.messages[0].content
+        for message in final_request.messages
+        if message.role == "system"
+        for block in message.content
         if isinstance(block, TextBlock)
     )
     assert "project rule sentinel" in final_system

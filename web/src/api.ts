@@ -85,7 +85,11 @@ export type ThreadSettings = {
   model: string;
   temperature: number | null;
   max_tokens: number | null;
-  thinking: unknown | null;
+  thinking: {
+    enabled: boolean;
+    budget_tokens: number | null;
+    keep: "none" | "all" | null;
+  } | null;
   limits: {
     max_iterations: number;
     max_tool_calls: number;
@@ -93,6 +97,32 @@ export type ThreadSettings = {
   };
   version: number;
   approval_mode?: "untrusted" | "on_request" | "never";
+};
+
+export type SkillMetadata = {
+  name: string;
+  description: string;
+  source: string;
+  source_path: string;
+  directory: string;
+};
+
+export type ThreadSkills = {
+  schema_version: number;
+  available: SkillMetadata[];
+  loaded: SkillMetadata[];
+  diagnostics: Array<Record<string, unknown>>;
+};
+
+export type ThreadCapabilities = {
+  thinking_supported: boolean;
+  supports_thinking_budget: boolean;
+  supported_keep_values: string[];
+  thinking?: {
+    supported: boolean;
+    supports_budget_tokens: boolean;
+    supported_keep_values: string[];
+  };
 };
 
 export type TurnSubmission = {
@@ -123,7 +153,10 @@ export type ThreadView = {
     updated_at: string;
     latest_turn: Record<string, unknown> | null;
     pending_approval?: PendingApproval | null;
+    turns?: Array<Record<string, unknown>>;
+    skills?: ThreadSkills;
   };
+  capabilities?: ThreadCapabilities;
   event_cursor: string | null;
   submission: TurnSubmission | null;
   workspace?: WorkspaceRecord;
@@ -240,6 +273,17 @@ export async function getThreads(): Promise<ThreadView[]> {
 
 export async function getThread(threadId: string): Promise<ThreadView> {
   return (await requestJson<ThreadResponse>(`/api/threads/${threadId}`)).thread;
+}
+
+export async function getThreadCapabilities(
+  threadId: string,
+): Promise<ThreadCapabilities> {
+  const response = await requestJson<{
+    schema_version: number;
+    thread_id: string;
+    capabilities: ThreadCapabilities;
+  }>(`/api/threads/${threadId}/capabilities`);
+  return response.capabilities;
 }
 
 

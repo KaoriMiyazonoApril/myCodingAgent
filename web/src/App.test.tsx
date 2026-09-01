@@ -983,3 +983,126 @@ test("submits multiline work and stops through Host commands", async () => {
     ]),
   );
 });
+
+test("shows Skills metadata and capability-gated thread settings", async () => {
+  const requests: Array<{ path: string; method: string; body?: string }> = [];
+  const thread = {
+    schema_version: 1,
+    snapshot: {
+      schema_version: 1,
+      thread_id: "thread-skills",
+      workspace: "/workspace",
+      status: "idle",
+      active_turn_id: null,
+      completed_turns: 0,
+      settings: {
+        provider_config_id: "deepseek",
+        model: "deepseek-chat",
+        temperature: null,
+        max_tokens: null,
+        thinking: null,
+        limits: {
+          max_iterations: 20,
+          max_tool_calls: 50,
+          max_execution_seconds: 900,
+        },
+        approval_mode: "on_request",
+        version: 0,
+      },
+      messages: [],
+      created_at: "2026-08-29T00:00:00Z",
+      updated_at: "2026-08-29T00:00:00Z",
+      latest_turn: null,
+      skills: {
+        schema_version: 1,
+        available: [
+          {
+            name: "repo-guide",
+            description: "Repository workflow guidance",
+            source: "workspace .agents",
+            source_path: "/workspace/.agents/skills/repo-guide/SKILL.md",
+            directory: "/workspace/.agents/skills/repo-guide",
+          },
+        ],
+        loaded: [],
+        diagnostics: [],
+      },
+    },
+    event_cursor: null,
+    submission: null,
+    workspace: {
+      workspace_id: "workspace-1",
+      path: "/workspace",
+      canonical_path: "/workspace",
+      display_name: "workspace",
+    },
+    capabilities: {
+      thinking_supported: true,
+      supports_thinking_budget: true,
+      supported_keep_values: ["none", "all"],
+    },
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ path, method, body: init?.body as string | undefined });
+      if (path === "/api/providers") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            default_provider_id: "deepseek",
+            providers: [
+              {
+                provider_id: "deepseek",
+                display_name: "DeepSeek",
+                configured: true,
+                credential_mask: "••••test",
+                selected_model: "deepseek-chat",
+                is_default: true,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (path === "/api/threads" && method === "GET") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [thread] }),
+        } as Response;
+      }
+      if (path.startsWith("/api/workspaces")) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            path: "/workspace",
+            parent: null,
+            roots: ["/workspace"],
+            entries: [],
+            truncated: false,
+          }),
+        } as Response;
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    }),
+  );
+
+  render(<App />);
+  expect(await screen.findByRole("button", { name: "Skills" })).toHaveTextContent(
+    "Loaded 0 / Available 1",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+  const skills = await screen.findByRole("dialog", { name: "Skills" });
+  expect(skills).toHaveTextContent("repo-guide");
+  expect(skills).toHaveTextContent("Repository workflow guidance");
+  fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
+  expect(screen.getByLabelText("Thinking")).not.toBeDisabled();
+  fireEvent.click(screen.getByLabelText("Thinking"));
+  expect(screen.getByLabelText("Thinking budget")).toBeInTheDocument();
+  expect(screen.getByLabelText("Thinking history")).toBeInTheDocument();
+  expect(requests.some(({ path }) => path === "/api/threads/thread-skills/capabilities")).toBe(false);
+});

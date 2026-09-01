@@ -506,7 +506,14 @@ def test_streaming_cross_phase_patch_command_stdin_and_final_flow(tmp_path) -> N
                 yield MessageEndEvent(finish_reason="tool_calls")
                 return
             if self.calls == 3:
-                tool_message = request.messages[-1]
+                # Context V2 appends its late working-tail projection after
+                # chronological history. Locate the latest real tool
+                # result rather than assuming it is the final message.
+                tool_message = next(
+                    message
+                    for message in reversed(request.messages)
+                    if message.role == "tool"
+                )
                 result = tool_message.content[0]
                 session_id = result.metadata["session_id"]
                 raw = json.dumps(

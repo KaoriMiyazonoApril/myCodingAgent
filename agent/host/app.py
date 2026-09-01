@@ -483,6 +483,15 @@ def create_app(
             "thread": with_submission(threads.get_thread(thread_id)),
         }
 
+    @app.get("/api/threads/{thread_id}/capabilities")
+    async def thread_capabilities(thread_id: str) -> dict[str, object]:
+        thread = threads.get_thread(thread_id)
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "thread_id": thread_id,
+            "capabilities": thread.get("capabilities", {}),
+        }
+
     @app.get("/api/threads/{thread_id}/events")
     async def stream_thread_events(
         thread_id: str,
@@ -512,6 +521,27 @@ def create_app(
         thread_id: str,
         request: ThreadSettingsUpdate,
     ) -> dict[str, object]:
+        current_view = threads.get_thread(thread_id)
+        current_snapshot = current_view.get("snapshot", {})
+        current_settings = (
+            current_snapshot.get("settings", {})
+            if isinstance(current_snapshot, dict)
+            else {}
+        )
+        current_limits_payload = (
+            current_settings.get("limits", {})
+            if isinstance(current_settings, dict)
+            else {}
+        )
+        # ``limits`` are an internal runtime budget, not a Basic Settings
+        # control.  If a legacy/client request omits them, preserve the
+        # current versioned values rather than resetting them to defaults.
+        fields_set = getattr(request, "model_fields_set", set())
+        limits_payload = (
+            request.limits.model_dump()
+            if "limits" in fields_set
+            else current_limits_payload
+        )
         thinking = (
             None
             if request.thinking is None
@@ -523,7 +553,7 @@ def create_app(
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             thinking=thinking,
-            limits=AgentLimits(**request.limits.model_dump()),
+            limits=AgentLimits(**limits_payload),
             approval_mode=request.approval_mode,
         )
         thread = threads.update_settings(
