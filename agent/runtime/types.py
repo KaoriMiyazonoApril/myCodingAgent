@@ -75,7 +75,15 @@ class ThreadSnapshot:
     def to_dict(self) -> dict[str, Any]:
         """Return a detached structure accepted by strict JSON encoders."""
 
-        return _public_dict(self)
+        payload = _public_dict(self)
+        settings = payload.get("settings")
+        if isinstance(settings, dict):
+            thinking = settings.get("thinking")
+            # Keep the V1 wire shape stable for settings that do not use the
+            # optional model-specific intensity control.
+            if isinstance(thinking, dict) and thinking.get("intensity") is None:
+                thinking.pop("intensity", None)
+        return payload
 
 
 @dataclass(frozen=True, slots=True)

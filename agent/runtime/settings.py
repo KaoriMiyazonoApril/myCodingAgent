@@ -74,6 +74,7 @@ class ThinkingSettings:
     enabled: bool
     budget_tokens: int | None = None
     keep: ThinkingKeep | None = None
+    intensity: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -86,10 +87,18 @@ class ThinkingSettings:
             raise ValueError("thinking.budget_tokens must be a positive integer")
         if self.keep is not None and not isinstance(self.keep, ThinkingKeep):
             raise ValueError("thinking.keep must be a ThinkingKeep value")
-        if not self.enabled and (
-            self.budget_tokens is not None or self.keep is not None
+        if self.intensity is not None and (
+            not isinstance(self.intensity, str) or not self.intensity.strip()
         ):
-            raise ValueError("disabled thinking cannot set budget_tokens or keep")
+            raise ValueError("thinking.intensity must be a non-empty string")
+        if not self.enabled and (
+            self.budget_tokens is not None
+            or self.keep is not None
+            or self.intensity is not None
+        ):
+            raise ValueError(
+                "disabled thinking cannot set budget_tokens, keep, or intensity"
+            )
 
     def to_extra_body(self) -> dict[str, object]:
         thinking: dict[str, object] = {
@@ -99,6 +108,8 @@ class ThinkingSettings:
             thinking["budget_tokens"] = self.budget_tokens
         if self.keep is not None:
             thinking["keep"] = self.keep.value
+        if self.intensity is not None:
+            thinking["intensity"] = self.intensity
         return {"thinking": thinking}
 
     def validate_for(self, capabilities: ThinkingCapabilities) -> None:
@@ -118,6 +129,17 @@ class ThinkingSettings:
         ):
             raise UnsupportedModelSettingError(
                 f"selected model does not support thinking.keep={self.keep.value!r}"
+            )
+        if not capabilities.toggle_supported and not self.enabled:
+            raise UnsupportedModelSettingError(
+                "selected model requires thinking to remain enabled"
+            )
+        if self.intensity is not None and (
+            not capabilities.intensity_supported
+            or self.intensity not in capabilities.intensity_options
+        ):
+            raise UnsupportedModelSettingError(
+                f"selected model does not support thinking.intensity={self.intensity!r}"
             )
 
 

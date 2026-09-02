@@ -43,9 +43,9 @@ OpenAI Python SDK 只在 `OpenAICompatibleProvider` 内用作 HTTP 客户端。S
 `agent.core` 不依赖 Model Layer 或 OpenAI SDK。`ToolDefinition` 同样属于工具领域，
 由 `agent.tools.types` 定义，当前只描述工具的元数据与 JSON Schema，不包含工具执行。
 
-`LLMRequest` 目前只抽象共同子集：messages、tools、temperature、max_tokens 与
-`extra_body`。调用 `chat()` 或 `stream()` 决定传输模式，避免请求数据同时包含两种
-模式的开关。`extra_body` 是经过刻意保留的厂商私有参数逃生口，
+`LLMRequest` 目前只抽象共同子集：messages、tools、temperature、max_tokens、统一的
+`ThinkingRequest` 与 `extra_body`。调用 `chat()` 或 `stream()` 决定传输模式，避免请求数据同时包含两种
+模式的开关。Provider adapter 负责把统一 Thinking 意图映射成真实厂商字段；`extra_body` 是经过刻意保留的厂商私有参数逃生口，
 不会污染核心类型。`Usage` 的三个 token 字段都允许为 `None`。
 
 ## 编码与解析
@@ -67,7 +67,7 @@ reasoning 历史由 `ProviderCapabilities.reasoning_retention` 的三态策略�
 thinking 启用参数在该底层边界仍通过 `extra_body` 指定。Agent Runtime 不向前端公开这个
 任意参数逃生口，而是从 allowlisted `ThinkingSettings` 生成受限的 `thinking` 对象。
 `ProviderCapabilities.thinking` 使用 `ThinkingCapabilities` 声明所选模型是否支持开关、
-`budget_tokens` 以及允许的 `keep` 值；`ModelInvoker` 在第一次请求前逐项校验，未知或
+默认状态、`budget_tokens`、强度选项以及允许的 `keep` 值；`ModelInvoker` 在第一次请求前逐项校验，未知或
 不支持的组合 fail closed 为 `UNSUPPORTED_MODEL_SETTING`。Capability 还可通过
 `context_window_tokens` 声明所选模型的上下文容量；Runtime 用它在每次请求前执行保守
 容量检查，但该字段不改变底层 API payload。
@@ -96,30 +96,55 @@ envelope：`ok`、`content`、`metadata`、`error_code` 会一起进入 tool mes
 
 所有供应商均实例化同一个 `OpenAICompatibleProvider`。`create_provider_config`
 提供当前官方默认端点：DeepSeek `https://api.deepseek.com`、Kimi/Moonshot
-`https://api.moonshot.cn/v1`、GLM `https://open.bigmodel.cn/api/paas/v4`；调用者
+`https://api.moonshot.ai/v1`、GLM `https://open.bigmodel.cn/api/paas/v4`；调用者
 仍可用 `base_url` 覆盖。每个 `ProviderProfile` 提供默认 capabilities，并可通过精确模型
 名映射到 `ModelProfile` 的逐字段覆盖；未覆盖字段继承 provider 默认值。对于可空字段，
 内部 `UNSET` 表示继承，而显式 `None` 表示禁用，因此 model profile 可以清除 provider
 默认的 reasoning 输入字段。Thinking 能力与 context window 同样可由精确模型 profile
-覆盖，Runtime 据此校验当前选择，而不是按 provider 名称猜测。预设不硬编码可能变化的
-模型容量；没有显式容量声明时，Runtime 使用自身的保守默认值。调用方也可在创建配置时
-显式传入完整 capabilities。
+覆盖，Runtime 据此校验当前选择，而不是按 provider 名称猜测。只有已由当前官方资料确认的
+精确模型才声明容量；没有显式容量声明时，Runtime 使用自身的保守默认值。调用方也可在
+创建配置时显式传入完整 capabilities。
 
 当前 DeepSeek 预设面向 `deepseek-v4-flash` 与 `deepseek-v4-pro` 等当前模型，不再保留已
 退役的 `deepseek-chat` / `deepseek-reasoner` 特例；其 reasoning 使用
 `TOOL_CHAIN_ONLY`，且 tool-call assistant message 需要非 null content。Kimi/Moonshot
 预设使用 `ALWAYS`，与 preserved thinking 默认保留完整历史的行为对齐，并声明其
 `thinking.keep` allowlist；DeepSeek 与 GLM 声明支持 thinking 开关，但不声称支持当前
-OpenAI-compatible 协议未列出的 budget/keep 字段。Runtime 调用方只使用安全的
+OpenAI-compatible 协议未列出的 budget/keep 字段；精确模型 profile 只增加已确认的
+Thinking 默认值、开关和强度，不会把未知能力继承到未知模型。Runtime 调用方只使用安全的
 `ThinkingSettings`。GLM 预设继续使用 `TOOL_CHAIN_ONLY`。API key 不会出现在
 `ProviderConfig` 的默认 repr 中，
 示例也只从环境变量读取 key。
 
+### Issue #6 capability/profile authority
+
+模型显示信息和 Runtime capability 由同一组 `ProviderProfile.model_profiles` 提供，Host
+只把 Provider 返回的 ID 与这些精确 profile 合并，不在 Web 或 Runtime 复制一份模型注册表。
+截至 2026-09-02，内置的已确认 profile 如下：
+
+| Provider | 精确模型 | Context Window | Thinking |
+| --- | --- | ---: | --- |
+| DeepSeek | `deepseek-v4-flash`, `deepseek-v4-pro` | 1M | 默认开启，可切换 `low/high/max`，默认 `high` |
+| Moonshot/Kimi | `kimi-k3` | 1M | 始终开启，`low/high/max`，默认 `max` |
+| Moonshot/Kimi | `kimi-k2.7-code`, `kimi-k2.7-code-highspeed` | 256K | 始终开启，不声明强度选项 |
+| Moonshot/Kimi | `kimi-k2.6` | 256K | 默认开启，可关闭，不声明强度选项 |
+| GLM | `glm-5.3` | 1M | 始终开启，`low/high/max`，默认 `max` |
+| GLM | `glm-5.2` | 1M | 默认开启，可关闭，`none/minimal/low/medium/high/xhigh/max`，默认 `max` |
+
+未命中精确 profile 的 Provider-reported ID 仍可手动使用，但 capability 和 Context Window
+均按未知处理；该保守结果不会猜测 Thinking、上下文容量或工具兼容性。`ModelInvoker`
+只把已验证的 `ThinkingSettings` 转成统一 `ThinkingRequest`，Provider adapter 再映射到
+供应商协议：DeepSeek V4 与 GLM 使用
+`thinking.type` 并在有强度时发送顶层 `reasoning_effort`，Kimi K3 使用顶层
+`reasoning_effort`，可关闭的 Kimi 使用 `thinking.type`，始终开启的 Kimi 不发送关闭参数。
+这些映射由 `ThinkingParameterStyle` allowlist 实现，不能由前端提交任意 `extra_body`。
+
 能力声明依据供应商的 thinking + tool-call 协议文档：
 [DeepSeek Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/)、
 [DeepSeek V4 Release Notes](https://api-docs.deepseek.com/news/news260424/)、
-[Kimi Code Configuration](https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/config-files)、
-[GLM 思考模式](https://docs.bigmodel.cn/cn/guide/capabilities/thinking-mode)。
+[Kimi Model List](https://platform.kimi.ai/docs/models)、
+[Kimi Thinking Models](https://platform.kimi.ai/docs/guide/use-thinking-models)、
+[GLM 深度思考](https://docs.bigmodel.cn/cn/guide/capabilities/thinking)。
 
 `ProviderConfig` 和预设选择的所有配置错误都统一抛出
 `LLMConfigurationError`。`Message` 在创建时校验 role 与 block 的组合：system/user

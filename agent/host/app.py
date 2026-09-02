@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent.model.presets import PROVIDER_PRESETS
 from agent.runtime import (
     AgentLimits,
     ApprovalMode,
@@ -33,6 +34,7 @@ from agent.runtime import (
 
 from .model_catalog import (
     ModelDiscovery,
+    ModelCatalogStatus,
     ModelDiscoveryError,
     ProviderAuthenticationError,
     ProviderResponseError,
@@ -42,6 +44,7 @@ from .provider_config import (
     ProviderConfigurationError,
     ProviderNotConfiguredError,
     ProviderStore,
+    PROVIDERS,
     SCHEMA_VERSION,
     UnknownProviderError,
 )
@@ -68,6 +71,15 @@ from .workspace import (
 
 
 logger = logging.getLogger(__name__)
+
+_SAFE_CATALOG_ERROR_CODES = frozenset(
+    {
+        "PROVIDER_TIMEOUT",
+        "PROVIDER_AUTHENTICATION_FAILED",
+        "INVALID_PROVIDER_RESPONSE",
+        "PROVIDER_UNAVAILABLE",
+    }
+)
 
 
 class ModelCatalog(Protocol):
@@ -110,6 +122,7 @@ class ThinkingUpdate(BaseModel):
     enabled: bool
     budget_tokens: int | None = None
     keep: ThinkingKeep | None = None
+    intensity: str | None = None
 
 
 class LimitsUpdate(BaseModel):
@@ -197,7 +210,14 @@ def create_app(
         try:
             await turn_tasks.shutdown()
         finally:
-            await threads.shutdown()
+            try:
+                await threads.shutdown()
+            finally:
+                close_catalog = getattr(model_catalog, "aclose", None)
+                if callable(close_catalog):
+                    result = close_catalog()
+                    if inspect.isawaitable(result):
+                        await result
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -421,17 +441,24 @@ def create_app(
     @app.get("/api/providers")
     async def providers() -> dict[str, object]:
         default = provider_store.default_selection()
+        public_providers = provider_store.list_public()
+        public_providers = [
+            _provider_with_catalog_status(provider, model_catalog)
+            for provider in public_providers
+        ]
         return {
             "schema_version": SCHEMA_VERSION,
             "default_provider_id": (
                 None if default is None else default["provider_id"]
             ),
-            "providers": provider_store.list_public(),
+            "providers": public_providers,
         }
 
     @app.get("/api/workspaces")
     async def workspaces(path: str | None = None) -> dict[str, object]:
-        listing = browser.list(path)
+        # Directory traversal is Host I/O.  Keep it out of the event loop so a
+        # large mounted WSL directory cannot delay SSE or model requests.
+        listing = await asyncio.to_thread(browser.list, path)
         return {
             "schema_version": SCHEMA_VERSION,
             "path": listing.path,
@@ -450,7 +477,7 @@ def create_app(
 
     @app.post("/api/workspaces/select", status_code=201)
     async def select_workspace(request: WorkspaceSelect) -> dict[str, object]:
-        workspace = browser.select(request.path)
+        workspace = await asyncio.to_thread(browser.select, request.path)
         return {
             "schema_version": SCHEMA_VERSION,
             "workspace": workspace.to_dict(),
@@ -657,23 +684,71 @@ def create_app(
             api_key=request.api_key,
             selected_model=request.selected_model,
         )
+        # Credential persistence is the synchronous contract.  Catalog
+        # discovery is deliberately best-effort and runs in the background so
+        # saving a key never waits on an upstream provider.
+        schedule_refresh = getattr(model_catalog, "schedule_refresh", None)
+        if callable(schedule_refresh):
+            try:
+                credential = provider_store.get_credential(provider_id)
+                schedule_refresh(provider_id, credential)
+            except Exception:
+                # The provider remains configured; the status endpoint will
+                # report a bounded error if the catalog adapter recorded one.
+                logger.debug("Could not schedule model catalog refresh", exc_info=True)
+        provider = _provider_with_catalog_status(provider, model_catalog)
         return {"schema_version": SCHEMA_VERSION, "provider": provider}
 
     @app.delete("/api/providers/{provider_id}/credential")
     async def clear_provider(provider_id: str) -> dict[str, object]:
         provider = provider_store.clear_credential(provider_id)
+        invalidate = getattr(model_catalog, "invalidate", None)
+        if callable(invalidate):
+            invalidate(provider_id)
+        provider = _provider_with_catalog_status(provider, model_catalog)
         return {"schema_version": SCHEMA_VERSION, "provider": provider}
 
     @app.post("/api/providers/{provider_id}/models/discover")
     async def discover_models(provider_id: str) -> dict[str, object]:
         credential = provider_store.get_credential(provider_id)
         discovered = await model_catalog.discover(provider_id, credential)
-        return {
+        response: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "provider_id": provider_id,
             "models": discovered.models,
             "cached": discovered.cached,
         }
+        describe_models = getattr(model_catalog, "model_metadata", None)
+        if callable(describe_models):
+            response["model_profiles"] = describe_models(provider_id, discovered.models)
+        status = _catalog_status(model_catalog, provider_id)
+        if status is not None:
+            response["status"] = status
+        return response
+
+    @app.get("/api/providers/{provider_id}/models")
+    async def provider_models(provider_id: str) -> dict[str, object]:
+        """Return local profile facts plus the latest shared catalog status."""
+
+        if provider_id not in PROVIDERS:
+            raise UnknownProviderError(f"Unknown Provider: {provider_id}")
+        known = PROVIDER_PRESETS[provider_id]
+        status = _catalog_status(model_catalog, provider_id)
+        remote_models = [] if status is None else status.get("models", [])
+        model_ids = list(known.model_profiles)
+        if isinstance(remote_models, list):
+            model_ids.extend(
+                model for model in remote_models
+                if isinstance(model, str) and model not in model_ids
+            )
+        response: dict[str, object] = {
+            "schema_version": SCHEMA_VERSION,
+            "provider_id": provider_id,
+            "model_profiles": [known.model_metadata(model) for model in sorted(model_ids)],
+        }
+        if status is not None:
+            response["status"] = status
+        return response
 
     @app.patch("/api/provider-default")
     async def select_default(
@@ -741,6 +816,83 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _catalog_status(catalog: object, provider_id: str) -> dict[str, object] | None:
+    """Return a safe catalog status when the injected catalog supports it."""
+
+    getter = getattr(catalog, "get_status", None)
+    if not callable(getter):
+        getter = getattr(catalog, "status", None)
+    if not callable(getter):
+        return None
+    try:
+        value = getter(provider_id)
+    except Exception:
+        # Status is auxiliary UI state; a custom catalog must not make the
+        # provider setup endpoint fail closed.
+        return None
+    if isinstance(value, ModelCatalogStatus):
+        return value.to_dict()
+    if isinstance(value, dict):
+        # Only retain the documented safe projection.  In particular, do not
+        # pass through exception text or credential fingerprints from a custom
+        # implementation.
+        raw_status = value.get("status")
+        status = (
+            raw_status
+            if isinstance(raw_status, str)
+            and raw_status in {"idle", "loading", "ready", "error"}
+            else "idle"
+        )
+        raw_models = value.get("models", [])
+        models = (
+            [model.strip() for model in raw_models if isinstance(model, str) and model.strip()]
+            if isinstance(raw_models, (list, tuple))
+            else []
+        )
+        raw_error_code = value.get("error_code")
+        error_code = None
+        if isinstance(raw_error_code, str):
+            if raw_error_code in _SAFE_CATALOG_ERROR_CODES:
+                error_code = raw_error_code
+            elif status == "error":
+                error_code = "PROVIDER_UNAVAILABLE"
+        return {
+            "status": status,
+            "models": models,
+            "cached": bool(value.get("cached", False)),
+            "error_code": error_code,
+        }
+    return None
+
+
+def _provider_with_catalog_status(
+    provider: dict[str, object],
+    catalog: object,
+) -> dict[str, object]:
+    result = dict(provider)
+    preset = PROVIDER_PRESETS.get(str(provider.get("provider_id", "")))
+    status = _catalog_status(catalog, str(provider.get("provider_id", "")))
+    if preset is not None:
+        if preset.description:
+            result["description"] = preset.description
+        model_ids = list(preset.model_profiles)
+        if status is not None:
+            remote_models = status.get("models", [])
+            if isinstance(remote_models, list):
+                model_ids.extend(
+                    model
+                    for model in remote_models
+                    if isinstance(model, str) and model not in model_ids
+                )
+        result["model_profiles"] = [
+            preset.model_metadata(model_id) for model_id in sorted(model_ids)
+        ]
+    if status is None:
+        return result
+    result["catalog"] = status
+    return result
 
 
 def _error_response(

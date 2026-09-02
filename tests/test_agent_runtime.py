@@ -652,15 +652,12 @@ def test_one_turn_override_changes_provider_and_thinking_without_rewriting_defau
     assert resolved == [("provider-b", "model-b"), ("provider-a", "model-a")]
     assert provider.requests[0].temperature == 0.9
     assert provider.requests[0].max_tokens == 3000
-    assert provider.requests[0].extra_body == {
-        "thinking": {
-            "type": "enabled",
-            "budget_tokens": 512,
-            "keep": "all",
-        }
-    }
+    assert provider.requests[0].thinking is not None
+    assert provider.requests[0].thinking.enabled is True
+    assert provider.requests[0].thinking.budget_tokens == 512
+    assert provider.requests[0].thinking.keep == "all"
     assert provider.requests[1].temperature == 0.2
-    assert provider.requests[1].extra_body is None
+    assert provider.requests[1].thinking is None
     snapshot = runtime.get_snapshot(thread.thread_id)
     assert snapshot.settings.provider_config_id == "provider-a"
     assert snapshot.settings.version == 0

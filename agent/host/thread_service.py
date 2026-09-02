@@ -374,10 +374,26 @@ class ThreadHost:
         keep = thinking.keep
         if keep is not None and keep.value not in keep_values:
             keep = None
+        toggle_supported = nested_capabilities.get("toggle_supported", True)
+        if not isinstance(toggle_supported, bool):
+            toggle_supported = True
+        intensity_supported = bool(
+            nested_capabilities.get("intensity_supported", False)
+        )
+        intensity_options = nested_capabilities.get("intensity_options", ())
+        if not isinstance(intensity_options, (list, tuple, set, frozenset)):
+            intensity_options = ()
+        intensity_options = tuple(
+            value for value in intensity_options if isinstance(value, str)
+        )
+        intensity = thinking.intensity
+        if not intensity_supported or intensity not in intensity_options:
+            intensity = None
         normalized = ThinkingSettings(
-            enabled=thinking.enabled,
+            enabled=thinking.enabled if toggle_supported else True,
             budget_tokens=thinking.budget_tokens if supports_budget else None,
             keep=keep,
+            intensity=intensity,
         )
         return replace(settings, thinking=normalized)
 

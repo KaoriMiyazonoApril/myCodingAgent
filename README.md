@@ -125,9 +125,12 @@ assistant/tool ToolResult 进入 chronological history，不在下一请求重�
 按需加载本地 `SKILL.md`。显式 `$skill-name` 会在首个模型请求前加载且不伪造 tool call；模型实际
 调用产生的 bounded ToolResult 仍按 canonical history 规则保留。
 
-Web 工作区的对话设置支持 provider/model、temperature、output limit、approval mode 与 capability
-驱动的 thinking budget；候选 provider/model 会先由 Host 有界预览并在保存时规范化。对话标题旁的
-Skills 面板消费实时事件状态，只显示当前 Turn 已加载和可用 Skill 的元数据。
+Web 工作区的对话设置支持 provider/model、Thinking、能力允许时的 Thinking intensity 与
+approval mode；temperature、output limit、budget、context 和 agent limits 保留在 transport/runtime
+层而不出现在 Basic Settings。候选 provider/model 会先由 Host 有界预览并在保存时规范化，模型
+目录使用固定 Provider endpoint、共享短超时缓存和单飞刷新。对话标题旁的 Skills 面板消费实时
+事件状态，按 Runtime metadata 分开展示当前 Turn 已加载和可用 Skill，并标注 activation source
+与 placement。
 预算、ToolResult hard bound、atomic history、rolling compaction 与 checkpoint 约束详见
 [`docs/context-architecture.md`](docs/context-architecture.md)。
 

@@ -19,14 +19,22 @@ import {
   resolveApproval,
   updateThreadSettings,
   type ProviderView,
+  type ModelCatalogStatus,
+  type ModelProfileView,
   type ThreadCapabilities,
   type ThreadSettings,
-  type ThreadSkills,
   type ThreadView,
   type WorkspaceRecord,
   type WorkspaceListing,
 } from "./api";
 import { ThreadEventClient } from "./eventClient";
+import {
+  resolveNextThreadSelection,
+  type NextThreadSelection,
+} from "./modelSelection";
+import { ModelPicker } from "./components/ModelPicker";
+import { ModelProfileSummary } from "./components/ModelProfileSummary";
+import { SkillsPopover } from "./components/SkillsPopover";
 import {
   applyAgentEvent,
   eventRequiresSnapshotRefresh,
@@ -56,8 +64,8 @@ export function App() {
   const [showProviderSettings, setShowProviderSettings] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspaceRecord | null>(null);
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false);
-  const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
-  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [nextThreadSelection, setNextThreadSelection] =
+    useState<NextThreadSelection | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -83,23 +91,16 @@ export function App() {
     };
   }, []);
 
-  const providerReady = providers.some(
-    (provider) =>
-      provider.is_default && provider.configured && provider.selected_model !== null,
-  );
   const configuredProviders = providers.filter((provider) => provider.configured);
-  const defaultProvider =
-    providers.find((provider) => provider.is_default && provider.configured) ??
-    configuredProviders[0] ??
-    null;
 
-  const selectedProvider =
-    providers.find(
-      (provider) =>
-        provider.provider_id === selectedProviderId && provider.configured,
-    ) ?? defaultProvider;
-  const effectiveProviderId = selectedProvider?.provider_id ?? null;
-  const effectiveModel = selectedModel ?? selectedProvider?.selected_model ?? "";
+  const resolvedNextThreadSelection = resolveNextThreadSelection(
+    providers,
+    nextThreadSelection,
+  );
+  const effectiveProviderId = resolvedNextThreadSelection?.providerId ?? null;
+  const effectiveModel = resolvedNextThreadSelection?.model ?? "";
+  const providerReady =
+    resolvedNextThreadSelection !== null && Boolean(effectiveModel.trim());
 
   const settingsOpen = showProviderSettings || editing !== null;
 
@@ -142,10 +143,19 @@ export function App() {
               const next = configuredProviders.find(
                 (provider) => provider.provider_id === providerId,
               );
-              setSelectedProviderId(providerId);
-              setSelectedModel(next?.selected_model ?? "");
+              setNextThreadSelection({
+                providerId,
+                model:
+                  next?.selected_model ??
+                  (next?.catalog?.status === "ready" ? next.catalog.models[0] : undefined) ??
+                  "",
+              });
             }}
-            onModelChange={(model) => setSelectedModel(model)}
+            onModelChange={(model) => {
+              if (effectiveProviderId !== null) {
+                setNextThreadSelection({ providerId: effectiveProviderId, model });
+              }
+            }}
           />
         </div>
         <div className="product-actions">
@@ -310,6 +320,9 @@ function ModelSelector({
 }) {
   const [open, setOpen] = useState(false);
   const provider = providers.find((item) => item.provider_id === providerId) ?? providers[0];
+  const modelProfiles = remotelyDiscoveredProfiles(provider);
+  const selectedProfile =
+    provider?.model_profiles?.find((item) => item.model_id === model) ?? null;
   const value = provider
     ? `${provider.display_name} · ${model || provider.selected_model || "model not set"}`
     : "尚未配置模型";
@@ -372,13 +385,20 @@ function ModelSelector({
                   </option>
                 ))}
               </select>
-              <label htmlFor="topbar-model">模型 ID</label>
-              <input
-                id="topbar-model"
+              <ModelPicker
+                key={provider?.provider_id ?? "no-provider"}
+                label="模型"
                 value={model}
-                onChange={(event) => onModelChange(event.target.value)}
-                placeholder="e.g. deepseek-chat"
+                profiles={modelProfiles}
+                onChange={onModelChange}
               />
+              {selectedProfile ? (
+                <ModelProfileSummary profile={selectedProfile} />
+              ) : (
+                <p className="field-help">
+                  未收录的模型仍可使用；Thinking 与 Context Window 不会被猜测。
+                </p>
+              )}
               <p className="field-help">用于接下来创建的新对话。</p>
             </>
           ) : (
@@ -405,15 +425,24 @@ function WorkspaceDialog({
   const [error, setError] = useState<string | null>(null);
   const [selecting, setSelecting] = useState(false);
   const requestGeneration = useRef(0);
+  const listingCacheRef = useRef<Map<string, WorkspaceListing>>(new Map());
   const dialogRef = useRef<HTMLElement | null>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
 
-  const load = useCallback(async (path?: string) => {
+  const load = useCallback(async (path?: string, force = false) => {
     const generation = ++requestGeneration.current;
+    const cacheKey = path ?? "__default__";
     if (path === undefined) {
       setListing(null);
       setSelected(null);
       setSelecting(false);
+    }
+    const cached = listingCacheRef.current.get(cacheKey);
+    if (!force && cached !== undefined) {
+      setListing(cached);
+      setLoading(false);
+      setError(null);
+      return;
     }
     setLoading(true);
     setError(null);
@@ -422,6 +451,8 @@ function WorkspaceDialog({
       if (!open || generation !== requestGeneration.current) {
         return;
       }
+      listingCacheRef.current.set(cacheKey, next);
+      listingCacheRef.current.set(next.path, next);
       setListing(next);
     } catch (reason: unknown) {
       if (!open || generation !== requestGeneration.current) {
@@ -474,6 +505,7 @@ function WorkspaceDialog({
       return;
     }
     requestGeneration.current += 1;
+    listingCacheRef.current.clear();
     returnFocusRef.current?.focus();
   }, [load, open]);
 
@@ -525,7 +557,11 @@ function WorkspaceDialog({
           <div className="error-banner" role="alert">
             <strong>项目不可用</strong>
             <span>{error}</span>
-            <button type="button" className="quiet-button" onClick={() => void load()}>
+            <button
+              type="button"
+              className="quiet-button"
+              onClick={() => void load(undefined, true)}
+            >
               重新加载根目录
             </button>
           </div>
@@ -549,7 +585,11 @@ function WorkspaceDialog({
                 <strong>{projectName(listing.path)}</strong>
                 <code title={listing.path}>{listing.path}</code>
               </div>
-              <button type="button" className="quiet-button" onClick={() => void load(listing.path)}>
+              <button
+                type="button"
+                className="quiet-button"
+                onClick={() => void load(listing.path, true)}
+              >
                 重新加载
               </button>
             </div>
@@ -703,6 +743,30 @@ function runtimeStatusLabel(status: string): string {
   return labels[status] ?? status;
 }
 
+function thinkingIntensityLabel(value: string): string {
+  return ({
+    none: "无",
+    minimal: "最小",
+    low: "低",
+    medium: "中",
+    high: "高",
+    xhigh: "极高",
+    max: "最大",
+  } as Record<string, string>)[value] ?? value;
+}
+
+function approvalModeDescription(
+  mode: "untrusted" | "on_request" | "never",
+): string {
+  if (mode === "untrusted") {
+    return "所有非只读命令均需人工确认。";
+  }
+  if (mode === "never") {
+    return "按当前 Runtime policy 自动执行，不发起人工确认。";
+  }
+  return "Agent 在需要人工确认的操作前询问。";
+}
+
 function toolTarget(argumentsValue: unknown): string | null {
   if (!isRecord(argumentsValue)) {
     return null;
@@ -729,6 +793,22 @@ function approvalToolTarget(toolCall: unknown): string | null {
   }
   const target = toolTarget(toolCall.arguments);
   return target === null ? null : target.slice(0, 320);
+}
+
+function remotelyDiscoveredProfiles(provider: ProviderView | undefined): ModelProfileView[] {
+  if (provider?.catalog?.status !== "ready") {
+    return [];
+  }
+  const profiles = new Map(
+    (provider.model_profiles ?? []).map((profile) => [profile.model_id, profile]),
+  );
+  return provider.catalog.models.map((modelId) => profiles.get(modelId) ?? {
+    model_id: modelId,
+    display_name: modelId,
+    description: "",
+    context_window_tokens: null,
+    known: false,
+  });
 }
 
 function ProviderSettingsView({
@@ -785,6 +865,7 @@ function ProviderSettingsView({
       {editing ? (
         <div className="editor-surface">
           <ProviderEditor
+            key={editing}
             provider={providers.find((item) => item.provider_id === editing) ?? null}
             onClose={onCloseEditor}
             onChange={onChange}
@@ -792,7 +873,7 @@ function ProviderSettingsView({
         </div>
       ) : (
         <p className="settings-note">
-          连接模型服务商后，模型会出现在顶栏并可用于新对话。
+          配置模型服务商后，模型会出现在顶栏并可用于新对话。
         </p>
       )}
     </section>
@@ -813,10 +894,21 @@ function ProviderRow({
           <h2>{provider.display_name}</h2>
           {provider.is_default ? <span className="default-badge">默认</span> : null}
         </div>
+        {provider.description ? (
+          <p className="provider-description">{provider.description}</p>
+        ) : null}
         <p className={`provider-state ${provider.configured ? "ready" : "not-ready"}`}>
           <span className="status-dot" aria-hidden="true" />
-          {provider.configured ? "已连接" : "未连接"}
+          {provider.configured ? "已配置" : "未配置"}
         </p>
+        {provider.catalog?.status === "loading" ? (
+          <p className="provider-catalog-status" role="status">正在同步模型目录…</p>
+        ) : null}
+        {provider.catalog?.status === "error" ? (
+          <p className="provider-catalog-status error" role="status">
+            模型目录同步失败 · {provider.catalog.error_code ?? "未知错误"}
+          </p>
+        ) : null}
         <p className="provider-model">
           {provider.configured
             ? provider.selected_model ?? "尚未选择模型"
@@ -826,10 +918,10 @@ function ProviderRow({
       <button
         type="button"
         className={provider.configured ? "quiet-button" : "primary-button"}
-        aria-label={`${provider.configured ? "管理" : "连接"} ${provider.display_name}`}
+        aria-label={`${provider.configured ? "管理" : "配置"} ${provider.display_name}`}
         onClick={() => onEdit(provider.provider_id)}
       >
-        {provider.configured ? "管理" : "连接"}
+        {provider.configured ? "管理" : "配置"}
       </button>
     </article>
   );
@@ -1098,11 +1190,11 @@ function ThreadPanel({
         </button>
         <button
           type="button"
-          aria-label="显示动态"
+          aria-label="显示运行详情"
           aria-pressed={mobileView === "activity"}
           onClick={() => setMobileView("activity")}
         >
-          动态
+          运行
         </button>
       </div>
       <nav
@@ -1200,7 +1292,7 @@ function ThreadPanel({
                 {!workspace
                   ? "打开本地项目，然后让编码助手检查或修改代码。"
                   : !providerReady
-                    ? "请先在设置中连接模型服务商，再创建对话。"
+                    ? "请先在设置中配置模型服务商，再创建对话。"
                     : "为当前项目创建对话，将任务、工具执行和文件修改集中在一起。"}
               </p>
               <button
@@ -1215,17 +1307,17 @@ function ThreadPanel({
           </section>
           <aside
             className={`activity-panel activity-panel-collapsed mobile-view-${mobileView === "activity" ? "active" : "inactive"}`}
-            aria-label="动态与修改"
+            aria-label="运行详情与修改"
           >
             <button
               type="button"
               className="activity-rail-toggle"
-              aria-label="展开动态与修改"
+              aria-label="展开运行详情与修改"
               aria-expanded="false"
               onClick={() => setActivityCollapsed(false)}
             >
               <span aria-hidden="true">‹</span>
-              <span>动态</span>
+              <span>运行</span>
             </button>
           </aside>
         </>
@@ -1309,18 +1401,13 @@ function ActiveThreadView({
   const [settingsModel, setSettingsModel] = useState(
     thread.snapshot.settings.model,
   );
-  const [settingsTemperature, setSettingsTemperature] = useState<number | null>(
-    thread.snapshot.settings.temperature,
-  );
-  const [settingsMaxTokens, setSettingsMaxTokens] = useState<number | null>(
-    thread.snapshot.settings.max_tokens,
-  );
   const [settingsThinking, setSettingsThinking] = useState(
     thread.snapshot.settings.thinking?.enabled ?? false,
   );
-  const [settingsThinkingBudget, setSettingsThinkingBudget] = useState<number | null>(
-    thread.snapshot.settings.thinking?.budget_tokens ?? null,
+  const [settingsThinkingIntensity, setSettingsThinkingIntensity] = useState<string | null>(
+    thread.snapshot.settings.thinking?.intensity ?? null,
   );
+  const settingsThinkingIntensityRef = useRef(settingsThinkingIntensity);
   const [settingsApprovalMode, setSettingsApprovalMode] = useState<
     "untrusted" | "on_request" | "never"
   >(thread.snapshot.settings.approval_mode ?? "on_request");
@@ -1336,6 +1423,29 @@ function ActiveThreadView({
   );
   const [capabilitiesPending, setCapabilitiesPending] = useState(false);
   const [capabilitiesError, setCapabilitiesError] = useState(false);
+  const settingsProviderView = providers.find(
+    (provider) => provider.provider_id === settingsProvider,
+  );
+  const settingsModelProfiles = remotelyDiscoveredProfiles(settingsProviderView);
+  const settingsProfile = settingsProviderView?.model_profiles?.find(
+    (profile) => profile.model_id === settingsModel,
+  );
+
+  const resetSettingsDraft = () => {
+    const settings = thread.snapshot.settings;
+    setSettingsProvider(settings.provider_config_id);
+    setSettingsModel(settings.model);
+    setSettingsThinking(settings.thinking?.enabled ?? false);
+    setSettingsThinkingIntensity(settings.thinking?.intensity ?? null);
+    setSettingsApprovalMode(settings.approval_mode ?? "on_request");
+    setCapabilities(DISABLED_CAPABILITIES);
+    setCapabilitiesPending(false);
+    setCapabilitiesError(false);
+  };
+
+  useEffect(() => {
+    settingsThinkingIntensityRef.current = settingsThinkingIntensity;
+  }, [settingsThinkingIntensity]);
 
   useEffect(() => {
     if (!showSettings) {
@@ -1362,6 +1472,16 @@ function ActiveThreadView({
         .then((next) => {
           if (!cancelled) {
             setCapabilities(next);
+            const thinking = next.thinking;
+            if (thinking?.default_enabled === true) {
+              setSettingsThinking(true);
+            }
+            if (
+              thinking?.default_intensity &&
+              settingsThinkingIntensityRef.current === null
+            ) {
+              setSettingsThinkingIntensity(thinking.default_intensity);
+            }
             setCapabilitiesPending(false);
             setCapabilitiesError(false);
           }
@@ -1382,7 +1502,12 @@ function ActiveThreadView({
       window.clearTimeout(resetTimer);
       window.clearTimeout(timer);
     };
-  }, [showSettings, settingsModel, settingsProvider, threadId]);
+  }, [
+    showSettings,
+    settingsModel,
+    settingsProvider,
+    threadId,
+  ]);
 
   useEffect(() => () => {
     mountedRef.current = false;
@@ -1588,6 +1713,7 @@ function ActiveThreadView({
                     type="button"
                     role="menuitem"
                     onClick={() => {
+                      resetSettingsDraft();
                       setShowSettings(true);
                       setCapabilitiesPending(true);
                       setCapabilitiesError(false);
@@ -1647,130 +1773,159 @@ function ActiveThreadView({
                   className="icon-button"
                   aria-label="关闭对话设置"
                   onClick={() => {
+                    resetSettingsDraft();
                     setShowSettings(false);
-                    setCapabilitiesPending(false);
-                    setCapabilitiesError(false);
                   }}
                 >
                   ×
                 </button>
               </div>
-              <div className="settings-editor-fields">
-                <label htmlFor="thread-settings-provider">模型服务商</label>
-                <select
-                  id="thread-settings-provider"
-                  value={settingsProvider}
-                  disabled={busy || thread.snapshot.status === "closed"}
-                  onChange={(event) => {
-                    const next = providers.find(
-                      (provider) => provider.provider_id === event.target.value,
-                    );
-                    setSettingsProvider(event.target.value);
-                    setSettingsModel(next?.selected_model ?? "");
-                    setCapabilities(DISABLED_CAPABILITIES);
-                    setCapabilitiesPending(true);
-                    setCapabilitiesError(false);
-                    setSettingsThinking(false);
-                    setSettingsThinkingBudget(null);
-                  }}
-                >
-                  {providers.map((provider) => (
-                    <option key={provider.provider_id} value={provider.provider_id}>
-                      {provider.display_name}
-                    </option>
-                  ))}
-                </select>
-                <label htmlFor="thread-settings-model">对话模型</label>
-                <input
-                  id="thread-settings-model"
-                  value={settingsModel}
-                  disabled={busy || thread.snapshot.status === "closed"}
-                  onChange={(event) => {
-                    setSettingsModel(event.target.value);
-                    setCapabilities(DISABLED_CAPABILITIES);
-                    setCapabilitiesPending(true);
-                    setCapabilitiesError(false);
-                    setSettingsThinking(false);
-                    setSettingsThinkingBudget(null);
-                  }}
-                />
-                <label htmlFor="thread-settings-temperature">温度</label>
-                <input
-                  id="thread-settings-temperature"
-                  type="number"
-                  min="0"
-                  max="2"
-                  step="0.1"
-                  value={settingsTemperature ?? ""}
-                  disabled={busy || thread.snapshot.status === "closed"}
-                  onChange={(event) =>
-                    setSettingsTemperature(
-                      event.target.value === "" ? null : Number(event.target.value),
-                    )
-                  }
-                />
-                <label htmlFor="thread-settings-max-tokens">最大输出令牌</label>
-                <input
-                  id="thread-settings-max-tokens"
-                  type="number"
-                  min="1"
-                  value={settingsMaxTokens ?? ""}
-                  disabled={busy || thread.snapshot.status === "closed"}
-                  onChange={(event) =>
-                    setSettingsMaxTokens(
-                      event.target.value === "" ? null : Number(event.target.value),
-                    )
-                  }
-                />
-                <label htmlFor="thread-settings-thinking">Thinking</label>
-                <input
-                  id="thread-settings-thinking"
-                  type="checkbox"
-                  checked={settingsThinking}
-                  disabled={
-                    busy ||
-                    thread.snapshot.status === "closed" ||
-                    !capabilities.thinking_supported
-                  }
-                  onChange={(event) => {
-                    setSettingsThinking(event.target.checked);
-                    if (!event.target.checked) {
-                      setSettingsThinkingBudget(null);
-                    }
-                  }}
-                />
-                {settingsThinking && capabilities.supports_thinking_budget ? (
-                  <>
-                    <label htmlFor="thread-settings-thinking-budget">Thinking budget</label>
-                    <input
-                      id="thread-settings-thinking-budget"
-                      type="number"
-                      min="1"
-                      value={settingsThinkingBudget ?? ""}
+              <div className="settings-sections">
+                <section className="settings-section" aria-labelledby="model-settings-heading">
+                  <h5 id="model-settings-heading">模型</h5>
+                  <div className="settings-field">
+                    <label htmlFor="thread-settings-provider">服务商</label>
+                    <select
+                      id="thread-settings-provider"
+                      value={settingsProvider}
+                      disabled={busy || thread.snapshot.status === "closed"}
+                      onChange={(event) => {
+                        const next = providers.find(
+                          (provider) => provider.provider_id === event.target.value,
+                        );
+                        setSettingsProvider(event.target.value);
+                        setSettingsModel(
+                          next?.selected_model ??
+                            (next?.catalog?.status === "ready"
+                              ? next.catalog.models[0]
+                              : undefined) ??
+                            "",
+                        );
+                        setCapabilities(DISABLED_CAPABILITIES);
+                        setCapabilitiesPending(true);
+                        setCapabilitiesError(false);
+                        setSettingsThinking(false);
+                        setSettingsThinkingIntensity(null);
+                      }}
+                    >
+                      {providers.filter((provider) => provider.configured).map((provider) => (
+                        <option key={provider.provider_id} value={provider.provider_id}>
+                          {provider.display_name}
+                        </option>
+                      ))}
+                    </select>
+                    <small>{settingsProviderView?.configured ? "已配置" : "未配置"}</small>
+                  </div>
+                  <ModelPicker
+                    key={settingsProvider}
+                    label="模型"
+                    value={settingsModel}
+                    profiles={settingsModelProfiles}
+                    disabled={busy || thread.snapshot.status === "closed"}
+                    onChange={(nextModel) => {
+                      setSettingsModel(nextModel);
+                      setCapabilities(DISABLED_CAPABILITIES);
+                      setCapabilitiesPending(true);
+                      setCapabilitiesError(false);
+                      setSettingsThinking(false);
+                      setSettingsThinkingIntensity(null);
+                    }}
+                  />
+                  {settingsProfile ? (
+                    <ModelProfileSummary profile={settingsProfile} />
+                  ) : settingsModel.trim() ? (
+                    <ModelProfileSummary
+                      profile={{
+                        model_id: settingsModel.trim(),
+                        display_name: settingsModel.trim(),
+                        description: "模型能力尚未收录；可继续使用，但不会猜测能力。",
+                        context_window_tokens: null,
+                        known: false,
+                      }}
+                    />
+                  ) : null}
+                </section>
+
+                {capabilities.thinking_supported ? (
+                  <section className="settings-section" aria-labelledby="reasoning-settings-heading">
+                    <h5 id="reasoning-settings-heading">推理</h5>
+                    {capabilities.thinking?.toggle_supported === false ? (
+                      <p className="readonly-setting">Thinking <strong>始终开启</strong></p>
+                    ) : (
+                      <label className="toggle-setting" htmlFor="thread-settings-thinking">
+                        <span>Thinking</span>
+                        <input
+                          id="thread-settings-thinking"
+                          type="checkbox"
+                          checked={settingsThinking}
+                          disabled={busy || thread.snapshot.status === "closed"}
+                          onChange={(event) => {
+                            setSettingsThinking(event.target.checked);
+                            if (!event.target.checked) {
+                              setSettingsThinkingIntensity(null);
+                            }
+                          }}
+                        />
+                      </label>
+                    )}
+                    {settingsThinking &&
+                    capabilities.thinking?.intensity_supported &&
+                    (capabilities.thinking.intensity_options?.length ?? 0) > 0 ? (
+                      <fieldset className="intensity-setting">
+                        <legend>思考强度</legend>
+                        <div>
+                          {capabilities.thinking.intensity_options?.map((option) => (
+                            <label key={option}>
+                              <input
+                                type="radio"
+                                name="thread-settings-thinking-intensity"
+                                value={option}
+                                checked={settingsThinkingIntensity === option}
+                                disabled={busy || thread.snapshot.status === "closed"}
+                                onChange={() => setSettingsThinkingIntensity(option)}
+                              />
+                              <span>{thinkingIntensityLabel(option)}</span>
+                            </label>
+                          ))}
+                        </div>
+                      </fieldset>
+                    ) : null}
+                  </section>
+                ) : null}
+
+                <section className="settings-section" aria-labelledby="permission-settings-heading">
+                  <h5 id="permission-settings-heading">权限</h5>
+                  <div className="settings-field">
+                    <label htmlFor="thread-settings-approval">Approval Mode</label>
+                    <select
+                      id="thread-settings-approval"
+                      value={settingsApprovalMode}
                       disabled={busy || thread.snapshot.status === "closed"}
                       onChange={(event) =>
-                        setSettingsThinkingBudget(
-                          event.target.value === "" ? null : Number(event.target.value),
+                        setSettingsApprovalMode(
+                          event.target.value as "untrusted" | "on_request" | "never",
                         )
                       }
-                    />
-                  </>
-                ) : null}
-                <label htmlFor="thread-settings-approval">Approval mode</label>
-                <select
-                  id="thread-settings-approval"
-                  value={settingsApprovalMode}
-                  disabled={busy || thread.snapshot.status === "closed"}
-                  onChange={(event) =>
-                    setSettingsApprovalMode(
-                      event.target.value as "untrusted" | "on_request" | "never",
-                    )
-                  }
+                    >
+                      <option value="untrusted">不信任命令</option>
+                      <option value="on_request">按需确认</option>
+                      <option value="never">从不确认</option>
+                    </select>
+                    <small>{approvalModeDescription(settingsApprovalMode)}</small>
+                  </div>
+                </section>
+              </div>
+              <div className="settings-editor-actions">
+                <button
+                  type="button"
+                  className="quiet-button"
+                  onClick={() => {
+                    resetSettingsDraft();
+                    setShowSettings(false);
+                  }}
                 >
-                  <option value="untrusted">Untrusted</option>
-                  <option value="on_request">On request</option>
-                  <option value="never">Never</option>
-                </select>
+                  取消
+                </button>
                 <button
                   type="button"
                   className="primary-button"
@@ -1786,25 +1941,24 @@ function ActiveThreadView({
                       ...thread.snapshot.settings,
                       provider_config_id: settingsProvider,
                       model: settingsModel.trim(),
-                      temperature: settingsTemperature,
-                      max_tokens: settingsMaxTokens,
-                      thinking: settingsThinking && capabilities.thinking_supported
+                      thinking: capabilities.thinking_supported
                         ? {
-                            enabled: true,
-                            budget_tokens: capabilities.supports_thinking_budget
-                              ? settingsThinkingBudget
-                              : null,
+                            enabled:
+                              capabilities.thinking?.toggle_supported === false
+                                ? true
+                                : settingsThinking,
+                            budget_tokens: null,
                             keep: null,
+                            ...(capabilities.thinking?.intensity_supported
+                              ? { intensity: settingsThinking ? settingsThinkingIntensity : null }
+                              : {}),
                           }
                         : null,
-                      approval_mode:
-                        thread.snapshot.settings.approval_mode === undefined
-                          ? undefined
-                          : settingsApprovalMode,
+                      approval_mode: settingsApprovalMode,
                     })
                   }
                 >
-                  保存对话设置
+                  保存
                 </button>
               </div>
               <p className="field-help">
@@ -2008,13 +2162,13 @@ function ActiveThreadView({
       </section>
       <aside
         className={`activity-panel ${activityCollapsed ? "activity-panel-collapsed" : ""} mobile-view-${mobileView === "activity" ? "active" : "inactive"}`}
-        aria-label="动态与修改"
+        aria-label="运行详情与修改"
       >
         {activityCollapsed ? (
           <button
             type="button"
             className="activity-rail-toggle"
-            aria-label="展开动态与修改"
+            aria-label="展开运行详情与修改"
             aria-expanded="false"
             aria-controls="conversation-context-panel"
             onClick={() => {
@@ -2023,7 +2177,7 @@ function ActiveThreadView({
             }}
           >
             <span aria-hidden="true">‹</span>
-            <span>{turnActive ? "动态 ●" : state.files.length > 0 ? `修改 ${state.files.length}` : "动态"}</span>
+            <span>{turnActive ? "运行 ●" : state.files.length > 0 ? `修改 ${state.files.length}` : "运行"}</span>
           </button>
         ) : (
           <>
@@ -2035,7 +2189,7 @@ function ActiveThreadView({
                   aria-selected={contextTab === "activity"}
                   onClick={() => setContextTab("activity")}
                 >
-                  动态
+                  运行
                 </button>
                 <button
                   type="button"
@@ -2049,7 +2203,7 @@ function ActiveThreadView({
               <button
                 type="button"
                 className="icon-button context-collapse-button"
-                aria-label="收起动态与修改"
+                aria-label="收起运行详情与修改"
                 aria-expanded="true"
                 aria-controls="conversation-context-panel"
                 onClick={onToggleActivity}
@@ -2059,7 +2213,7 @@ function ActiveThreadView({
             </div>
             <div className="activity-content" id="conversation-context-panel">
               {contextTab === "activity" ? (
-                <div role="tabpanel" aria-label="动态">
+                <div role="tabpanel" aria-label="运行">
                   {connection === "disconnected" ? (
                     <p className="inline-error" role="status">连接已中断，正在重连…</p>
                   ) : null}
@@ -2135,84 +2289,6 @@ function ActiveThreadView({
         )}
       </aside>
     </>
-  );
-}
-
-function SkillsPopover({
-  skills,
-  open,
-  onToggle,
-  onClose,
-}: {
-  skills: ThreadSkills | undefined;
-  open: boolean;
-  onToggle: () => void;
-  onClose: () => void;
-}) {
-  const value: ThreadSkills = skills ?? {
-    schema_version: 1,
-    available: [],
-    loaded: [],
-    diagnostics: [],
-  };
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [onClose, open]);
-  return (
-    <div className="skills-popover-wrap">
-      <button
-        type="button"
-        className="quiet-button skills-toggle"
-        aria-label="Skills"
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        onClick={onToggle}
-      >
-        Skills · Loaded {value.loaded.length} / Available {value.available.length}
-      </button>
-      {open ? (
-        <div className="skills-popover" role="dialog" aria-label="Skills">
-          <div className="skills-popover-heading">
-            <div>
-              <p className="step-label">Runtime context</p>
-              <h4>Skills</h4>
-            </div>
-            <button type="button" className="icon-button" aria-label="关闭 Skills" onClick={onClose}>×</button>
-          </div>
-          <section aria-labelledby="loaded-skills-heading">
-            <h5 id="loaded-skills-heading">Loaded Skills ({value.loaded.length})</h5>
-            {value.loaded.length > 0 ? value.loaded.map((skill) => (
-              <article className="skill-popover-item" key={`loaded-${skill.name}`}>
-                <strong>{skill.name}</strong>
-                <small>{skill.source}</small>
-                <code>{skill.source_path}</code>
-                <p>{skill.description}</p>
-              </article>
-            )) : <p className="thread-empty">No Skills loaded this Turn.</p>}
-          </section>
-          <section aria-labelledby="available-skills-heading">
-            <h5 id="available-skills-heading">Available Skills ({value.available.length})</h5>
-            {value.available.length > 0 ? value.available.map((skill) => (
-              <article className="skill-popover-item" key={`available-${skill.name}`}>
-                <strong>{skill.name}</strong>
-                <small>{skill.source}</small>
-                <code>{skill.source_path}</code>
-                <p>{skill.description}</p>
-              </article>
-            )) : <p className="thread-empty">No Skills discovered.</p>}
-          </section>
-        </div>
-      ) : null}
-    </div>
   );
 }
 
@@ -2446,15 +2522,34 @@ type ProviderEditorProps = {
 function ProviderEditor({ provider, onClose, onChange }: ProviderEditorProps) {
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
-  const [models, setModels] = useState<string[]>([]);
+  const [models, setModels] = useState<string[]>(
+    provider?.catalog?.status === "ready" ? provider.catalog.models : [],
+  );
+  const [modelProfiles, setModelProfiles] = useState<ModelProfileView[]>(
+    remotelyDiscoveredProfiles(provider ?? undefined),
+  );
   const [model, setModel] = useState(provider?.selected_model ?? "");
+  const modelRef = useRef(model);
+  const discoveryGeneration = useRef(0);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [editorError, setEditorError] = useState<string | null>(null);
+  const [catalogStatus, setCatalogStatus] = useState<ModelCatalogStatus | null>(
+    provider?.catalog ?? null,
+  );
+
+  useEffect(() => () => {
+    discoveryGeneration.current += 1;
+  }, []);
 
   if (provider === null) {
     return null;
   }
+
+  const updateModel = (next: string) => {
+    modelRef.current = next;
+    setModel(next);
+  };
 
   const run = async (operation: () => Promise<void>) => {
     setBusy(true);
@@ -2466,6 +2561,91 @@ function ProviderEditor({ provider, onClose, onChange }: ProviderEditorProps) {
     } finally {
       setBusy(false);
     }
+  };
+
+  const applyDiscovery = (
+    discovered: Awaited<ReturnType<typeof discoverModels>>,
+    baseProvider: ProviderView,
+  ) => {
+    setModels(discovered.models);
+    const knownProfiles = new Map(
+      (baseProvider.model_profiles ?? []).map((profile) => [profile.model_id, profile]),
+    );
+    const profiles = discovered.model_profiles ?? discovered.models.map(
+      (modelId) => knownProfiles.get(modelId) ?? {
+        model_id: modelId,
+        display_name: modelId,
+        description: "",
+        context_window_tokens: null,
+        known: false,
+      },
+    );
+    setModelProfiles(profiles);
+    if (!modelRef.current && discovered.models[0]) {
+      updateModel(discovered.models[0]);
+    }
+    const status = discovered.status ?? {
+      status: "ready" as const,
+      models: discovered.models,
+      cached: discovered.cached,
+      error_code: null,
+    };
+    setCatalogStatus(status);
+    const allProfiles = new Map(
+      (baseProvider.model_profiles ?? []).map((profile) => [profile.model_id, profile]),
+    );
+    for (const profile of profiles) {
+      allProfiles.set(profile.model_id, profile);
+    }
+    onChange({
+      ...baseProvider,
+      model_profiles: [...allProfiles.values()],
+      catalog: status,
+    });
+    return discovered;
+  };
+
+  const discoverInBackground = (baseProvider: ProviderView) => {
+    const generation = ++discoveryGeneration.current;
+    const loadingStatus: ModelCatalogStatus = {
+      status: "loading",
+      models: [],
+      cached: false,
+      error_code: null,
+    };
+    setModels([]);
+    setModelProfiles([]);
+    setCatalogStatus(loadingStatus);
+    onChange({ ...baseProvider, catalog: loadingStatus });
+    void discoverModels(provider.provider_id)
+      .then((discovered) => {
+        if (generation !== discoveryGeneration.current) {
+          return;
+        }
+        applyDiscovery(discovered, baseProvider);
+        if (discovered.models.length === 0) {
+          setMessage("凭据已保存 · 模型服务商未返回模型，请手动输入");
+        }
+      })
+      .catch((reason: unknown) => {
+        if (generation !== discoveryGeneration.current) {
+          return;
+        }
+        const errorCode = reason instanceof HostError ? reason.code : "PROVIDER_UNAVAILABLE";
+        const errorStatus: ModelCatalogStatus = {
+          status: "error",
+          models: [],
+          cached: false,
+          error_code: errorCode,
+        };
+        setCatalogStatus(errorStatus);
+        onChange({ ...baseProvider, catalog: errorStatus });
+        setEditorError(
+          reason instanceof Error
+            ? `模型目录同步失败 · ${reason.message}`
+            : "模型目录同步失败",
+        );
+      });
   };
 
   const saveAndDiscover = () =>
@@ -2481,14 +2661,7 @@ function ProviderEditor({ provider, onClose, onChange }: ProviderEditorProps) {
       onChange(saved);
       setApiKey("");
       setMessage(`凭据已保存 · ${saved.credential_mask ?? "已配置"}`);
-      const discovered = await discoverModels(provider.provider_id);
-      setModels(discovered.models);
-      if (!model && discovered.models[0]) {
-        setModel(discovered.models[0]);
-      }
-      if (discovered.models.length === 0) {
-        setMessage("凭据已保存 · 模型服务商未返回模型，请手动输入");
-      }
+      discoverInBackground(saved);
     });
 
   const makeDefault = () =>
@@ -2503,11 +2676,12 @@ function ProviderEditor({ provider, onClose, onChange }: ProviderEditorProps) {
 
   const refreshModels = () =>
     run(async () => {
+      const generation = ++discoveryGeneration.current;
       const discovered = await discoverModels(provider.provider_id);
-      setModels(discovered.models);
-      if (!model && discovered.models[0]) {
-        setModel(discovered.models[0]);
+      if (generation !== discoveryGeneration.current) {
+        return;
       }
+      applyDiscovery(discovered, provider);
       setMessage(
         discovered.models.length > 0
           ? `发现 ${discovered.models.length} 个可用模型`
@@ -2517,6 +2691,7 @@ function ProviderEditor({ provider, onClose, onChange }: ProviderEditorProps) {
 
   const clear = () =>
     run(async () => {
+      discoveryGeneration.current += 1;
       const cleared = await clearProviderCredential(provider.provider_id);
       onChange(cleared);
       setModels([]);
@@ -2571,33 +2746,36 @@ function ProviderEditor({ provider, onClose, onChange }: ProviderEditorProps) {
         disabled={busy}
         onClick={() => void saveAndDiscover()}
       >
-        {busy ? "正在连接…" : "保存并发现模型"}
+        {busy ? "正在保存…" : "保存凭据"}
       </button>
 
       <div className="field-group">
-        <label htmlFor="provider-model">服务商模型</label>
-        {models.length > 0 ? (
-          <select
-            id="provider-model"
-            value={model}
-            onChange={(event) => setModel(event.target.value)}
-          >
-            {models.map((modelId) => (
-              <option key={modelId} value={modelId}>
-                {modelId}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <input
-            id="provider-model"
-            value={model}
-            placeholder="输入服务商模型标识"
-            onChange={(event) => setModel(event.target.value)}
+        <ModelPicker
+          label="服务商模型"
+          value={model}
+          profiles={[
+            ...modelProfiles,
+            ...models
+              .filter((modelId) => !modelProfiles.some((profile) => profile.model_id === modelId))
+              .map((modelId) => ({
+                model_id: modelId,
+                display_name: modelId,
+                description: "",
+                context_window_tokens: null,
+                known: false,
+              })),
+          ]}
+          onChange={updateModel}
+        />
+        {modelProfiles.find((profile) => profile.model_id === model) ? (
+          <ModelProfileSummary
+            profile={modelProfiles.find((profile) => profile.model_id === model)!}
           />
-        )}
+        ) : null}
         <p className="field-help">
-          模型发现仅报告可访问的 ID；编码助手会在实际使用时检查兼容性。
+          {catalogStatus?.status === "loading"
+            ? "正在后台同步模型目录；保存凭据不会等待上游。"
+            : "模型发现仅报告可访问的 ID；未知模型仍可手动输入，能力不会被猜测。"}
         </p>
       </div>
 

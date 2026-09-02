@@ -209,6 +209,9 @@ class SkillTurnState:
         self.catalog = catalog
         self._loaded: dict[str, Skill] = {}
         self._explicit_loaded: dict[str, Skill] = {}
+        # Activation provenance is turn-local presentation metadata.  It does
+        # not alter which body is projected or how the Skill tool behaves.
+        self._activation: dict[str, tuple[str, str]] = {}
         self._on_loaded = on_loaded
         self.body_max_chars = body_max_chars
         # Body formatting belongs to the loader seam; this object only owns
@@ -247,6 +250,10 @@ class SkillTurnState:
                 self._explicit_loaded.setdefault(skill.name, skill)
             return
         self._loaded[skill.name] = skill
+        self._activation[skill.name] = (
+            "explicit" if explicit else "tool",
+            "working_tail" if explicit else "tool_history",
+        )
         if explicit:
             self._explicit_loaded[skill.name] = skill
         callback = self._on_loaded
@@ -338,14 +345,37 @@ class SkillTurnState:
         return text
 
     def snapshot(self) -> dict[str, object]:
+        loaded_names = set(self._loaded)
         return {
-            "loaded": [skill.metadata for skill in self.loaded],
-            "available_count": len(self.catalog.skills),
+            "loaded": self.loaded_metadata(),
+            "available_count": sum(
+                skill.name not in loaded_names for skill in self.catalog.skills
+            ),
         }
+
+    def activation_metadata(self, name: str) -> dict[str, str] | None:
+        """Expose source/placement without changing Skill catalog metadata."""
+
+        activation = self._activation.get(name)
+        if activation is None:
+            return None
+        source, placement = activation
+        return {"activation_source": source, "placement": placement}
+
+    def loaded_metadata(self) -> list[dict[str, str]]:
+        """Return loaded Skill metadata with safe activation provenance."""
+
+        result: list[dict[str, str]] = []
+        for skill in self.loaded:
+            metadata = dict(skill.metadata)
+            metadata.update(self.activation_metadata(skill.name) or {})
+            result.append(metadata)
+        return result
 
     def reset(self) -> None:
         self._loaded.clear()
         self._explicit_loaded.clear()
+        self._activation.clear()
 
 
 __all__ = [

@@ -1,10 +1,20 @@
 export type ProviderView = {
   provider_id: "deepseek" | "moonshot" | "glm";
   display_name: string;
+  description?: string;
   configured: boolean;
   credential_mask: string | null;
   selected_model: string | null;
   is_default: boolean;
+  model_profiles?: ModelProfileView[];
+  catalog?: ModelCatalogStatus;
+};
+
+export type ModelCatalogStatus = {
+  status: "idle" | "loading" | "ready" | "error";
+  models: string[];
+  cached: boolean;
+  error_code: string | null;
 };
 
 export type ProvidersResponse = {
@@ -51,6 +61,24 @@ export type ModelDiscoveryResponse = {
   provider_id: string;
   models: string[];
   cached: boolean;
+  model_profiles?: ModelProfileView[];
+  status?: ModelCatalogStatus;
+};
+
+export type ModelProfileView = {
+  model_id: string;
+  display_name: string;
+  description: string;
+  context_window_tokens: number | null;
+  known: boolean;
+  thinking?: {
+    supported: boolean;
+    default_enabled: boolean;
+    toggle_supported: boolean;
+    intensity_supported: boolean;
+    intensity_options: string[];
+    default_intensity: string | null;
+  };
 };
 
 export type WorkspaceEntry = {
@@ -89,6 +117,7 @@ export type ThreadSettings = {
     enabled: boolean;
     budget_tokens: number | null;
     keep: "none" | "all" | null;
+    intensity?: string | null;
   } | null;
   limits: {
     max_iterations: number;
@@ -105,6 +134,8 @@ export type SkillMetadata = {
   source: string;
   source_path: string;
   directory: string;
+  activation_source?: "explicit" | "tool";
+  placement?: "working_tail" | "tool_history";
 };
 
 export type ThreadSkills = {
@@ -122,7 +153,13 @@ export type ThreadCapabilities = {
     supported: boolean;
     supports_budget_tokens: boolean;
     supported_keep_values: string[];
+    default_enabled?: boolean;
+    toggle_supported?: boolean;
+    intensity_supported?: boolean;
+    intensity_options?: string[];
+    default_intensity?: string | null;
   };
+  context_window_tokens?: number | null;
 };
 
 export type TurnSubmission = {

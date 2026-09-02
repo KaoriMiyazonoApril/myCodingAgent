@@ -29,8 +29,8 @@ Thread 历史；Runtime 仍支持 InMemoryThreadStore 的单进程嵌入模式�
 代理 `/api`；生产模式由 Python Host 直接托管构建后的前端。
 
 首次启动允许 Runtime 尚未配置。用户在 Web 设置中为 DeepSeek、Moonshot/Kimi 或 GLM 填写
-API key，Host 将凭据原子地保存在本机用户配置目录，只向浏览器返回脱敏状态。保存后，前端让
-Host 使用受信 Provider preset 的固定 endpoint 获取 Provider 返回的模型 ID；发现失败时明确
+API key，Host 将凭据原子地保存在本机用户配置目录，只向浏览器返回脱敏状态。保存成功后 Host
+立即返回“已配置”，并在后台使用受信 Provider preset 的固定 endpoint 获取 Provider 返回的模型 ID；发现失败时明确
 展示错误并允许手工输入模型。用户选择默认 Provider 和模型后，Host 才惰性组合单例
 `ThreadRuntime`。
 
@@ -138,7 +138,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - The Host application factory is the highest test seam for HTTP commands, DTOs, static serving, lifecycle, and error mapping. Tests inject Runtime composition and Provider discovery behavior through application dependencies.
 - `ThreadRuntime` remains the highest Agent seam. Runtime integration tests exercise public Snapshot, EventBatch, cancellation, settings, and close behavior rather than internal loop collaborators.
 - Provider configuration is hidden behind one deep store interface that owns versioned loading, atomic saving, permission enforcement, masking, default selection, and credential clearing.
-- Provider model discovery is hidden behind one catalog interface with production and fake adapters. It returns sanitized model IDs and typed failures; callers do not handle SDK response objects.
+- Provider model discovery is hidden behind one catalog interface with production and fake adapters. It returns sanitized model IDs and typed failures; callers do not handle SDK response objects. The production catalog owns a short-timeout async request, a process-wide credential-keyed cache, and single-flight refreshes; React only observes its safe `idle/loading/ready/error` projection.
 - `TurnTaskManager` is a deep Host module with a small start, cancel, inspect, and shutdown interface. It owns task mappings and cleanup without becoming the source of Agent status.
 - The SSE adapter owns real-time EventBuffer subscription (with replay fallback), framing, heartbeat,
   cursor recovery, and disconnect cleanup behind one streaming interface. Runtime and routes do not
@@ -157,6 +157,8 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Discovery uses only the fixed base URL from the existing Provider preset and the Host-stored key. Responses are reduced to non-empty model IDs, deduplicated and sorted.
 - A discovery result means “reported by the Provider for this credential,” not verified tool-calling compatibility. V1 does not send a paid chat or tool probe.
 - Model discovery results are cached in process memory for five minutes and are not durable truth. A manual model ID is always accepted when non-empty; incompatibility is reported by the existing model/Runtime error path when used.
+- The Host enriches reported IDs with the authoritative exact-model profile (display name, description, context window, and Thinking capability). Unknown IDs remain selectable with an explicit unknown capability state; no context or Thinking fact is inferred from a name.
+- Saving a credential persists it before starting best-effort background discovery. The save response never waits for the upstream request; explicit refresh may wait for its bounded request and exposes only a stable error code.
 - Host settings store one `default_provider_id` and one `selected_model` per configured Provider. Changing these defaults affects new Threads only.
 - The Host may start with no configured Provider. Runtime composition is lazy; Thread creation before a Provider and model are selected fails with `CONFIGURATION_REQUIRED` while health, static UI, Provider, and workspace endpoints remain available.
 
@@ -193,7 +195,8 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 
 - `agent web` accepts repeatable workspace roots; without roots the browser starts at `/`. Browser navigation and selection remain within at least one normalized configured root.
 - A request lists one level, directory-first and name-sorted, with at most 500 entries and an explicit `truncated` flag. Hidden directories are included.
-- Entries are canonicalized at access time. Internal directory aliases can be navigated, while aliases whose effective target escapes an allowed root are omitted or rejected.
+- The requested directory is canonically checked at access time. The listing performs one `scandir`; ordinary children use `DirEntry` metadata and lexical child paths, while symlink entries alone receive strict canonical containment checks. Internal directory aliases can be navigated, while aliases whose effective target escapes an allowed root are omitted or rejected.
+- The Web dialog caches successful listings for its open cycle. A reload explicitly bypasses that cache, and closing the dialog clears it; this cache is presentation state and never weakens Host containment checks.
 - `POST /api/workspaces/select` explicitly creates or reuses an in-memory Host Workspace record. The record contains an opaque id, canonical path, and display name; it is the only input accepted by Thread creation.
 - Missing, inaccessible, invalid, and root-escape requests receive distinct stable errors. Workspace selection does not replace Runtime lease and per-access filesystem checks.
 
@@ -237,10 +240,12 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Conversation renders user and assistant messages, tool request/running/result cards, bounded approval cards recovered from Snapshot/SSE, file-change cards, Turn errors, Runtime rejection, and Host connection/configuration errors.
 - Activity renders current status, submission/Turn metadata, tool calls, changed files, diff completeness, and simplified unified diffs. Tool output and diffs use bounded scrollable monospace regions.
 - Composer supports multiline text, submit, pending/running disable rules, and Stop. It never interprets Policy or treats SSE disconnect as cancellation.
-- Provider settings use a password input with save, clear, masked configured state, automatic model discovery, explicit refresh, manual model entry, and default selection.
+- Provider settings use a password input with save, clear, masked configured state, automatic background model discovery, explicit refresh, manual model entry, and default selection. Model IDs use one searchable/combobox-style control backed by the Host catalog; the UI shows only profile facts that Host supplied and labels unknown facts as unknown. Basic settings expose Provider, Model, Thinking, Thinking intensity when supported, and Approval mode; transport-only temperature, output, budget, context, and agent-limit fields are not presented there.
 - Host errors are never swallowed. The UI distinguishes disconnected Host, invalid workspace, missing Thread, Provider authentication/availability, rejected Turn, failed Turn, failed tool, failed settings update, and failed cancellation.
 - The SSE client reconnects automatically with bounded backoff, keeps current Snapshot-derived UI during disconnection, and refetches the hydratable Thread view when recovery cannot continue.
 - Opening the Workspace dialog immediately renders the Host filesystem browser. Selecting the current directory creates or reuses a Host Workspace record; no operating-system picker or browser-owned path conversion is involved.
+- Skills presentation keeps loaded and available items in disjoint buckets and shows the activation source (`explicit` or `tool`) and placement (`working_tail` or `tool_history`) supplied by Runtime. It does not alter progressive-disclosure loading or working-tail semantics.
+- The secondary execution panel is labelled `运行详情`, with compact `运行` / `修改` tabs at narrow widths; collapsed controls use horizontal labels and do not rely on CSS `writing-mode`.
 - At widths below 1024 pixels, Thread navigation becomes a toggleable sidebar and Activity becomes a drawer or tab. Conversation and Composer remain available. V1 is desktop-first rather than a separate mobile product.
 - Interactive controls support keyboard use and visible focus. Status meaning uses text/icon in addition to color, and failures are announced in persistent visible UI.
 
@@ -269,8 +274,8 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Runtime tests extend existing prior art for Thread creation, busy rejection, event ordering, cursor expiry, cancellation, settings versions, close semantics, workspace validation, diffs, and public-data redaction.
 - Runtime tests cover optional initial settings, asynchronous validation responsiveness, lease cleanup after preflight cancellation, and sanitized `turn_rejected` events for every pre-start failure class.
 - Provider store tests cover first load, schema version, atomic replacement, owner-only permissions, masking, replacement, clearing, default selection, malformed-file failure, and absence of secrets from repr/log/error surfaces.
-- Provider catalog tests cover successful ID reduction, deduplication, sorting, five-minute cache behavior, authentication failure, network failure, malformed payload, empty list, and manual-model fallback. Production URLs are asserted against preset-owned values rather than caller input.
-- Workspace browser tests cover default and multiple roots, one-level sorting, hidden directories, truncation, canonical internal symlinks, external escapes, nonexistent paths, permissions, sibling-prefix escape, `..` escape, and WSL-style POSIX paths.
+- Provider catalog tests cover successful ID reduction, deduplication, sorting, five-minute cache behavior, concurrent single-flight, short timeout, safe status projection, authentication failure, network failure, malformed payload, empty list, and manual-model fallback. Production URLs are asserted against preset-owned values rather than caller input.
+- Workspace browser tests cover default and multiple roots, one-level sorting, hidden directories, truncation, canonical internal symlinks, external escapes, nonexistent paths, permissions, sibling-prefix escape, `..` escape, WSL-style POSIX paths, and the no-per-entry-resolve fast path for large ordinary directories.
 - Thread API tests cover list, create with initial settings, not found, hydratable view, close idempotency, closed mutation, settings update, stale version, configuration required, and invalid workspace.
 - Turn API tests cover accepted response latency, starting state, duplicate conflict, Runtime transition, terminal cleanup, preflight cancellation, active cancellation, expected rejection, unexpected task failure, close during Turn, and shutdown cleanup.
 - SSE adapter tests cover event names, IDs, JSON data, append ordering, initial cursor, query/header precedence, disconnect/reconnect, heartbeat, active/idle polling selection, cursor expiry, snapshot recovery, empty-buffer cursor reset, terminal events, and no cancellation on disconnect.

@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from agent.model.errors import LLMError
 from agent.model.provider import LLMProvider
-from agent.model.types import ProviderCapabilities
+from agent.model.types import ProviderCapabilities, ThinkingParameterStyle
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
 
@@ -794,11 +794,19 @@ class ThreadRuntime:
             task_state = TaskState()
             pending_skill_events: list[tuple[str, dict[str, object]]] = []
             def skill_loaded(skill) -> None:
+                activation_source = "tool"
+                placement = "tool_history"
+                activation = skill_state.activation_metadata(skill.name)
+                if activation is not None:
+                    activation_source = activation["activation_source"]
+                    placement = activation["placement"]
                 payload = {
                     "name": skill.name,
                     "source": skill.source,
                     "source_path": skill.source_path,
                     "description": skill.description,
+                    "activation_source": activation_source,
+                    "placement": placement,
                 }
                 # Explicit mentions are loaded during provider-free preflight,
                 # so hold their event until after ``turn_started``.  A model
@@ -1283,7 +1291,7 @@ class ThreadRuntime:
             and thinking.supports_budget_tokens
         )
         keep_values = () if thinking is None else thinking.supported_keep_values
-        return {
+        projection: dict[str, object] = {
             "thinking_supported": supported,
             "supports_thinking_budget": budget,
             "supported_keep_values": list(keep_values),
@@ -1293,6 +1301,27 @@ class ThreadRuntime:
                 "supported_keep_values": list(keep_values),
             },
         }
+        if thinking is not None and thinking.supported and (
+            thinking.default_enabled
+            or not bool(thinking.toggle_supported)
+            or thinking.intensity_supported
+            or capabilities.thinking_parameter_style
+            is not ThinkingParameterStyle.GENERIC
+        ):
+            nested = projection["thinking"]
+            assert isinstance(nested, dict)
+            nested.update(
+                {
+                    "default_enabled": thinking.default_enabled,
+                    "toggle_supported": bool(thinking.toggle_supported),
+                    "intensity_supported": thinking.intensity_supported,
+                    "intensity_options": list(thinking.intensity_options),
+                    "default_intensity": thinking.default_intensity,
+                }
+            )
+        if capabilities is not None and capabilities.context_window_tokens is not None:
+            projection["context_window_tokens"] = capabilities.context_window_tokens
+        return projection
 
     get_capabilities = capabilities_for
 
@@ -1441,11 +1470,23 @@ class ThreadRuntime:
             else record.active_turn.tools.pending_approval()
         )
         loaded = () if record.active_turn is None else record.active_turn.skills.loaded
+        loaded_names = {skill.name for skill in loaded}
         catalog = record.skill_catalog
         skills = {
             "schema_version": 1,
-            "available": [skill.metadata for skill in catalog.skills],
-            "loaded": [skill.metadata for skill in loaded],
+            # A Skill is shown in exactly one bucket while a Turn is active.
+            # The full catalog remains owned by Runtime and is still used for
+            # model context/tool resolution; this is only the Host/UI view.
+            "available": [
+                skill.metadata
+                for skill in catalog.skills
+                if skill.name not in loaded_names
+            ],
+            "loaded": (
+                []
+                if record.active_turn is None
+                else record.active_turn.skills.loaded_metadata()
+            ),
             "diagnostics": [diagnostic.to_dict() for diagnostic in catalog.diagnostics],
         }
         return ThreadSnapshot(

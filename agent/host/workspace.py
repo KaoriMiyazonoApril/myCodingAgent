@@ -8,9 +8,10 @@ selected canonical directory an opaque, process-local id.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import heapq
 import os
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 from uuid import uuid4
 
 
@@ -113,7 +114,11 @@ class WorkspaceBrowser:
         return tuple(str(root) for root in self._roots)
 
     def list(self, requested_path: str | None = None) -> WorkspaceListing:
-        candidate = self._resolve_directory(requested_path)
+        # Navigation performs one strict check for the directory itself.  The
+        # actual child scan below is the only directory listing operation;
+        # ordinary children are represented from their DirEntry metadata and
+        # do not each trigger an expensive canonicalization.
+        candidate = self._resolve_directory(requested_path, check_access=False)
         root = self._containing_root(candidate)
 
         try:
@@ -169,7 +174,12 @@ class WorkspaceBrowser:
     def has(self, workspace_id: str) -> bool:
         return workspace_id in self._records
 
-    def _resolve_directory(self, requested_path: str | None) -> Path:
+    def _resolve_directory(
+        self,
+        requested_path: str | None,
+        *,
+        check_access: bool = True,
+    ) -> Path:
         raw_path = requested_path if requested_path is not None else str(self._roots[0])
         if not isinstance(raw_path, str) or not raw_path.strip():
             raise WorkspaceInvalidPathError("Workspace path is invalid")
@@ -193,8 +203,10 @@ class WorkspaceBrowser:
         if not canonical.is_dir():
             raise WorkspaceInvalidPathError("Workspace path is not a directory")
         self._containing_root(canonical)
-        # A directory listing is the minimum Host accessibility check and is
-        # intentionally limited to this selected directory.
+        if not check_access:
+            return canonical
+        # Selection/validation performs a final accessibility check.  Listing
+        # skips this block so it can keep one scandir per dialog request.
         try:
             with os.scandir(canonical):
                 pass
@@ -228,21 +240,37 @@ class WorkspaceBrowser:
         return str(parent)
 
     def _directory_entries(self, path: Path) -> list[WorkspaceEntry]:
-        directories: list[WorkspaceEntry] = []
+        # Keep only the first bounded alphabetical page in memory. The scan is
+        # still single-pass so `truncated` remains truthful for large folders.
+        return heapq.nsmallest(
+            self._limit + 1,
+            self._iter_directory_entries(path),
+            key=lambda entry: entry.name,
+        )
+
+    def _iter_directory_entries(self, path: Path) -> Iterator[WorkspaceEntry]:
         with os.scandir(path) as iterator:
             for entry in iterator:
                 try:
-                    # Follow directory aliases so internal links are useful in
-                    # the browser. External aliases are omitted from listings;
-                    # direct navigation still returns OUTSIDE_ALLOWED_ROOT.
-                    if not entry.is_dir(follow_symlinks=True):
-                        continue
-                    canonical = Path(entry.path).resolve(strict=True)
-                    self._containing_root(canonical)
+                    if entry.is_symlink():
+                        # Follow directory aliases so internal links are
+                        # useful in the browser. External aliases are omitted
+                        # from listings; direct navigation still returns
+                        # OUTSIDE_ALLOWED_ROOT.
+                        if not entry.is_dir(follow_symlinks=True):
+                            continue
+                        canonical = Path(entry.path).resolve(strict=True)
+                        self._containing_root(canonical)
+                    else:
+                        # DirEntry.is_dir is a cheap metadata check.  A normal
+                        # child of an already-contained directory cannot leave
+                        # the root lexically, so strict resolve is deferred to
+                        # navigation/selection of that child.
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        canonical = Path(entry.path)
                 except WorkspaceOutsideRootError:
                     continue
                 except (FileNotFoundError, RuntimeError, OSError):
                     continue
-                directories.append(WorkspaceEntry(name=entry.name, path=str(canonical)))
-        directories.sort(key=lambda entry: entry.name)
-        return directories
+                yield WorkspaceEntry(name=entry.name, path=str(canonical))

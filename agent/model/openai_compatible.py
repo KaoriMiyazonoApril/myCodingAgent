@@ -43,6 +43,8 @@ from .types import (
     ProviderConfig,
     ReasoningDeltaEvent,
     ReasoningRetention,
+    ThinkingParameterStyle,
+    ThinkingRequest,
     TextDeltaEvent,
     ToolCallDeltaEvent,
     Usage,
@@ -238,10 +240,49 @@ class OpenAICompatibleProvider(LLMProvider):
             payload["temperature"] = request.temperature
         if request.max_tokens is not None:
             payload["max_tokens"] = request.max_tokens
-        if request.extra_body:
+        adapter_body = self._thinking_extra_body(request.thinking)
+        if request.extra_body and adapter_body:
+            adapter_body = {**request.extra_body, **adapter_body}
+        elif request.extra_body:
+            adapter_body = dict(request.extra_body)
+        if adapter_body:
             # The SDK passes this through for deliberately provider-specific needs.
-            payload["extra_body"] = dict(request.extra_body)
+            payload["extra_body"] = adapter_body
         return payload
+
+    def _thinking_extra_body(
+        self,
+        thinking_request: ThinkingRequest | None,
+    ) -> dict[str, object] | None:
+        """Translate unified thinking intent at the provider-adapter boundary."""
+
+        if thinking_request is None:
+            return None
+        style = self.capabilities.thinking_parameter_style
+        enabled = thinking_request.enabled
+        intensity = thinking_request.intensity
+        if style is ThinkingParameterStyle.KIMI_ALWAYS_ON:
+            return None
+        if style is ThinkingParameterStyle.KIMI_REASONING_EFFORT:
+            return {"reasoning_effort": intensity} if enabled and intensity else None
+        if style is ThinkingParameterStyle.KIMI_TOGGLE:
+            return {"thinking": {"type": "enabled" if enabled else "disabled"}}
+
+        vendor_thinking: dict[str, object] = {
+            "type": "enabled" if enabled else "disabled"
+        }
+        if thinking_request.budget_tokens is not None:
+            vendor_thinking["budget_tokens"] = thinking_request.budget_tokens
+        if thinking_request.keep is not None:
+            vendor_thinking["keep"] = thinking_request.keep
+        if style in {ThinkingParameterStyle.DEEPSEEK_V4, ThinkingParameterStyle.GLM}:
+            result: dict[str, object] = {"thinking": vendor_thinking}
+            if enabled and intensity is not None:
+                result["reasoning_effort"] = intensity
+            return result
+        if intensity is not None:
+            vendor_thinking["intensity"] = intensity
+        return {"thinking": vendor_thinking}
 
     def _encode_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
         encoded: list[dict[str, Any]] = []

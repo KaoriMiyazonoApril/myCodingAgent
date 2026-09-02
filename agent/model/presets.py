@@ -6,10 +6,12 @@ from types import MappingProxyType
 
 from .errors import LLMConfigurationError
 from .types import (
+    ModelProfile,
     ProviderCapabilities,
     ProviderConfig,
     ProviderProfile,
     ReasoningRetention,
+    ThinkingParameterStyle,
     ThinkingCapabilities,
     WorkingTailMode,
 )
@@ -40,23 +42,162 @@ GLM_CAPABILITIES = ProviderCapabilities(
     working_tail_mode=WorkingTailMode.STRUCTURED_USER_TAIL,
 )
 
+
+def _deepseek_v4_profile(model_id: str, display_name: str) -> tuple[str, ModelProfile]:
+    return model_id, ModelProfile(
+        model_id=model_id,
+        display_name=display_name,
+        description="DeepSeek V4 思考模型，支持低/高/最大 Thinking 强度。",
+        context_window_tokens=1_000_000,
+        thinking=ThinkingCapabilities(
+            supported=True,
+            default_enabled=True,
+            toggle_supported=True,
+            intensity_supported=True,
+            intensity_options=("low", "high", "max"),
+            default_intensity="high",
+        ),
+        thinking_parameter_style=ThinkingParameterStyle.DEEPSEEK_V4,
+    )
+
+
+def _kimi_profiles() -> dict[str, ModelProfile]:
+    return {
+        "kimi-k3": ModelProfile(
+            model_id="kimi-k3",
+            display_name="Kimi K3",
+            description="Kimi K3，1M 上下文，Thinking 始终开启。",
+            context_window_tokens=1_000_000,
+            thinking=ThinkingCapabilities(
+                supported=True,
+                default_enabled=True,
+                toggle_supported=False,
+                intensity_supported=True,
+                intensity_options=("low", "high", "max"),
+                default_intensity="max",
+            ),
+            thinking_parameter_style=ThinkingParameterStyle.KIMI_REASONING_EFFORT,
+        ),
+        "kimi-k2.7-code": ModelProfile(
+            model_id="kimi-k2.7-code",
+            display_name="Kimi K2.7 Code",
+            description="Kimi K2.7 Code，256K 上下文，Thinking 始终开启。",
+            context_window_tokens=256_000,
+            thinking=ThinkingCapabilities(
+                supported=True,
+                default_enabled=True,
+                toggle_supported=False,
+            ),
+            thinking_parameter_style=ThinkingParameterStyle.KIMI_ALWAYS_ON,
+        ),
+        "kimi-k2.7-code-highspeed": ModelProfile(
+            model_id="kimi-k2.7-code-highspeed",
+            display_name="Kimi K2.7 Code Highspeed",
+            description="Kimi K2.7 Code Highspeed，256K 上下文，Thinking 始终开启。",
+            context_window_tokens=256_000,
+            thinking=ThinkingCapabilities(
+                supported=True,
+                default_enabled=True,
+                toggle_supported=False,
+            ),
+            thinking_parameter_style=ThinkingParameterStyle.KIMI_ALWAYS_ON,
+        ),
+        "kimi-k2.6": ModelProfile(
+            model_id="kimi-k2.6",
+            display_name="Kimi K2.6",
+            description="Kimi K2.6，256K 上下文，Thinking 可关闭。",
+            context_window_tokens=256_000,
+            thinking=ThinkingCapabilities(
+                supported=True,
+                default_enabled=True,
+                toggle_supported=True,
+            ),
+            thinking_parameter_style=ThinkingParameterStyle.KIMI_TOGGLE,
+        ),
+    }
+
+
+def _glm_profiles() -> dict[str, ModelProfile]:
+    return {
+        "glm-5.3": ModelProfile(
+            model_id="glm-5.3",
+            display_name="GLM-5.3",
+            description="GLM-5.3，1M 上下文，Thinking 始终开启。",
+            context_window_tokens=1_000_000,
+            thinking=ThinkingCapabilities(
+                supported=True,
+                default_enabled=True,
+                toggle_supported=False,
+                intensity_supported=True,
+                intensity_options=("low", "high", "max"),
+                default_intensity="max",
+            ),
+            thinking_parameter_style=ThinkingParameterStyle.GLM,
+        ),
+        "glm-5.2": ModelProfile(
+            model_id="glm-5.2",
+            display_name="GLM-5.2",
+            description="GLM-5.2，1M 上下文，Thinking 可关闭并支持强度。",
+            context_window_tokens=1_000_000,
+            thinking=ThinkingCapabilities(
+                supported=True,
+                default_enabled=True,
+                toggle_supported=True,
+                intensity_supported=True,
+                intensity_options=(
+                    "none",
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                ),
+                default_intensity="max",
+            ),
+            thinking_parameter_style=ThinkingParameterStyle.GLM,
+        ),
+    }
+
+
+_DEEPSEEK_MODELS = dict(
+    (_deepseek_v4_profile("deepseek-v4-flash", "DeepSeek V4 Flash"),
+     _deepseek_v4_profile("deepseek-v4-pro", "DeepSeek V4 Pro"))
+)
+
 PROVIDER_PRESETS = MappingProxyType(
     {
         "deepseek": ProviderProfile(
             base_url="https://api.deepseek.com",
             default_capabilities=DEEPSEEK_CAPABILITIES,
+            model_profiles=_DEEPSEEK_MODELS,
+            display_name="DeepSeek",
+            description="DeepSeek 官方模型服务。",
+            conservative_unknown_models=True,
         ),
         "kimi": ProviderProfile(
-            base_url="https://api.moonshot.cn/v1",
+            base_url="https://api.moonshot.ai/v1",
             default_capabilities=KIMI_CAPABILITIES,
+            model_profiles=_kimi_profiles(),
+            display_name="Moonshot / Kimi",
+            description="Moonshot / Kimi 官方模型服务。",
+            conservative_unknown_models=True,
         ),
         "moonshot": ProviderProfile(
-            base_url="https://api.moonshot.cn/v1",
+            base_url="https://api.moonshot.ai/v1",
             default_capabilities=KIMI_CAPABILITIES,
+            model_profiles=_kimi_profiles(),
+            display_name="Moonshot / Kimi",
+            description="Moonshot / Kimi 官方模型服务。",
+            conservative_unknown_models=True,
         ),
         "glm": ProviderProfile(
             base_url="https://open.bigmodel.cn/api/paas/v4",
             default_capabilities=GLM_CAPABILITIES,
+            model_profiles=_glm_profiles(),
+            display_name="GLM",
+            description="智谱 GLM 官方模型服务。",
+            conservative_unknown_models=True,
         ),
     }
 )

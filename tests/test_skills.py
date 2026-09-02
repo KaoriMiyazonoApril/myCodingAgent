@@ -83,6 +83,31 @@ def test_skill_loading_is_idempotent_and_turn_local(tmp_path: Path) -> None:
     assert state.projection() == ""
 
 
+def test_skill_snapshot_reports_activation_source_and_available_bucket(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _write_skill(workspace / ".agents" / "skills", "alpha", "Do alpha", "body text")
+    _write_skill(workspace / ".agents" / "skills", "beta", "Do beta", "other body")
+    catalog = SkillDiscovery(home=tmp_path / "empty-home").discover(workspace)
+    state = SkillTurnState(catalog)
+
+    state.activate("alpha")
+    state.load("beta")
+    snapshot = state.snapshot()
+
+    assert snapshot["available_count"] == 0
+    loaded = snapshot["loaded"]
+    assert isinstance(loaded, list)
+    assert loaded[0]["name"] == "alpha"
+    assert loaded[0]["activation_source"] == "explicit"
+    assert loaded[0]["placement"] == "working_tail"
+    assert loaded[1]["name"] == "beta"
+    assert loaded[1]["activation_source"] == "tool"
+    assert loaded[1]["placement"] == "tool_history"
+
+
 def test_skill_loader_is_a_stateless_bounded_body_seam(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

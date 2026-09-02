@@ -19,6 +19,7 @@ from agent.model.types import (
     LLMRequest,
     LLMResponse,
     MessageEndEvent,
+    ThinkingRequest,
 )
 from agent.tools.types import ToolDefinition
 
@@ -57,8 +58,17 @@ class ModelInvoker:
             tools=tools,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
-            extra_body=(
-                self._config.thinking.to_extra_body()
+            thinking=(
+                ThinkingRequest(
+                    enabled=self._config.thinking.enabled,
+                    budget_tokens=self._config.thinking.budget_tokens,
+                    keep=(
+                        None
+                        if self._config.thinking.keep is None
+                        else self._config.thinking.keep.value
+                    ),
+                    intensity=self._config.thinking.intensity,
+                )
                 if self._config.thinking is not None
                 else None
             ),
@@ -92,8 +102,17 @@ class ModelInvoker:
             tools=tools,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
-            extra_body=(
-                self._config.thinking.to_extra_body()
+            thinking=(
+                ThinkingRequest(
+                    enabled=self._config.thinking.enabled,
+                    budget_tokens=self._config.thinking.budget_tokens,
+                    keep=(
+                        None
+                        if self._config.thinking.keep is None
+                        else self._config.thinking.keep.value
+                    ),
+                    intensity=self._config.thinking.intensity,
+                )
                 if self._config.thinking is not None
                 else None
             ),

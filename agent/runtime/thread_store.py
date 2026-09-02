@@ -512,6 +512,7 @@ def _settings_to_dict(settings: ModelSettings | ThreadSettings) -> dict[str, obj
             "enabled": thinking.enabled,
             "budget_tokens": thinking.budget_tokens,
             "keep": None if thinking.keep is None else thinking.keep.value,
+            **({"intensity": thinking.intensity} if thinking.intensity is not None else {}),
         },
         "limits": {
             "max_iterations": settings.limits.max_iterations,
@@ -536,6 +537,7 @@ def _settings_from_dict(raw: object, *, versioned: bool) -> ThreadSettings | Mod
             enabled=thinking_raw["enabled"],
             budget_tokens=thinking_raw.get("budget_tokens"),
             keep=None if keep is None else ThinkingKeep(keep),
+            intensity=thinking_raw.get("intensity"),
         )
     limits_raw = raw.get("limits")
     if not isinstance(limits_raw, dict):
@@ -679,6 +681,11 @@ def _override_to_dict(value: TurnSettingsOverride | None) -> dict[str, object] |
                 "enabled": field_value.enabled,
                 "budget_tokens": field_value.budget_tokens,
                 "keep": None if field_value.keep is None else field_value.keep.value,
+                **(
+                    {"intensity": field_value.intensity}
+                    if field_value.intensity is not None
+                    else {}
+                ),
             }
         elif isinstance(field_value, AgentLimits):
             result[name] = {
@@ -706,6 +713,7 @@ def _override_from_dict(raw: object) -> TurnSettingsOverride | None:
             enabled=thinking["enabled"],
             budget_tokens=thinking.get("budget_tokens"),
             keep=None if keep is None else ThinkingKeep(keep),
+            intensity=thinking.get("intensity"),
         )
     limits = values.get("limits")
     if isinstance(limits, dict):

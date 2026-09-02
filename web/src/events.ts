@@ -171,6 +171,17 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     next.approval = null;
     // Loaded Skills are turn-local.  Keep the complete available catalog but
     // never carry a prior Turn's bodies/metadata into the next execution.
+    next.skills.available = [
+      ...next.skills.available,
+      ...next.skills.loaded.filter(
+        (loaded) => !next.skills.available.some((available) => available.name === loaded.name),
+      ).map((loaded) => {
+        const catalog = { ...loaded };
+        delete catalog.activation_source;
+        delete catalog.placement;
+        return catalog;
+      }),
+    ];
     next.skills.loaded = [];
     next.provisional = {
       turn_id: event.turn_id,
@@ -278,6 +289,9 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     const skill = safeSkill(event.payload);
     if (skill !== null && !next.skills.loaded.some((item) => item.name === skill.name)) {
       next.skills.loaded.push(skill);
+      next.skills.available = next.skills.available.filter(
+        (item) => item.name !== skill.name,
+      );
     }
   } else if (event.type === "skill_activation_failed") {
     const name = event.payload.name;
@@ -539,6 +553,12 @@ function safeSkill(value: unknown): SkillMetadata | null {
     source_path: value.source_path,
     directory:
       typeof value.directory === "string" ? value.directory : value.source_path,
+    ...(value.activation_source === "explicit" || value.activation_source === "tool"
+      ? { activation_source: value.activation_source }
+      : {}),
+    ...(value.placement === "working_tail" || value.placement === "tool_history"
+      ? { placement: value.placement }
+      : {}),
   };
 }
 

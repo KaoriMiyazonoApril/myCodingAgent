@@ -201,7 +201,7 @@ test("starts with a compact empty state when no model is configured", async () =
   expect(screen.getByText("DeepSeek")).toBeInTheDocument();
   expect(screen.getByText("Moonshot / Kimi")).toBeInTheDocument();
   expect(screen.getByText("GLM")).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "连接 DeepSeek" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "配置 DeepSeek" })).toBeInTheDocument();
 });
 
 test("saves a key, discovers models, and selects a default", async () => {
@@ -311,21 +311,21 @@ test("saves a key, discovers models, and selects a default", async () => {
 
   fireEvent.click(screen.getByRole("button", { name: "设置" }));
   fireEvent.click(
-    await screen.findByRole("button", { name: "连接 DeepSeek" }),
+    await screen.findByRole("button", { name: "配置 DeepSeek" }),
   );
   const key = screen.getByLabelText("访问密钥");
   fireEvent.change(key, { target: { value: "sk-api-secret" } });
-  fireEvent.click(screen.getByRole("button", { name: "保存并发现模型" }));
+  fireEvent.click(screen.getByRole("button", { name: "保存凭据" }));
 
+  const modelPicker = await screen.findByRole("combobox", { name: "服务商模型" });
+  fireEvent.focus(modelPicker);
   expect(
-    await screen.findByRole("option", { name: "deepseek-reasoner" }),
+    await screen.findByRole("option", { name: /deepseek-reasoner/ }),
   ).toBeInTheDocument();
   expect(key).toHaveValue("");
   expect(screen.getByText("凭据已保存 · ••••cret")).toBeInTheDocument();
 
-  fireEvent.change(screen.getByLabelText("服务商模型"), {
-    target: { value: "deepseek-reasoner" },
-  });
+  fireEvent.click(screen.getByRole("option", { name: /deepseek-reasoner/ }));
   fireEvent.click(screen.getByRole("button", { name: "设为默认" }));
 
   expect((await screen.findAllByText("默认")).length).toBeGreaterThan(0);
@@ -347,7 +347,7 @@ test("saves a key, discovers models, and selects a default", async () => {
   );
 });
 
-test("shows provider request failures inline", async () => {
+test("keeps a Provider configured when background model discovery fails", async () => {
   const fetchMock = vi.mocked(fetch);
   fetchMock.mockImplementation(async (input, init) => {
     if (String(input) === "/api/threads") {
@@ -371,8 +371,24 @@ test("shows provider request failures inline", async () => {
     }
     if ((init?.method ?? "GET") === "PUT") {
       return {
+        ok: true,
+        json: async () => ({
+          schema_version: 1,
+          provider: {
+            provider_id: "deepseek",
+            display_name: "DeepSeek",
+            configured: true,
+            credential_mask: "••••-key",
+            selected_model: null,
+            is_default: false,
+          },
+        }),
+      } as Response;
+    }
+    if (String(input).endsWith("/models/discover")) {
+      return {
         ok: false,
-        status: 400,
+        status: 503,
         json: async () => ({
           error: {
             code: "PROVIDER_AUTHENTICATION_FAILED",
@@ -404,16 +420,19 @@ test("shows provider request failures inline", async () => {
   render(<App />);
   fireEvent.click(screen.getByRole("button", { name: "设置" }));
   fireEvent.click(
-    await screen.findByRole("button", { name: "连接 DeepSeek" }),
+    await screen.findByRole("button", { name: "配置 DeepSeek" }),
   );
   fireEvent.change(screen.getByLabelText("访问密钥"), {
     target: { value: "rejected-key" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "保存并发现模型" }));
+  fireEvent.click(screen.getByRole("button", { name: "保存凭据" }));
 
   expect(
     await screen.findByRole("alert"),
-  ).toHaveTextContent("Provider rejected the configured credential");
+  ).toHaveTextContent("模型目录同步失败 · Provider rejected the configured credential");
+  expect(screen.getByText("凭据已保存 · ••••-key")).toBeInTheDocument();
+  expect(screen.getByText("已配置")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "使用 Custom Model ID" })).toBeInTheDocument();
 });
 
 test("navigates Host workspaces and selects the current directory", async () => {
@@ -553,6 +572,65 @@ test("returns focus to the project selector after closing its dialog", async () 
   fireEvent.click(within(dialog).getByRole("button", { name: "关闭项目对话框" }));
 
   await waitFor(() => expect(document.activeElement).toBe(opener));
+});
+
+test("caches workspace listings during one dialog session and reload bypasses it", async () => {
+  const workspaceRequests: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [] }),
+        } as Response;
+      }
+      if (path.startsWith("/api/workspaces")) {
+        workspaceRequests.push(path);
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            path: "/workspace",
+            parent: null,
+            roots: ["/workspace"],
+            entries: [],
+            truncated: false,
+          }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          schema_version: 1,
+          default_provider_id: null,
+          providers: [],
+        }),
+      } as Response;
+    }),
+  );
+
+  render(<App />);
+  const opener = await screen.findByRole("button", { name: "选择项目" });
+  fireEvent.click(opener);
+  fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
+  const dialog = await screen.findByRole("dialog");
+  await within(dialog).findByRole("button", { name: "重新加载" });
+  expect(workspaceRequests).toHaveLength(1);
+
+  fireEvent.click(within(dialog).getByRole("button", { name: /workspace/ }));
+  await waitFor(() => expect(workspaceRequests).toHaveLength(1));
+  fireEvent.click(within(dialog).getByRole("button", { name: "重新加载" }));
+  await waitFor(() => expect(workspaceRequests).toHaveLength(2));
+
+  fireEvent.click(within(dialog).getByRole("button", { name: "关闭项目对话框" }));
+  fireEvent.click(opener);
+  fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
+  await within(await screen.findByRole("dialog")).findByRole("button", {
+    name: "重新加载",
+  });
+  expect(workspaceRequests).toHaveLength(3);
 });
 
 test("creates switches refreshes and closes Host threads", async () => {
@@ -820,13 +898,13 @@ test("creates switches refreshes and closes Host threads", async () => {
   expect(
     screen.getByRole("region", { name: "编码助手对话" }),
   ).toBeInTheDocument();
-  const contextPanel = screen.getByRole("complementary", { name: "动态与修改" });
+  const contextPanel = screen.getByRole("complementary", { name: "运行详情与修改" });
   expect(contextPanel).not.toHaveTextContent("迭代次数2");
-  expect(screen.getByRole("button", { name: "展开动态与修改" })).toHaveTextContent(
+  expect(screen.getByRole("button", { name: "展开运行详情与修改" })).toHaveTextContent(
     "修改 1",
   );
-  fireEvent.click(screen.getByRole("button", { name: "展开动态与修改" }));
-  expect(await screen.findByRole("tab", { name: "动态" })).toHaveAttribute(
+  fireEvent.click(screen.getByRole("button", { name: "展开运行详情与修改" }));
+  expect(await screen.findByRole("tab", { name: "运行" })).toHaveAttribute(
     "aria-selected",
     "false",
   );
@@ -839,10 +917,10 @@ test("creates switches refreshes and closes Host threads", async () => {
   expect(
     screen.getByLabelText("对话文件修改"),
   ).toHaveTextContent("src/example.py");
-  fireEvent.click(screen.getByRole("tab", { name: "动态" }));
+  fireEvent.click(screen.getByRole("tab", { name: "运行" }));
   expect(contextPanel).toHaveTextContent("迭代次数2");
   expect(contextPanel).toHaveTextContent("输入令牌8");
-  fireEvent.click(screen.getByRole("button", { name: "收起动态与修改" }));
+  fireEvent.click(screen.getByRole("button", { name: "收起运行详情与修改" }));
   expect(screen.getByRole("button", { name: "显示对话记录" })).toHaveAttribute(
     "aria-pressed",
     "false",
@@ -873,25 +951,25 @@ test("creates switches refreshes and closes Host threads", async () => {
   expect(screen.queryByText("/home/student/project")).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
   fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
-  fireEvent.change(screen.getByLabelText("对话模型"), {
+  fireEvent.change(screen.getByLabelText("自定义模型 ID"), {
     target: { value: "deepseek-reasoner" },
   });
   await waitFor(() =>
-    expect(screen.getByRole("button", { name: "保存对话设置" })).not.toBeDisabled(),
+    expect(screen.getByRole("button", { name: "保存" })).not.toBeDisabled(),
   );
-  fireEvent.click(screen.getByRole("button", { name: "保存对话设置" }));
+  fireEvent.click(screen.getByRole("button", { name: "保存" }));
   await waitFor(() =>
     expect(screen.queryByLabelText("对话设置")).not.toBeInTheDocument(),
   );
   fireEvent.click(await screen.findByRole("button", { name: "对话选项" }));
   fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
-  fireEvent.change(screen.getByLabelText("对话模型"), {
+  fireEvent.change(screen.getByLabelText("自定义模型 ID"), {
     target: { value: "stale-model" },
   });
   await waitFor(() =>
-    expect(screen.getByRole("button", { name: "保存对话设置" })).not.toBeDisabled(),
+    expect(screen.getByRole("button", { name: "保存" })).not.toBeDisabled(),
   );
-  fireEvent.click(screen.getByRole("button", { name: "保存对话设置" }));
+  fireEvent.click(screen.getByRole("button", { name: "保存" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "更新对话设置失败 · Thread settings changed",
   );
@@ -930,6 +1008,7 @@ test("creates switches refreshes and closes Host threads", async () => {
             max_tool_calls: 50,
             max_execution_seconds: 900,
           },
+          approval_mode: "on_request",
         }),
       },
       { path: "/api/threads/thread-new", method: "GET", body: undefined },
@@ -1260,18 +1339,18 @@ test("shows Skills metadata and capability-gated thread settings", async () => {
   );
 
   render(<App />);
-  expect(await screen.findByRole("button", { name: "Skills" })).toHaveTextContent(
-    "Loaded 0 / Available 1",
+  expect(await screen.findByRole("button", { name: "技能" })).toHaveTextContent(
+    "技能 0 / 1",
   );
-  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
-  const skills = await screen.findByRole("dialog", { name: "Skills" });
+  fireEvent.click(screen.getByRole("button", { name: "技能" }));
+  const skills = await screen.findByRole("dialog", { name: "技能" });
   expect(skills).toHaveTextContent("repo-guide");
   expect(skills).toHaveTextContent("Repository workflow guidance");
   fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
   fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
   await waitFor(() => expect(screen.getByLabelText("Thinking")).not.toBeDisabled());
   fireEvent.click(screen.getByLabelText("Thinking"));
-  expect(screen.getByLabelText("Thinking budget")).toBeInTheDocument();
+  expect(screen.queryByLabelText("Thinking budget")).not.toBeInTheDocument();
   expect(screen.queryByLabelText("Thinking history")).not.toBeInTheDocument();
   expect(
     requests.some(({ path }) => path.startsWith("/api/threads/thread-skills/capabilities?")),
@@ -1279,10 +1358,10 @@ test("shows Skills metadata and capability-gated thread settings", async () => {
 
   // A draft switch must use the candidate capability preview immediately and
   // must not retain the previous provider's thinking controls.
-  fireEvent.change(screen.getByLabelText("模型服务商"), {
+  fireEvent.change(screen.getByLabelText("服务商"), {
     target: { value: "moonshot" },
   });
-  await waitFor(() => expect(screen.getByLabelText("Thinking")).toBeDisabled());
+  await waitFor(() => expect(screen.queryByLabelText("Thinking")).not.toBeInTheDocument());
   expect(screen.queryByLabelText("Thinking budget")).not.toBeInTheDocument();
   await waitFor(() =>
     expect(
@@ -1291,7 +1370,7 @@ test("shows Skills metadata and capability-gated thread settings", async () => {
       ),
     ).toBe(true),
   );
-  fireEvent.change(screen.getByLabelText("模型服务商"), {
+  fireEvent.change(screen.getByLabelText("服务商"), {
     target: { value: "deepseek" },
   });
   await waitFor(() => expect(screen.getByLabelText("Thinking")).not.toBeDisabled());
@@ -1356,14 +1435,14 @@ test("opening and saving unchanged Settings preserves enabled Thinking", async (
   );
 
   render(<App />);
-  await screen.findByRole("button", { name: /Skills/ });
+  await screen.findByRole("button", { name: "技能" });
   fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
   fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
   await waitFor(() => expect(screen.getByLabelText("Thinking")).not.toBeDisabled());
   expect(screen.getByLabelText("Thinking")).toBeChecked();
-  expect(screen.getByLabelText("Thinking budget")).toHaveValue(1_024);
+  expect(screen.queryByLabelText("Thinking budget")).not.toBeInTheDocument();
 
-  fireEvent.click(screen.getByRole("button", { name: "保存对话设置" }));
+  fireEvent.click(screen.getByRole("button", { name: "保存" }));
   await waitFor(() =>
     expect(
       requests.some(
@@ -1379,7 +1458,7 @@ test("opening and saving unchanged Settings preserves enabled Thinking", async (
   );
   expect(JSON.parse(patch?.body ?? "{}").thinking).toEqual({
     enabled: true,
-    budget_tokens: 1_024,
+    budget_tokens: null,
     keep: null,
   });
 });
@@ -1389,7 +1468,7 @@ test("keeps Settings save disabled until the exact capability preview resolves",
   try {
     const thread = appThread("thread-thinking-pending", {
       enabled: true,
-      budget_tokens: 1_024,
+      budget_tokens: null,
       keep: null,
     });
     const requests: Array<{ path: string; method: string; body?: string }> = [];
@@ -1446,11 +1525,11 @@ test("keeps Settings save disabled until the exact capability preview resolves",
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(screen.getByRole("button", { name: /Skills/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "技能" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
 
-    const save = screen.getByRole("button", { name: "保存对话设置" });
+    const save = screen.getByRole("button", { name: "保存" });
     expect(save).toBeDisabled();
     fireEvent.click(save);
     expect(
@@ -1491,7 +1570,7 @@ test("keeps Settings save disabled until the exact capability preview resolves",
     const patch = requests.find(({ method }) => method === "PATCH");
     expect(JSON.parse(patch?.body ?? "{}").thinking).toEqual({
       enabled: true,
-      budget_tokens: 1_024,
+      budget_tokens: null,
       keep: null,
     });
   } finally {
@@ -1563,7 +1642,7 @@ test("keeps Settings save disabled when the capability preview fails", async () 
     });
     fireEvent.click(screen.getByRole("button", { name: "对话选项" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "对话设置" }));
-    const save = screen.getByRole("button", { name: "保存对话设置" });
+    const save = screen.getByRole("button", { name: "保存" });
     expect(save).toBeDisabled();
 
     await act(async () => {
@@ -1625,8 +1704,8 @@ test("updates the Skills button from a live skill_loaded event", async () => {
 
   try {
     render(<App />);
-    const skillsButton = await screen.findByRole("button", { name: /Skills/ });
-    expect(skillsButton).toHaveTextContent("Loaded 0 / Available 1");
+    const skillsButton = await screen.findByRole("button", { name: "技能" });
+    expect(skillsButton).toHaveTextContent("技能 0 / 1");
     const source = await waitFor(() => {
       const current = AppFakeEventSource.instances[0];
       if (current === undefined) {
@@ -1652,7 +1731,7 @@ test("updates the Skills button from a live skill_loaded event", async () => {
       },
     });
     await waitFor(() =>
-      expect(skillsButton).toHaveTextContent("Loaded 1 / Available 1"),
+      expect(skillsButton).toHaveTextContent("技能 1 / 1"),
     );
   } finally {
     vi.stubGlobal("EventSource", previousEventSource);
@@ -1729,7 +1808,7 @@ test("hydrates an approval card, shows its risk summary, and resolves once", asy
 
   try {
     render(<App />);
-    await screen.findByRole("button", { name: /Skills/ });
+    await screen.findByRole("button", { name: "技能" });
     expect(screen.getByText("run_command")).toBeInTheDocument();
     expect(screen.getByRole("alert", { name: "等待确认" })).toHaveTextContent(
       "rm -rf build",
@@ -1800,7 +1879,7 @@ test("disables approval controls immediately after Turn cancellation", async () 
 
   try {
     render(<App />);
-    await screen.findByRole("button", { name: /Skills/ });
+    await screen.findByRole("button", { name: "技能" });
     const source = await waitFor(() => {
       const current = AppFakeEventSource.instances[0];
       if (current === undefined) {
@@ -1905,7 +1984,7 @@ test("allows retry when failed resolution recovery still shows the same approval
 
   try {
     render(<App />);
-    await screen.findByRole("button", { name: /Skills/ });
+    await screen.findByRole("button", { name: "技能" });
     const approve = screen.getByRole("button", { name: "批准" });
     fireEvent.click(approve);
     await waitFor(() =>
@@ -1993,7 +2072,7 @@ test("sends Reject as false, removes the card, and does not start another reques
 
   try {
     render(<App />);
-    await screen.findByRole("button", { name: /Skills/ });
+    await screen.findByRole("button", { name: "技能" });
     fireEvent.click(screen.getByRole("button", { name: "拒绝" }));
     await waitFor(() =>
       expect(screen.queryByRole("button", { name: "拒绝" })).not.toBeInTheDocument(),
@@ -2083,7 +2162,7 @@ test("keeps one approval resolution in flight across snapshot remounts", async (
 
   try {
     render(<App />);
-    await screen.findByRole("button", { name: /Skills/ });
+    await screen.findByRole("button", { name: "技能" });
     fireEvent.click(screen.getByRole("button", { name: "批准" }));
     const source = await waitFor(() => {
       const current = AppFakeEventSource.instances[0];
@@ -2173,7 +2252,7 @@ test("keeps approval controls disabled while a cancelling snapshot is active", a
 
   try {
     render(<App />);
-    await screen.findByRole("button", { name: /Skills/ });
+    await screen.findByRole("button", { name: "技能" });
     expect(screen.getByRole("button", { name: "批准" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "拒绝" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "批准" }));

@@ -51,6 +51,16 @@ textarea {
   font: inherit;
 }
 
+.model-options-compat {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 button,
 select {
   touch-action: manipulation;
@@ -273,6 +283,115 @@ textarea:disabled {
   padding: 16px;
 }
 
+.model-profile-summary {
+  display: grid;
+  gap: 4px;
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  color: var(--text-soft);
+  background: rgb(32 51 74 / 46%);
+}
+
+.model-profile-summary strong {
+  font-size: 12px;
+}
+
+.model-profile-summary p,
+.model-profile-summary small {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.model-picker {
+  position: relative;
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.model-picker > label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.model-picker > input,
+.settings-section select {
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  background: #0d1628;
+}
+
+.text-button {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  color: var(--accent-strong);
+  background: transparent;
+  font-size: 11px;
+}
+
+.model-picker-options {
+  position: absolute;
+  z-index: 35;
+  top: 68px;
+  right: 0;
+  left: 0;
+  display: grid;
+  max-height: 220px;
+  padding: 5px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #17243a;
+  box-shadow: 0 14px 30px rgb(0 0 0 / 34%);
+}
+
+.model-picker-options button {
+  display: grid;
+  gap: 3px;
+  padding: 8px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text-soft);
+  background: transparent;
+  text-align: left;
+}
+
+.model-picker-options button:hover,
+.model-picker-options button[aria-selected="true"] {
+  background: var(--surface-active);
+}
+
+.model-picker-options code,
+.model-picker-options p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.model-profile-summary p {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.model-profile-summary small {
+  color: var(--accent-strong);
+  font: 10px/1.45 "JetBrains Mono", ui-monospace, monospace;
+}
+
+.settings-editor-fields .model-profile-summary {
+  grid-column: 2 / -1;
+}
+
 .menu-label {
   margin: 5px 8px 7px;
   color: var(--muted);
@@ -404,7 +523,7 @@ textarea:disabled {
 }
 
 .agent-console.activity-collapsed {
-  grid-template-columns: 240px minmax(0, 1fr) 44px;
+  grid-template-columns: 240px minmax(0, 1fr) 92px;
 }
 
 .mobile-view-switcher {
@@ -775,6 +894,116 @@ textarea:disabled {
   white-space: nowrap;
 }
 
+.settings-sections {
+  display: grid;
+  gap: 0;
+}
+
+.settings-section {
+  display: grid;
+  gap: 12px;
+  padding: 16px 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.settings-section:first-child {
+  padding-top: 4px;
+  border-top: 0;
+}
+
+.settings-section h5,
+.intensity-setting legend {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.settings-field {
+  display: grid;
+  gap: 7px;
+}
+
+.settings-field > label,
+.intensity-setting legend {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.settings-field > small,
+.readonly-setting,
+.skills-explainer {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.toggle-setting,
+.readonly-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.toggle-setting input {
+  width: 38px;
+  min-height: 22px;
+}
+
+.intensity-setting {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.intensity-setting > div {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+  gap: 7px;
+}
+
+.intensity-setting label {
+  position: relative;
+}
+
+.intensity-setting input {
+  position: absolute;
+  opacity: 0;
+}
+
+.intensity-setting span {
+  display: grid;
+  min-height: 38px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-soft);
+  background: #0d1628;
+}
+
+.intensity-setting input:checked + span {
+  border-color: var(--accent-strong);
+  color: var(--accent-strong);
+  background: rgb(46 115 83 / 18%);
+}
+
+.settings-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.settings-inline-help {
+  grid-column: 2;
+  margin: -4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .thread-context-line {
   display: flex;
   align-items: center;
@@ -1119,16 +1348,12 @@ textarea:disabled {
 }
 
 .activity-panel-collapsed .activity-rail-toggle {
-  height: 100%;
-  flex: 1 1 auto;
-  flex-direction: column;
-  justify-content: flex-start;
-  padding: 8px 0;
+  height: 44px;
+  flex: 0 0 44px;
+  flex-direction: row;
+  justify-content: space-between;
+  padding: 0 10px;
   border-bottom: 0;
-}
-
-.activity-panel-collapsed .activity-rail-toggle span:last-child {
-  writing-mode: vertical-rl;
 }
 
 .activity-content {
@@ -1406,6 +1631,13 @@ textarea:disabled {
   font-size: 16px;
 }
 
+.provider-description {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .default-badge {
   padding: 3px 6px;
   border: 1px solid rgb(99 227 154 / 44%);
@@ -1436,6 +1668,16 @@ textarea:disabled {
   overflow-wrap: anywhere;
   color: var(--muted);
   font: 11px/1.45 "JetBrains Mono", ui-monospace, monospace;
+}
+
+.provider-catalog-status {
+  margin: 4px 0 0;
+  color: var(--accent-strong);
+  font-size: 11px;
+}
+
+.provider-catalog-status.error {
+  color: var(--danger);
 }
 
 .provider-row > button {
@@ -2359,7 +2601,7 @@ textarea:disabled {
   }
 
   .agent-console.activity-collapsed {
-    grid-template-columns: 220px minmax(0, 1fr) 42px;
+    grid-template-columns: 220px minmax(0, 1fr) 84px;
   }
 }
 
@@ -2446,10 +2688,6 @@ textarea:disabled {
     flex-direction: row;
     justify-content: space-between;
     padding: 0 16px;
-  }
-
-  .activity-panel-collapsed .activity-rail-toggle span:last-child {
-    writing-mode: horizontal-tb;
   }
 
   .settings-editor-fields {
@@ -2568,6 +2806,14 @@ textarea:disabled {
   .settings-editor-fields .primary-button {
     grid-column: auto;
     justify-self: stretch;
+  }
+
+  .settings-inline-help {
+    grid-column: auto;
+  }
+
+  .settings-editor-fields .model-profile-summary {
+    grid-column: auto;
   }
 
   .settings-heading > .quiet-button,
