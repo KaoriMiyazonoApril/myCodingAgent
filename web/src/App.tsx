@@ -62,7 +62,10 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState<string | null>(null);
   const [showProviderSettings, setShowProviderSettings] = useState(false);
-  const [workspace, setWorkspace] = useState<WorkspaceRecord | null>(null);
+  const [nextThreadWorkspace, setNextThreadWorkspace] =
+    useState<WorkspaceRecord | null>(null);
+  const [activeThreadWorkspace, setActiveThreadWorkspace] =
+    useState<WorkspaceRecord | null>(null);
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false);
   const [nextThreadSelection, setNextThreadSelection] =
     useState<NextThreadSelection | null>(null);
@@ -101,6 +104,20 @@ export function App() {
   const effectiveModel = resolvedNextThreadSelection?.model ?? "";
   const providerReady =
     resolvedNextThreadSelection !== null && Boolean(effectiveModel.trim());
+  const creationWorkspace = nextThreadWorkspace ?? activeThreadWorkspace;
+  const displayedWorkspace = activeThreadWorkspace ?? nextThreadWorkspace;
+
+  const handleActiveWorkspaceChange = useCallback(
+    (next: WorkspaceRecord | null) => {
+      setActiveThreadWorkspace(next);
+      if (next !== null) {
+        setNextThreadWorkspace((current) =>
+          current?.canonical_path === next.canonical_path ? null : current,
+        );
+      }
+    },
+    [],
+  );
 
   const settingsOpen = showProviderSettings || editing !== null;
 
@@ -132,7 +149,13 @@ export function App() {
         </div>
         <div className="topbar-context">
           <ProjectSelector
-            workspace={workspace}
+            workspace={displayedWorkspace}
+            nextWorkspace={
+              activeThreadWorkspace !== null &&
+              nextThreadWorkspace?.canonical_path !== activeThreadWorkspace.canonical_path
+                ? nextThreadWorkspace
+                : null
+            }
             onOpenProject={() => setWorkspaceDialogOpen(true)}
           />
           <ModelSelector
@@ -189,8 +212,8 @@ export function App() {
           <ThreadPanel
             providers={providers}
             providerReady={providerReady}
-            workspace={workspace}
-            onWorkspaceRecovered={setWorkspace}
+            workspace={creationWorkspace}
+            onActiveWorkspaceChange={handleActiveWorkspaceChange}
             selectedProviderId={effectiveProviderId}
             selectedModel={effectiveModel}
             onOpenProject={() => setWorkspaceDialogOpen(true)}
@@ -217,7 +240,11 @@ export function App() {
         open={workspaceDialogOpen}
         onClose={() => setWorkspaceDialogOpen(false)}
         onSelect={(selectedWorkspace) => {
-          setWorkspace(selectedWorkspace);
+          setNextThreadWorkspace(
+            selectedWorkspace.canonical_path === activeThreadWorkspace?.canonical_path
+              ? null
+              : selectedWorkspace,
+          );
           setWorkspaceDialogOpen(false);
         }}
       />
@@ -227,9 +254,11 @@ export function App() {
 
 function ProjectSelector({
   workspace,
+  nextWorkspace,
   onOpenProject,
 }: {
   workspace: WorkspaceRecord | null;
+  nextWorkspace: WorkspaceRecord | null;
   onOpenProject: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -283,6 +312,9 @@ function ProjectSelector({
           ) : (
             <p className="menu-empty">暂无最近项目</p>
           )}
+          {nextWorkspace ? (
+            <p className="menu-label">下个对话：{nextWorkspace.display_name}</p>
+          ) : null}
           <button
             type="button"
             role="menuitem"
@@ -297,7 +329,7 @@ function ProjectSelector({
             }}
           >
             <span aria-hidden="true">＋</span>
-            打开项目…
+            为新对话打开项目…
           </button>
         </div>
       ) : null}
@@ -931,7 +963,7 @@ type ThreadPanelProps = {
   providers: ProviderView[];
   providerReady: boolean;
   workspace: WorkspaceRecord | null;
-  onWorkspaceRecovered: (workspace: WorkspaceRecord) => void;
+  onActiveWorkspaceChange: (workspace: WorkspaceRecord | null) => void;
   selectedProviderId: string | null;
   selectedModel: string;
   onOpenProject: () => void;
@@ -942,7 +974,7 @@ function ThreadPanel({
   providers,
   providerReady,
   workspace,
-  onWorkspaceRecovered,
+  onActiveWorkspaceChange,
   selectedProviderId,
   selectedModel,
   onOpenProject,
@@ -1035,9 +1067,6 @@ function ThreadPanel({
         if (mounted) {
           setThreads(response);
           setActiveId((current) => current ?? response[0]?.snapshot.thread_id ?? null);
-          if (response[0]?.workspace) {
-            onWorkspaceRecovered(response[0].workspace);
-          }
           setError(null);
         }
       })
@@ -1054,13 +1083,11 @@ function ThreadPanel({
     return () => {
       mounted = false;
     };
-  }, [onWorkspaceRecovered]);
+  }, []);
 
   useEffect(() => {
-    if (active?.workspace) {
-      onWorkspaceRecovered(active.workspace);
-    }
-  }, [active, onWorkspaceRecovered]);
+    onActiveWorkspaceChange(active?.workspace ?? null);
+  }, [active, onActiveWorkspaceChange]);
 
   const replaceThread = useCallback((next: ThreadView) => {
     setThreads((current) =>

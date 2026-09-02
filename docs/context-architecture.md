@@ -168,7 +168,11 @@ activated before the first provider request without a synthetic assistant/tool e
 as a deterministic, aggregate, bounded late section. Loaded state and diagnostics are reset for every Turn,
 while durable `skill_loaded` events and the read-only Skills popover expose metadata. A model-driven load
 remains a real tool call/result in canonical history (including its bounded body), and is not projected again;
-an explicit preflight load is projection-only, so no fabricated call is added to the thread snapshot.
+an explicit preflight load is projection-only, so no fabricated call is added to the thread snapshot. The
+`read_file` tool schema directs the model to use `skill(name)` as the full-instruction loading entry point.
+Direct `read_file` access to a catalog root `SKILL.md` fails with `SKILL_TOOL_REQUIRED`; files that
+the loaded Skill references remain available through normal local tools. This guard prevents duplicate or
+unobservable instruction loading without changing either activation path or Context placement.
 
 ## Thread settings and capabilities
 

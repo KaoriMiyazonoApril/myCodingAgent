@@ -57,6 +57,28 @@ def test_local_tools_accept_an_explicit_command_sandbox_backend(tmp_path) -> Non
     assert result.metadata["stdout"] == "deterministic"
 
 
+def test_read_file_requires_the_skill_tool_for_catalog_skill_instructions(
+    tmp_path: Path,
+) -> None:
+    skill_file = tmp_path / ".agents" / "skills" / "alpha" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text("private skill body", encoding="utf-8")
+    registry = create_local_tool_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCallBlock(
+            id="read-skill-directly",
+            name="read_file",
+            arguments={"path": ".agents/skills/alpha/SKILL.md"},
+        )
+    )
+
+    assert result.error_code == "SKILL_TOOL_REQUIRED"
+    assert "private skill body" not in result.content
+    assert "skill" in result.content
+    assert "Never use this" in registry.lookup("read_file").description  # type: ignore[union-attr]
+
+
 def test_closing_local_tool_registry_releases_sandbox_once(tmp_path) -> None:
     backend = DeterministicSandboxBackend()
     registry = create_local_tool_registry(tmp_path, sandbox_backend=backend)

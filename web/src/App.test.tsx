@@ -517,6 +517,88 @@ test("navigates Host workspaces and selects the current directory", async () => 
   );
 });
 
+test("opening a directory stages it for a new conversation without rebinding the active one", async () => {
+  const active = appThread("thread-first");
+  active.snapshot.workspace = "/workspace/first";
+  active.workspace = {
+    workspace_id: "workspace-first",
+    path: "/workspace/first",
+    canonical_path: "/workspace/first",
+    display_name: "first",
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? "GET";
+      if (path === "/api/threads") {
+        return {
+          ok: true,
+          json: async () => ({ schema_version: 1, threads: [active] }),
+        } as Response;
+      }
+      if (path === "/api/workspaces/select" && method === "POST") {
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            workspace: {
+              workspace_id: "workspace-second",
+              path: "/workspace/second",
+              canonical_path: "/workspace/second",
+              display_name: "second",
+            },
+          }),
+        } as Response;
+      }
+      if (path.startsWith("/api/workspaces")) {
+        const inSecond = path.includes("%2Fworkspace%2Fsecond");
+        return {
+          ok: true,
+          json: async () => ({
+            schema_version: 1,
+            path: inSecond ? "/workspace/second" : "/workspace",
+            parent: inSecond ? "/workspace" : null,
+            roots: ["/workspace"],
+            entries: inSecond
+              ? []
+              : [{ name: "second", path: "/workspace/second", type: "directory" }],
+            truncated: false,
+          }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          schema_version: 1,
+          default_provider_id: "deepseek",
+          providers: [{
+            provider_id: "deepseek",
+            display_name: "DeepSeek",
+            configured: true,
+            credential_mask: "••••test",
+            selected_model: "deepseek-chat",
+            is_default: true,
+          }],
+        }),
+      } as Response;
+    }),
+  );
+
+  render(<App />);
+  const project = await screen.findByRole("button", { name: "当前项目：first" });
+  fireEvent.click(project);
+  fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
+  const dialog = await screen.findByRole("dialog");
+  fireEvent.click(within(dialog).getByRole("button", { name: "打开 second" }));
+  await within(dialog).findByText("/workspace/second");
+  fireEvent.click(within(dialog).getByRole("button", { name: "使用此项目" }));
+
+  expect(await screen.findByRole("button", { name: "当前项目：first" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "当前项目：first" }));
+  expect(await screen.findByText("下个对话：second")).toBeInTheDocument();
+});
+
 test("keeps workspace errors visible with a reload action", async () => {
   vi.stubGlobal(
     "fetch",
@@ -937,11 +1019,19 @@ test("creates switches refreshes and closes Host threads", async () => {
   fireEvent.click(screen.getByRole("button", { name: "当前项目：old" }));
   fireEvent.click(await screen.findByRole("menuitem", { name: /打开项目/ }));
   fireEvent.click(await screen.findByRole("button", { name: "使用此项目" }));
-  await screen.findByRole("button", { name: "当前项目：project" });
+  expect(
+    await screen.findByRole("button", { name: "当前项目：old" }),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "当前项目：old" }));
+  expect(await screen.findByText("下个对话：project")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "当前项目：old" }));
   fireEvent.click(screen.getByRole("button", { name: "新对话" }));
 
   expect(
     await screen.findByRole("heading", { name: "新对话" }),
+  ).toBeInTheDocument();
+  expect(
+    await screen.findByRole("button", { name: "当前项目：project" }),
   ).toBeInTheDocument();
   expect(
     screen.getByRole("heading", { name: "想让编码助手做什么？" }),

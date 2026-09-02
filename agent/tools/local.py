@@ -25,6 +25,7 @@ MAX_SEARCH_LINE_CHARS = 100_000
 MAX_SEARCH_DURATION_SECONDS = 5.0
 REGEX_TIMEOUT_SECONDS = 0.05
 MAX_READ_RETURN_BYTES = 256 * 1024
+WORKSPACE_SKILL_DIRECTORIES = frozenset({".agents", ".claude", ".opencode"})
 
 
 def _object_schema(
@@ -64,6 +65,26 @@ def _matches_relative_glob(path: str, pattern: str) -> bool:
 def _read_file(filesystem: WorkspaceFilesystem, arguments: dict[str, object]) -> ToolResult:
     offset = cast(int, arguments["offset"])
     limit = cast(int, arguments["limit"])
+
+    _, relative = filesystem.resolve(arguments.get("path"))
+    canonical_parts = PurePosixPath(relative).parts
+    requested_parts = PurePosixPath(cast(str, arguments["path"])).parts
+    skill_parts = next(
+        (
+            parts
+            for parts in (canonical_parts, requested_parts)
+            if len(parts) == 4
+            and parts[0] in WORKSPACE_SKILL_DIRECTORIES
+            and parts[1] == "skills"
+            and parts[3] == "SKILL.md"
+        ),
+        None,
+    )
+    if skill_parts is not None:
+        raise ToolOperationError(
+            "SKILL_TOOL_REQUIRED",
+            f"load Skill {skill_parts[2]!r} with skill(name); do not read SKILL.md with read_file",
+        )
 
     page = filesystem.read_text_page_bounded(
         arguments.get("path"),
@@ -338,7 +359,10 @@ def create_local_tool_registry(
     registry.register(
         ToolDefinition(
             name="read_file",
-            description="Read a UTF-8 text file with one-based line pagination.",
+            description=(
+                "Read a UTF-8 text file with one-based line pagination. "
+                "Never use this for a catalog Skill's SKILL.md; load it with skill(name)."
+            ),
             parameters=_object_schema(
                 {
                     "path": {"type": "string", "minLength": 1},

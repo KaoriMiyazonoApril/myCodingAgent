@@ -198,6 +198,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - The requested directory is canonically checked at access time. The listing performs one `scandir`; ordinary children use `DirEntry` metadata and lexical child paths, while symlink entries alone receive strict canonical containment checks. Internal directory aliases can be navigated, while aliases whose effective target escapes an allowed root are omitted or rejected.
 - The Web dialog caches successful listings for its open cycle. A reload explicitly bypasses that cache, and closing the dialog clears it; this cache is presentation state and never weakens Host containment checks.
 - `POST /api/workspaces/select` explicitly creates or reuses an in-memory Host Workspace record. The record contains an opaque id, canonical path, and display name; it is the only input accepted by Thread creation.
+- A Thread's Workspace binding is immutable. The Web separately owns the active Thread Workspace display and a next-Thread Workspace draft; selecting a directory during an active conversation never rebinds that conversation.
 - Missing, inaccessible, invalid, and root-escape requests receive distinct stable errors. Workspace selection does not replace Runtime lease and per-access filesystem checks.
 
 ### HTTP commands and DTOs
@@ -244,7 +245,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Host errors are never swallowed. The UI distinguishes disconnected Host, invalid workspace, missing Thread, Provider authentication/availability, rejected Turn, failed Turn, failed tool, failed settings update, and failed cancellation.
 - The SSE client reconnects automatically with bounded backoff, keeps current Snapshot-derived UI during disconnection, and refetches the hydratable Thread view when recovery cannot continue.
 - Opening the Workspace dialog immediately renders the Host filesystem browser. Selecting the current directory creates or reuses a Host Workspace record; no operating-system picker or browser-owned path conversion is involved.
-- Skills presentation keeps loaded and available items in disjoint buckets and shows the activation source (`explicit` or `tool`) and placement (`working_tail` or `tool_history`) supplied by Runtime. It does not alter progressive-disclosure loading or working-tail semantics.
+- Skills presentation keeps loaded and available items in disjoint buckets and shows the activation source (`explicit` or `tool`) and placement (`working_tail` or `tool_history`) supplied by Runtime. Catalog root instructions are loaded only through `skill(name)`; `read_file` reports `SKILL_TOOL_REQUIRED` for those `SKILL.md` paths while leaving referenced files readable. This does not alter progressive-disclosure loading or working-tail semantics.
 - The secondary execution panel is labelled `运行详情`, with compact `运行` / `修改` tabs at narrow widths; collapsed controls use horizontal labels and do not rely on CSS `writing-mode`.
 - At widths below 1024 pixels, Thread navigation becomes a toggleable sidebar and Activity becomes a drawer or tab. Conversation and Composer remain available. V1 is desktop-first rather than a separate mobile product.
 - Interactive controls support keyboard use and visible focus. Status meaning uses text/icon in addition to color, and failures are announced in persistent visible UI.

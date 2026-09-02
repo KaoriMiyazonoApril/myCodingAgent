@@ -53,7 +53,8 @@ agent web \
 未指定 root 时从 Host 的 `/` 开始浏览；启动命令所在目录不再隐式成为授权边界。
 Workspace Dialog 通过 Host browser 列出、导航并显式选择目录，选择后 Host 创建带有
 `workspace_id`、规范化路径和显示名称的内存 Workspace 记录。目录中的内部 symlink
-按实际规范化目标处理，Agent 工具仍在每次访问时执行 workspace containment 校验。
+按实际规范化目标处理，Agent 工具仍在每次访问时执行 workspace containment 校验。Thread
+创建后目录绑定不可更改；对话期间另选目录只会成为下一个新 Thread 的目录。
 
 ## Provider Setup
 
@@ -123,7 +124,9 @@ Context 组装、历史选择/裁剪/压缩、项目指令、运行时环境和�
 assistant/tool ToolResult 进入 chronological history，不在下一请求重复投影全文。Task plan 通过 `update_plan` 原子替换，命令
 执行产生受限的 mutation/validation/failure/artifact evidence；模型可通过本地 `skill(name)` 工具
 按需加载本地 `SKILL.md`。显式 `$skill-name` 会在首个模型请求前加载且不伪造 tool call；模型实际
-调用产生的 bounded ToolResult 仍按 canonical history 规则保留。
+调用产生的 bounded ToolResult 仍按 canonical history 规则保留。Catalog Skill 的根 `SKILL.md`
+不能通过 `read_file` 绕过加载入口；该请求会返回 `SKILL_TOOL_REQUIRED`，Skill 引用的其他文件仍可
+在完整指令加载后按需读取。
 
 Web 工作区的对话设置支持 provider/model、Thinking、能力允许时的 Thinking intensity 与
 approval mode；temperature、output limit、budget、context 和 agent limits 保留在 transport/runtime
