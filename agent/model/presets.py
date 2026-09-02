@@ -20,6 +20,7 @@ from .types import (
 DEEPSEEK_CAPABILITIES = ProviderCapabilities(
     reasoning_retention=ReasoningRetention.TOOL_CHAIN_ONLY,
     reasoning_input_field="reasoning_content",
+    reasoning_output_fields=("reasoning_content",),
     requires_assistant_content_for_tool_calls=True,
     thinking=ThinkingCapabilities(supported=True),
     working_tail_mode=WorkingTailMode.STRUCTURED_USER_TAIL,
@@ -28,6 +29,7 @@ DEEPSEEK_CAPABILITIES = ProviderCapabilities(
 KIMI_CAPABILITIES = ProviderCapabilities(
     reasoning_retention=ReasoningRetention.ALWAYS,
     reasoning_input_field="reasoning_content",
+    reasoning_output_fields=("reasoning_content",),
     thinking=ThinkingCapabilities(
         supported=True,
         supported_keep_values=("none", "all"),
@@ -38,6 +40,7 @@ KIMI_CAPABILITIES = ProviderCapabilities(
 GLM_CAPABILITIES = ProviderCapabilities(
     reasoning_retention=ReasoningRetention.TOOL_CHAIN_ONLY,
     reasoning_input_field="reasoning_content",
+    reasoning_output_fields=("reasoning_content",),
     thinking=ThinkingCapabilities(supported=True),
     working_tail_mode=WorkingTailMode.STRUCTURED_USER_TAIL,
 )
@@ -75,6 +78,11 @@ def _kimi_profiles() -> dict[str, ModelProfile]:
             display_name="Kimi K3",
             description="Kimi K3，1M 上下文，Thinking 始终开启。",
             context_window_tokens=1_000_000,
+            # K3's Chat API uses max_completion_tokens.  The unified resolver
+            # supplies this request default; the adapter only maps the field
+            # name and never invents a limit.
+            model_max_output_tokens=1_048_576,
+            default_request_max_tokens=131_072,
             thinking=ThinkingCapabilities(
                 supported=True,
                 default_enabled=True,
@@ -113,11 +121,17 @@ def _kimi_profiles() -> dict[str, ModelProfile]:
             model_id="kimi-k2.6",
             display_name="Kimi K2.6",
             description="Kimi K2.6，256K 上下文，Thinking 可关闭。",
+            # K2.6 defaults to not preserving historical reasoning; an
+            # explicit ThinkingRequest(keep="all") opts into replay.
+            reasoning_retention=ReasoningRetention.NEVER,
             context_window_tokens=256_000,
             thinking=ThinkingCapabilities(
                 supported=True,
                 default_enabled=True,
                 toggle_supported=True,
+                # K2.6 optionally accepts preserved thinking.  This is an
+                # internal capability; ordinary Host projections omit it.
+                supported_keep_values=("all",),
             ),
             thinking_parameter_style=ThinkingParameterStyle.KIMI_TOGGLE,
         ),
@@ -126,26 +140,12 @@ def _kimi_profiles() -> dict[str, ModelProfile]:
 
 def _glm_profiles() -> dict[str, ModelProfile]:
     return {
-        "glm-5.3": ModelProfile(
-            model_id="glm-5.3",
-            display_name="GLM-5.3",
-            description="GLM-5.3，1M 上下文，Thinking 始终开启。",
-            context_window_tokens=1_000_000,
-            thinking=ThinkingCapabilities(
-                supported=True,
-                default_enabled=True,
-                toggle_supported=False,
-                intensity_supported=True,
-                intensity_options=("low", "high", "max"),
-                default_intensity="max",
-            ),
-            thinking_parameter_style=ThinkingParameterStyle.GLM,
-        ),
         "glm-5.2": ModelProfile(
             model_id="glm-5.2",
             display_name="GLM-5.2",
             description="GLM-5.2，1M 上下文，Thinking 可关闭并支持强度。",
             context_window_tokens=1_000_000,
+            model_max_output_tokens=128_000,
             thinking=ThinkingCapabilities(
                 supported=True,
                 default_enabled=True,

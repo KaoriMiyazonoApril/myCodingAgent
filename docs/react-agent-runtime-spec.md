@@ -76,7 +76,9 @@ workspace，也不保存 Provider secret 或进程运行时对象。独立 Host 
   link syscall 禁令；该安全规则已被 autonomous workspace 设计取代，不再约束当前 backend。
 - Ticket 03 已实现多 Turn 与设置冻结：`Conversation` 独占合法历史，Runtime 通过公开
   provider 配置 ID 和模型解析每个 Turn 的 `LLMProvider`，`ModelInvoker` 将冻结的
-  temperature、max tokens 与 allowlisted thinking 设置应用于整个工具链。默认设置更新
+  temperature、max tokens 与 allowlisted thinking 设置应用于整个工具链。普通 Web 基础设置
+  不展示 transport-only 的 temperature/max output/budget/keep；这些字段仍由 Runtime 内部
+  冻结以保持请求契约。默认设置更新
   使用单调版本和 `SETTINGS_CONFLICT`；`TurnSettingsOverride` 以 `UNSET` 区分继承和显式
   `None`，因此可以只覆盖一个字段且不改写 Thread 默认值。每个 provider 实例暴露所选
   模型的 `ThinkingCapabilities`，Runtime 在请求前验证 thinking 开关、budget 和 keep，
@@ -99,9 +101,9 @@ workspace，也不保存 Provider secret 或进程运行时对象。独立 Host 
   event ID 游标读取，游标已淘汰时返回 `cursor_expired = true`，调用方据此重新读取
   Snapshot。reasoning 默认不进入任何公开状态或普通事件；仅当后端显式配置 `debug` 时，
   才紧随模型响应发出独立的 `model_reasoning` 事件。
-- Ticket 05 已实现 Turn 运行控制：`ModelInvoker` 仅对 retryable `LLMError` 在三次总尝试
+- Ticket 05 已实现 Turn 运行控制：`ModelInvoker` 仅对 retryable `LLMError` 在五次总尝试
   内重试；`RunController` 统一累计模型迭代、工具调用、usage、执行 deadline 与连续相同
-  失败指纹。公开 `AgentLimits` 提供 20 次迭代、50 次工具调用和 15 分钟执行时间的默认值，
+ 失败指纹。公开 `AgentLimits` 提供 60 次迭代、200 次工具调用和 60 分钟执行时间的默认值，
   并对调用方输入设置硬上限。预算终止返回带具体 `stop_reason` 的
   `LIMIT_REACHED` Summary；连续三次相同失败是固定的运行保护规则，而不是调用方可放宽的
   设置，同时为同一批次内未执行的工具调用补齐结构化结果。
@@ -182,7 +184,7 @@ workspace，也不保存 Provider secret 或进程运行时对象。独立 Host 
   不可变 `TurnConfig` 并在构造时校验，事件 emitter 只读取该 Turn 冻结的值。
 - Review Ticket 05 已收口最终验收证据：真实 `OpenAICompatibleProvider` 的非法 raw tool
   arguments 会原样穿过 Runtime 历史、事件与下一次模型请求，同时产生匹配的
-  `INVALID_ARGUMENTS` 结果并继续循环；测试还显式锁定设置版本 0、20/50/900 默认预算、
+  `INVALID_ARGUMENTS` 结果并继续循环；测试还显式锁定设置版本 0、60/200/3600 默认预算、
   四个活跃 Turn 的默认全局上限，以及 Event、Snapshot、Summary 和最终工具历史的一致性。
   原 Runtime tickets 05–10 与本组 review tickets 均已同步为完成状态。
 
@@ -226,11 +228,11 @@ workspace，也不保存 Provider secret 或进程运行时对象。独立 Host 
 36. As a maintainer, I want budget and cancellation checks hidden behind a run controller, so that termination rules have one source of truth.
 37. As a maintainer, I want file change tracking hidden behind one module, so that diff and conflict semantics are consistent for every write tool.
 38. As a maintainer, I want workspace overlap logic hidden behind a lease manager, so that every caller uses the same path rules.
-39. As a runtime author, I want retryable LLM failures retried at most three times, so that transient provider failures can recover without an infinite loop.
+39. As a runtime author, I want retryable LLM failures retried at most five attempts with bounded backoff, so that transient provider failures can recover without an infinite loop.
 40. As a runtime author, I want authentication, validation, and other non-retryable LLM failures to fail immediately, so that deterministic errors are not amplified.
-41. As a runtime author, I want a maximum of 20 model iterations per turn by default, so that a confused agent cannot loop indefinitely.
-42. As a runtime author, I want a maximum of 50 tool calls per turn by default, so that one response chain cannot exhaust local resources.
-43. As a runtime author, I want a 15-minute execution budget per turn by default, so that abandoned work eventually terminates.
+41. As a runtime author, I want a maximum of 60 model iterations per turn by default, so that a confused agent cannot loop indefinitely.
+42. As a runtime author, I want a maximum of 200 tool calls per turn by default, so that one response chain cannot exhaust local resources.
+43. As a runtime author, I want a 60-minute execution budget per turn by default, so that abandoned work eventually terminates.
 44. As a runtime author, I want a default global concurrency limit of four active turns, so that independent work remains bounded.
 45. As a runtime author, I want identical tool name, normalized arguments, and error code repeated three times to terminate the turn, so that deterministic failure loops stop early.
 46. As a coding-agent user, I want budget exhaustion reported as `LIMIT_REACHED`, so that an incomplete turn is not presented as success.
@@ -281,18 +283,18 @@ workspace，也不保存 Provider secret 或进程运行时对象。独立 Host 
 - `ThreadRuntime` is the highest external seam and the primary test surface. Its small interface covers Thread creation, settings updates, Turn submission, cancellation, approval resolution, event consumption, snapshot retrieval, and Thread closure. Transport adapters call this interface rather than reaching into Agent Loop modules.
 - The Agent Loop is deliberately narrow: request a model response, append the assistant message, finish if no tool calls exist, otherwise execute all calls in order and append all matching tool results. It does not implement retry, Policy, event serialization, file diffing, workspace locking, or provider-specific reasoning rules inline.
 - `Conversation` owns ordered internal `Message` values and constructs each model request history. It preserves valid tool-call/tool-result pairings and delegates provider-specific reasoning encoding to existing model capabilities. Switching models between Turns retains text and tool history while allowing the selected provider adapter to filter reasoning according to its capabilities.
-- `ModelInvoker` wraps the existing `LLMProvider` seam. It applies immutable Turn generation settings and retries only errors whose existing taxonomy marks `retryable`. The default is at most three attempts with short exponential backoff. Authentication, invalid request, configuration, and response-parse failures do not retry.
+- `ModelInvoker` wraps the existing `LLMProvider` seam. It applies immutable Turn generation settings and retries only errors whose existing taxonomy marks `retryable`. The default is at most five total attempts with 0.5/1/2/4-second backoff. A streaming retry is allowed only before any delta; once a delta is emitted, that attempt fails without replaying or duplicating prior output. Authentication, invalid request, configuration, and response-parse failures do not retry.
 - `ToolCoordinator` wraps the existing `ToolRegistry` execution seam without moving tool capability behavior into the Runtime. It executes calls sequentially, consults Policy, manages an approval pause, emits lifecycle events, propagates cancellation, converts results to conversation blocks, and ensures every accepted call receives a corresponding result.
 - Synchronous registry executors run in worker threads that cannot be forcibly stopped by coroutine cancellation. Their async dispatch therefore defers cancellation propagation until the worker is quiescent and marks the reconciled result internally. `RunController` returns only that marked result to `ToolCoordinator`, which records its actual history and file effects before a cancellation or deadline checkpoint terminates the Turn. The workspace lease remains held throughout this reconciliation.
 - Policy has three decisions: `ALLOW`, `DENY`, and `REQUIRE_APPROVAL`. The initial adapter allows all valid calls. `DENY` produces a safe `POLICY_DENIED` tool result. `REQUIRE_APPROVAL` changes the Thread to `WAITING_APPROVAL`, stops launching later calls, and awaits an external decision or an independent approval timeout.
-- `RunController` is the single source of truth for one Turn's maximum iterations, maximum tool calls, execution deadline, cancellation, approval-clock suspension, and repeated-failure detection. `ThreadRuntime` owns the shared active-Turn capacity. Defaults are 20 model iterations, 50 tool calls, 15 minutes of execution time, three identical consecutive failures, and four active Turns globally.
+- `RunController` is the single source of truth for one Turn's maximum iterations, maximum tool calls, execution deadline, cancellation, approval-clock suspension, and repeated-failure detection. `ThreadRuntime` owns the shared active-Turn capacity. Defaults are 60 model iterations, 200 tool calls, 60 minutes of execution time, five total model attempts with 0.5/1/2/4-second backoff, a 1,800-second approval timeout, three identical consecutive failures, and four active Turns globally. Approval waiting pauses only its independent approval clock and does not consume the active Turn execution deadline.
 - A repeated failure fingerprint consists of tool name, canonically normalized arguments, and error code. Only three consecutive identical fingerprints stop a Turn. Different failed operations do not count as one repeated sequence.
 - Normal completion occurs only when the assistant response contains no tool calls. Budget exhaustion and repeated failure produce `LIMIT_REACHED` with an exact stop reason. Cancellation produces `CANCELLED`. Non-retryable model or Runtime failures produce `FAILED`. Ordinary tool errors remain in the loop.
 - `ThreadSettings` contains the public defaults used by future Turns and has a monotonically increasing version. An update supplies its expected version; stale writes fail with `SETTINGS_CONFLICT`. Every accepted update appends a Thread-scoped `settings_updated` event carrying the new version and selected provider/model identity; its `turn_id` is null because the update is not owned by an active Turn. Settings accepted during an active Turn affect only subsequent Turns.
 - Thread creation may supply one initial `ModelSettings` value, which is converted directly to version-zero `ThreadSettings`; callers that omit it continue to receive the Runtime defaults.
 - `TurnConfig` is an immutable snapshot created when a Turn starts. A field-level `TurnSettingsOverride` is merged with Thread defaults first; an internal `UNSET` sentinel means inherit while explicit `None` clears an optional value for that Turn. The snapshot contains provider configuration reference, public model name, temperature, maximum output tokens, supported thinking options, PromptBuilder output, reasoning visibility, and effective Agent limits. Values cannot change during the Turn.
-- Frontend-controllable provider data is allowlisted. The public settings include provider configuration ID, public model, temperature, maximum output tokens, supported thinking options, and bounded Agent limits. API keys, base URLs, raw provider bodies, credentials, and backend hard ceilings are not public settings.
-- Thinking request fields are fail-closed against the selected model's `ThinkingCapabilities` before the first model request. Provider defaults may be refined by exact-model `ModelProfile` overrides; unsupported thinking, budget, or keep values return `UNSUPPORTED_MODEL_SETTING` rather than passing an unchecked private body to the provider.
+- Frontend-controllable provider data is allowlisted. Runtime settings may carry transport-only temperature and maximum output tokens for compatibility, but ordinary Web Basic Settings exposes only provider configuration ID, public model, read-only context facts, supported thinking options, and approval mode. Internal `budget_tokens` / `keep`, API keys, base URLs, raw provider bodies, credentials, and backend hard ceilings are never Web settings.
+- Thinking request fields are fail-closed against the selected model's `ThinkingCapabilities` before the first model request. Provider defaults may be refined by exact-model `ModelProfile` overrides; unsupported thinking, budget, or keep values return `UNSUPPORTED_MODEL_SETTING` rather than passing an unchecked private body to the provider. The chain is provider-independent until the exact-model adapter seam (`ThinkingSettings -> ThinkingRequest -> wire payload`); unknown model profiles inherit no optional thinking, intensity, context, output, or reasoning-field capability.
 - The workspace reference is immutable after Thread creation. Selecting another folder requires another Thread so old message paths and diffs never change meaning.
 - `WorkspaceLeaseManager` normalizes real workspace roots and treats equal paths or ancestor/descendant relationships as overlapping. Multiple Threads may refer to overlapping roots, but only one overlapping Turn may hold a lease. A conflict fails immediately with `WORKSPACE_BUSY`; there is no implicit queue. A lease is held during `RUNNING` and `WAITING_APPROVAL` and released on every terminal path.
 - Before a Turn enters the loop, workspace validation checks only that the selected root still exists, is a readable directory, resolves canonically, and remains within the Host allowlist. It does not recursively scan the workspace or reject internal symlinks and hard-linked files. `WorkspaceLeaseManager` overlap/concurrency semantics remain unchanged.
@@ -309,7 +311,7 @@ workspace，也不保存 Provider secret 或进程运行时对象。独立 Host 
 - Public messages contain user and assistant text plus structured tool calls and safe tool results. System prompts, credentials, internal tracebacks, and raw reasoning are excluded from the ordinary message list.
 - `TurnSummary` contains Turn ID, status, stop reason, final assistant text, modified files, file diffs, diff completeness, iteration/tool-call counters, accumulated usage, start/end timestamps, and an optional safe error summary. It is the final result of one Turn, not the mutable state of the whole Agent.
 - Every `AgentEvent` has schema version, event ID, Thread ID, nullable Turn ID, a monotonically increasing Thread-scoped sequence, type, timestamp, and JSON-compatible payload. The shared bounded EventBuffer and event-ID cursor preserve total append order, while durable semantic events are mirrored through `ThreadStore`; model streaming deltas remain transient. Runtime reserves sequence ranges in bounded checkpoints (so a crash may leave gaps but never reuses an observed transient sequence), rather than committing once per delta. Stage-level types cover Turn lifecycle, complete model response, tool request/start/finish, approval request/resolution, file changes, settings updates, cancellation, completion, failure, and limit termination.
-- Reasoning transmission is backend-controlled by `reasoning_visibility`. The default `hidden` value emits no reasoning. Explicit `debug` emits a separate complete reasoning event after a model response; reasoning does not enter ordinary messages, summaries, or logs. The frontend may decide whether to render a reasoning event it has received.
+- Reasoning transmission is backend-controlled by `reasoning_visibility`, which accepts only `hidden` or explicit `debug`. The default `hidden` value emits no reasoning. Explicit `debug` emits separate controlled reasoning events after a model response; reasoning does not enter ordinary messages, summaries, or logs. The frontend may decide whether to render a reasoning event it has received. An assistant message with a tool call is an intermediate step: its narration text is excluded from ordinary public messages while canonical history remains complete.
 - Live events are kept in a bounded in-memory ring buffer and must never block Agent execution because a consumer is slow or absent. Durable semantic events are also restored from `ThreadStore`; the next Thread sequence continues after restart. A consumer whose live cursor expired retrieves a fresh Snapshot.
 - The separate Host transport maps Thread creation, versioned settings updates, Turn submission, cancellation, Snapshot retrieval, and Thread closure to HTTP commands and forwards Runtime events with SSE. Approval remains excluded from Web V1. The core Runtime still has no dependency on the Web framework.
 - Turn submission accepts a non-empty, at-most-200-character idempotency key and atomically requires the Thread to be `IDLE` for a new key. A matching retry joins the in-flight result or returns a detached completed Summary; reuse with different user text or settings override fails with `IDEMPOTENCY_CONFLICT`. The Host adapter consumes this behavior without moving it into transport code.

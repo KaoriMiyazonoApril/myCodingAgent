@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 import {
   cancelTurn,
@@ -39,15 +45,16 @@ import {
   applyAgentEvent,
   eventRequiresSnapshotRefresh,
   hydrateThread,
+  PROVISIONAL_TEXT_MAX_CHARS,
+  reconcileApprovalSnapshot,
   type ActivityState,
   type ApprovalRequest,
+  type ToolActivity,
 } from "./events";
 import "./styles.css";
 
 const DISABLED_CAPABILITIES: ThreadCapabilities = {
   thinking_supported: false,
-  supports_thinking_budget: false,
-  supported_keep_values: [],
 };
 
 type ApprovalAction = {
@@ -357,7 +364,7 @@ function ModelSelector({
   const selectedProfile =
     provider?.model_profiles?.find((item) => item.model_id === model) ?? null;
   const value = provider
-    ? `${provider.display_name} · ${model || provider.selected_model || "model not set"}`
+    ? `${provider.display_name} · ${model || provider.selected_model || "未设置模型"}`
     : "尚未配置模型";
 
   useEffect(() => {
@@ -751,6 +758,47 @@ function toolStatusLabel(status: ReturnType<typeof hydrateThread>["tools"][numbe
   }[status];
 }
 
+// Keep long Turns useful at a glance.  Active, waiting, and failed calls are
+// never hidden; only the oldest successful calls collapse into one summary.
+const TOOL_SUCCESS_DISPLAY_LIMIT = 12;
+
+type CompactToolActivity = {
+  tools: ToolActivity[];
+  hiddenSuccessCount: number;
+};
+
+function compactToolActivity(tools: ToolActivity[]): CompactToolActivity {
+  const successful = tools.filter((tool) => tool.status === "success");
+  const important = tools.filter((tool) => tool.status !== "success");
+  const recentSuccessful = successful.slice(-TOOL_SUCCESS_DISPLAY_LIMIT);
+  const visibleIds = new Set([
+    ...important.map((tool) => tool.id),
+    ...recentSuccessful.map((tool) => tool.id),
+  ]);
+  return {
+    tools: tools.filter((tool) => visibleIds.has(tool.id)),
+    hiddenSuccessCount: Math.max(0, successful.length - recentSuccessful.length),
+  };
+}
+
+function providerStatus(
+  provider: ProviderView,
+): { label: string; className: "ready" | "not-ready" | "error" } {
+  if (!provider.configured) {
+    return { label: "未配置", className: "not-ready" };
+  }
+  if (provider.catalog?.status === "ready") {
+    return { label: "已配置 · 已验证", className: "ready" };
+  }
+  if (provider.catalog?.status === "error") {
+    return { label: "已配置 · 验证失败", className: "error" };
+  }
+  if (provider.catalog?.status === "loading") {
+    return { label: "已配置 · 验证中", className: "ready" };
+  }
+  return { label: "已配置", className: "ready" };
+}
+
 function fileChangeLabel(changeType: string): string {
   return {
     modified: "已修改",
@@ -920,6 +968,7 @@ function ProviderRow({
   provider: ProviderView;
   onEdit: (providerId: string) => void;
 }) {
+  const status = providerStatus(provider);
   return (
     <article className="provider-row">
       <div className="provider-row-main">
@@ -930,9 +979,9 @@ function ProviderRow({
         {provider.description ? (
           <p className="provider-description">{provider.description}</p>
         ) : null}
-        <p className={`provider-state ${provider.configured ? "ready" : "not-ready"}`}>
+        <p className={`provider-state ${status.className}`}>
           <span className="status-dot" aria-hidden="true" />
-          {provider.configured ? "已配置" : "未配置"}
+          {status.label}
         </p>
         {provider.catalog?.status === "loading" ? (
           <p className="provider-catalog-status" role="status">正在同步模型目录…</p>
@@ -1282,7 +1331,7 @@ function ThreadPanel({
       ) : null}
       {active ? (
         <ActiveThreadView
-          key={`${active.snapshot.thread_id}:${active.snapshot.updated_at}:${active.submission?.accepted_at ?? "idle"}`}
+          key={active.snapshot.thread_id}
           thread={active}
           conversationTitle={threadTitle(active, localTitles[active.snapshot.thread_id])}
           pendingUserMessage={pendingUserMessages[active.snapshot.thread_id] ?? null}
@@ -1443,6 +1492,11 @@ function ActiveThreadView({
   const mountedRef = useRef(true);
   const threadId = thread.snapshot.thread_id;
   const submissionActive = thread.submission !== null;
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  // Scrolling is owned by the conversation container, not window.  Keep the
+  // user's intent in a ref so streaming renders never pull an intentional
+  // manual scroll back to the bottom.
+  const followConversationRef = useRef(true);
   // Candidate capability previews are authoritative for the draft values.
   // Start conservatively so opening Settings cannot briefly expose the
   // previous Thread's optional controls before the candidate request returns.
@@ -1673,8 +1727,51 @@ function ActiveThreadView({
     return () => client.stop();
   }, [initialCursor, onThread, submissionActive, threadId]);
 
+  const conversationContentVersion = [
+    state.messages.map((message) => `${message.id}:${message.text.length}`).join(","),
+    state.tools
+      .map((tool) => `${tool.id}:${tool.status}:${tool.result?.length ?? 0}`)
+      .join(","),
+    state.files.map((file) => `${file.path}:${file.diff.length}`).join(","),
+    state.approval?.approval_id ?? "",
+    state.provisional?.text.length ?? 0,
+    state.provisional?.text_truncated ? "truncated" : "",
+    state.provisional?.tool_calls.length ?? 0,
+    state.error?.code ?? "",
+    streamError ?? "",
+    showSettings ? "settings" : "",
+    showDetails ? "details" : "",
+  ].join("|");
+
+  useLayoutEffect(() => {
+    const container = scrollRef.current;
+    if (container === null) {
+      return;
+    }
+    if (followConversationRef.current) {
+      container.scrollTop = container.scrollHeight;
+    } else {
+      // Approval reconciliation can remove a card while the user is reading
+      // older messages. Clamp only if the browser itself made the old offset
+      // invalid; never force that reader to the bottom.
+      const maximum = Math.max(0, container.scrollHeight - container.clientHeight);
+      container.scrollTop = Math.min(container.scrollTop, maximum);
+    }
+  }, [conversationContentVersion]);
+
+  const handleConversationScroll = useCallback(() => {
+    const container = scrollRef.current;
+    if (container === null) {
+      return;
+    }
+    const distanceFromBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight;
+    followConversationRef.current = distanceFromBottom <= 96;
+  }, []);
+
   const turnActive = thread.submission !== null;
   const turnStatus = summaryText(state.terminal, "status") ?? "idle";
+  const compactedTools = compactToolActivity(state.tools);
   const displayedThreadStatus = turnActive ? "running" : thread.snapshot.status;
   const displayedTurnStatus = state.cancel_requested
     ? "cancel requested"
@@ -1707,7 +1804,11 @@ function ActiveThreadView({
         className={`thread-detail mobile-view-${mobileView === "conversation" ? "active" : "inactive"}`}
         aria-label="编码助手对话"
       >
-        <div className="thread-scroll">
+        <div
+          className="thread-scroll"
+          ref={scrollRef}
+          onScroll={handleConversationScroll}
+        >
           <div className="thread-detail-heading">
             <div className="thread-heading-copy">
               <h3>{conversationTitle}</h3>
@@ -1965,25 +2066,29 @@ function ActiveThreadView({
                     capabilitiesError
                   }
                   onClick={() =>
-                    onSaveSettings({
-                      ...thread.snapshot.settings,
-                      provider_config_id: settingsProvider,
-                      model: settingsModel.trim(),
-                      thinking: capabilities.thinking_supported
-                        ? {
-                            enabled:
-                              capabilities.thinking?.toggle_supported === false
-                                ? true
-                                : settingsThinking,
-                            budget_tokens: null,
-                            keep: null,
-                            ...(capabilities.thinking?.intensity_supported
-                              ? { intensity: settingsThinking ? settingsThinkingIntensity : null }
-                              : {}),
-                          }
-                        : null,
-                      approval_mode: settingsApprovalMode,
-                    })
+                    (() => {
+                      onSaveSettings({
+                        ...thread.snapshot.settings,
+                        provider_config_id: settingsProvider,
+                        model: settingsModel.trim(),
+                        thinking: capabilities.thinking_supported
+                          ? {
+                              enabled:
+                                capabilities.thinking?.toggle_supported === false
+                                  ? true
+                                  : settingsThinking,
+                              ...(capabilities.thinking?.intensity_supported
+                                ? { intensity: settingsThinking ? settingsThinkingIntensity : null }
+                                : {}),
+                            }
+                          : null,
+                        approval_mode: settingsApprovalMode,
+                      });
+                      // The Thread key is intentionally stable while an
+                      // authoritative update arrives, so close the editor
+                      // explicitly instead of relying on a remount.
+                      setShowSettings(false);
+                    })()
                   }
                 >
                   保存
@@ -2084,7 +2189,12 @@ function ActiveThreadView({
                       const next = await getThread(threadId);
                       if (mountedRef.current) {
                         onThread(next);
-                        setState(initialThreadState(next));
+                        // Approval resolution is an authoritative metadata
+                        // reconciliation. Preserve the live message/tool
+                        // projection and only replace the pending approval;
+                        // full hydration is reserved for reconnect/cursor
+                        // recovery snapshots.
+                        setState((current) => reconcileApprovalSnapshot(current, next));
                         if (accepted) {
                           setStreamError(null);
                         }
@@ -2268,7 +2378,12 @@ function ActiveThreadView({
                       <span>{state.tools.length}</span>
                     </div>
                     <div className="activity-tool-list" aria-label="工具执行摘要">
-                      {state.tools.map((tool) => (
+                      {compactedTools.hiddenSuccessCount > 0 ? (
+                        <p className="tool-compact-summary" role="status">
+                          已折叠 {compactedTools.hiddenSuccessCount} 项较早的已完成工具
+                        </p>
+                      ) : null}
+                      {compactedTools.tools.map((tool) => (
                         <article className={`activity-tool ${tool.status}`} key={tool.id}>
                           <span aria-hidden="true">
                             {tool.status === "success" ? "✓" : tool.status === "error" ? "×" : "○"}
@@ -2338,6 +2453,7 @@ function ConversationFeed({
   pendingUserMessage: string | null;
   onStarter: (value: string) => void;
 }) {
+  const compactedTools = compactToolActivity(state.tools);
   const showPendingUserMessage =
     pendingUserMessage !== null &&
     !state.messages.some(
@@ -2361,17 +2477,6 @@ function ConversationFeed({
             <p className="message-role">
               {message.role === "user" ? "你" : "编码助手"}
             </p>
-            {message.role === "assistant" && message.reasoning ? (
-              <details className="message-reasoning">
-                <summary>
-                  思考过程
-                  {message.reasoning.truncated
-                    ? `(已截断，共 ${message.reasoning.total_chars ?? "?"} 字符)`
-                    : ""}
-                </summary>
-                <p>{message.reasoning.text}</p>
-              </details>
-            ) : null}
             <p>{message.text}</p>
           </article>
         ))}
@@ -2383,23 +2488,21 @@ function ConversationFeed({
         ) : null}
         {state.provisional !== null &&
         (state.provisional.text ||
-          state.provisional.reasoning ||
           state.provisional.tool_calls.length > 0) ? (
           <article className="message assistant provisional-message" aria-live="polite">
             <p className="message-role">编码助手 · 正在生成</p>
-            {state.provisional.reasoning ? (
-              <details className="message-reasoning" open>
-                <summary>思考中…</summary>
-                <p>{state.provisional.reasoning}</p>
-              </details>
+            {state.provisional.text && state.provisional.tool_calls.length === 0 ? (
+              <p className="provisional-progress">
+                {state.provisional.text.slice(0, PROVISIONAL_TEXT_MAX_CHARS)}
+                {state.provisional.text_truncated ? "…" : ""}
+              </p>
             ) : null}
-            {state.provisional.text ? <p>{state.provisional.text}</p> : null}
             {state.provisional.tool_calls.length > 0 ? (
               <ul className="provisional-tool-calls">
                 {state.provisional.tool_calls.map((call) => (
                   <li key={call.index}>
                     <code>{call.name ?? "tool"}</code>
-                    {call.arguments ? <code>{call.arguments}</code> : null}
+                    {call.arguments ? <code>{call.arguments.slice(0, 240)}</code> : null}
                   </li>
                 ))}
               </ul>
@@ -2429,8 +2532,13 @@ function ConversationFeed({
             <h4>工作过程</h4>
             <span>{state.tools.length} 项</span>
           </div>
+          {compactedTools.hiddenSuccessCount > 0 ? (
+            <p className="tool-compact-summary" role="status">
+              已折叠 {compactedTools.hiddenSuccessCount} 项较早的已完成工具
+            </p>
+          ) : null}
           <div className="tool-list">
-            {state.tools.map((tool) => {
+            {compactedTools.tools.map((tool) => {
               const target = toolTarget(tool.arguments);
               return (
                 <article className={`tool-card ${tool.status}`} key={tool.id}>
@@ -2514,39 +2622,101 @@ function ConversationFeed({
 
 const ACTIVITY_LABELS: Record<ActivityState["phase"], string> = {
   thinking: "思考",
+  generating: "生成",
+  idle: "已完成",
+  // Legacy Host aliases are normalized by the reducer, but keep labels here
+  // for snapshots/events produced by an older client boundary.
   writing: "生成",
   acting: "工具调用",
 };
 
-function activitySeconds(activity: ActivityState, now: number): number {
-  const started = Date.parse(activity.since);
-  const anchorStart = Number.isFinite(started) ? started : now;
-  const endedAt =
-    activity.finished && activity.ended_at !== undefined
-      ? Date.parse(activity.ended_at)
-      : Number.NaN;
-  const anchorEnd = Number.isFinite(endedAt) ? endedAt : now;
-  return Math.max(0, anchorEnd - anchorStart) / 1000;
-}
+export function ModelActivityPill({ activity }: { activity: ActivityState }) {
+  const [clock, setClock] = useState<{
+    phase: ActivityState["phase"];
+    startedAt: number | null;
+    now: number;
+    frozenSeconds: number;
+    thinkingSeconds: number | null;
+  }>(() => ({
+    phase: activity.phase,
+    startedAt: null,
+    now: 0,
+    frozenSeconds: 0,
+    thinkingSeconds: null,
+  }));
 
-function ModelActivityPill({ activity }: { activity: ActivityState }) {
-  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (activity.finished) {
-      return;
+    // Capture each phase boundary in the local monotonic clock. The state
+    // update is deferred so the effect remains a subscription to the timer,
+    // while a delayed callback cannot charge the previous phase extra time.
+    const phaseStartedAt = performance.now();
+    const syncTimer = window.setTimeout(() => {
+      const current = performance.now();
+      setClock((previous) => {
+        const phaseChanged = previous.phase !== activity.phase;
+        const previousElapsed =
+          previous.startedAt === null
+            ? previous.frozenSeconds
+            : Math.max(
+                0,
+                ((phaseChanged ? phaseStartedAt : current) - previous.startedAt) / 1000,
+              );
+        const isFinished = activity.finished || activity.phase === "idle";
+        const thinkingSeconds =
+          activity.phase === "thinking" && phaseChanged
+            ? null
+            : previous.phase === "thinking" && (phaseChanged || isFinished)
+              ? previousElapsed
+              : previous.thinkingSeconds;
+        return {
+          phase: activity.phase,
+          startedAt: isFinished ? null : phaseStartedAt,
+          now: current,
+          frozenSeconds: isFinished ? previousElapsed : 0,
+          thinkingSeconds,
+        };
+      });
+    }, 0);
+    if (activity.finished || activity.phase === "idle") {
+      return () => window.clearTimeout(syncTimer);
     }
-    const timer = window.setInterval(() => setNow(Date.now()), 100);
-    return () => window.clearInterval(timer);
-  }, [activity.finished]);
+    const timer = window.setInterval(
+      () => setClock((previous) => ({ ...previous, now: performance.now() })),
+      100,
+    );
+    return () => {
+      window.clearTimeout(syncTimer);
+      window.clearInterval(timer);
+    };
+  }, [activity.phase, activity.finished]);
 
-  const seconds = activitySeconds(activity, now);
+  const phaseSynchronized = clock.phase === activity.phase;
+  const liveSeconds =
+    !phaseSynchronized || clock.startedAt === null
+      ? 0
+      : Math.max(0, (clock.now - clock.startedAt) / 1000);
+  const seconds =
+    activity.finished || activity.phase === "idle"
+      ? clock.frozenSeconds
+      : liveSeconds;
   const label = ACTIVITY_LABELS[activity.phase];
   const className = `model-activity model-activity-${activity.phase}${
-    activity.finished ? " model-activity-finished" : ""
+    activity.finished || activity.phase === "idle" ? " model-activity-finished" : ""
   }`;
+  const thinkingSeconds =
+    clock.thinkingSeconds ??
+    (!phaseSynchronized && clock.phase === "thinking" && clock.startedAt !== null
+      ? Math.max(0, (clock.now - clock.startedAt) / 1000)
+      : null);
+  const thinkingFrozen = thinkingSeconds !== null && activity.phase !== "thinking";
   return (
     <div className={className} role="status" aria-live="polite">
-      {activity.finished ? (
+      {thinkingFrozen ? (
+        <span className="model-activity-thinking-frozen">
+          思考 · {thinkingSeconds.toFixed(1)}s
+        </span>
+      ) : null}
+      {activity.finished || activity.phase === "idle" ? (
         <span>
           {label} · {seconds.toFixed(1)}s
         </span>

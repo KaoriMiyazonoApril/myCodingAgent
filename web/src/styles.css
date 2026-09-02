@@ -1276,8 +1276,36 @@ textarea:disabled {
   color: rgb(255 210 140);
 }
 
+.model-activity-generating:not(.model-activity-finished) {
+  border-color: rgb(99 227 154 / 46%);
+  color: var(--accent-strong);
+}
+
+.model-activity-idle {
+  border-color: var(--border-subtle);
+}
+
+.model-activity-thinking-frozen {
+  margin-right: 8px;
+  color: var(--muted);
+}
+
 .model-activity-finished {
   opacity: 0.85;
+}
+
+.tool-card.requested {
+  border-left-color: var(--warning);
+}
+
+.tool-compact-summary {
+  margin: 8px 0 0;
+  padding: 7px 9px;
+  border-left: 2px solid var(--border);
+  color: var(--muted);
+  background: rgb(25 37 58 / 42%);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .conversation-file-card {
@@ -1709,6 +1737,10 @@ textarea:disabled {
 
 .provider-row .provider-state.not-ready {
   color: var(--muted);
+}
+
+.provider-row .provider-state.error {
+  color: var(--danger);
 }
 
 .provider-model {
@@ -2343,6 +2375,17 @@ textarea:disabled {
   font-weight: 650;
 }
 
+.provisional-progress {
+  display: -webkit-box;
+  margin: 6px 0 0;
+  overflow: hidden;
+  color: var(--text-soft);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
 .message-reasoning {
   margin: 8px 0 6px;
   padding: 8px 10px;
@@ -2542,6 +2585,12 @@ textarea:disabled {
 .tool-detail-block > strong {
   color: var(--muted);
   font-size: 10px;
+}
+
+.tool-detail-block pre {
+  max-height: 220px;
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .tool-error-code {

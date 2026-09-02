@@ -133,12 +133,8 @@ def test_thread_create_list_and_get_use_runtime_snapshot_and_lazy_singleton(
     assert capabilities.status_code == 200
     assert capabilities.json()["capabilities"] == {
         "thinking_supported": False,
-        "supports_thinking_budget": False,
-        "supported_keep_values": [],
         "thinking": {
             "supported": False,
-            "supports_budget_tokens": False,
-            "supported_keep_values": [],
         },
     }
     assert second.status_code == 201
@@ -205,9 +201,9 @@ def test_thread_settings_conflict_close_and_closed_mutation_are_stable(
     assert settings["version"] == 1
     assert settings["provider_config_id"] == "glm"
     assert settings["limits"] == {
-        "max_iterations": 20,
-        "max_tool_calls": 50,
-        "max_execution_seconds": 900,
+        "max_iterations": 60,
+        "max_tool_calls": 200,
+        "max_execution_seconds": 3600,
     }
     assert stale.status_code == 409
     assert stale.json()["error"]["code"] == "SETTINGS_CONFLICT"
@@ -271,7 +267,8 @@ def test_candidate_capabilities_are_authoritative_for_settings_switches(tmp_path
         provider_config_id="moonshot",
         model="kimi-k2",
     )
-    assert supported["supports_thinking_budget"] is True
+    assert "supports_thinking_budget" not in supported
+    assert "supported_keep_values" not in supported
     assert unsupported["thinking_supported"] is False
 
     switched = host.update_settings(
@@ -304,8 +301,6 @@ def test_candidate_capabilities_are_authoritative_for_settings_switches(tmp_path
     )
     assert switched_back["snapshot"]["settings"]["thinking"] == {
         "enabled": True,
-        "budget_tokens": 512,
-        "keep": "all",
     }
 
 
@@ -333,12 +328,8 @@ def test_empty_candidate_capabilities_fail_closed_in_host_projection() -> None:
 
     assert candidate == {
         "thinking_supported": False,
-        "supports_thinking_budget": False,
-        "supported_keep_values": [],
         "thinking": {
             "supported": False,
-            "supports_budget_tokens": False,
-            "supported_keep_values": [],
         },
     }
     assert current == {"thinking_supported": True}

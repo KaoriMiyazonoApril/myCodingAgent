@@ -25,20 +25,32 @@ from agent.model.types import (
 from agent.tools.types import ToolDefinition
 
 from .message_assembler import MessageAssembler
-from .settings import TurnConfig
+from .settings import TurnConfig, _UNSET
+
+
+_UNSET_RESOLVED_OUTPUT_LIMIT = object()
 
 
 def resolve_output_limit(
-    explicit_max_tokens: int | None,
+    explicit_max_tokens: int | None | object,
     capabilities: ProviderCapabilities | None,
 ) -> int | None:
     """Resolve the single effective per-request output limit.
 
     Capability and policy stay separate: the model's officially verified
     maximum output only clamps; the Harness-internal default request limit
-    only applies when the Thread carries no explicit override.  ``None``
-    results mean "omit max_tokens, let the provider default apply".
+    only applies when the Thread carries no explicit override.  The settings
+    sentinel means "no override"; an explicit ``None`` means "omit
+    max_tokens" and therefore must not fall back to the Harness default.
     """
+    if explicit_max_tokens is not _UNSET and explicit_max_tokens is not None and (
+        isinstance(explicit_max_tokens, bool)
+        or not isinstance(explicit_max_tokens, int)
+        or explicit_max_tokens <= 0
+    ):
+        raise ValueError(
+            "explicit_max_tokens must be a positive integer, None, or unset"
+        )
 
     model_max = (
         None if capabilities is None else capabilities.model_max_output_tokens
@@ -48,11 +60,13 @@ def resolve_output_limit(
         if capabilities is None
         else capabilities.default_request_max_tokens
     )
-    if explicit_max_tokens is not None:
-        base = explicit_max_tokens
-    elif request_default is not None:
+    if explicit_max_tokens is _UNSET:
         base = request_default
+    elif explicit_max_tokens is None:
+        return None
     else:
+        base = explicit_max_tokens
+    if base is None:
         return None
     if model_max is not None:
         return min(base, model_max)
@@ -67,8 +81,8 @@ class ModelInvoker:
         provider: LLMProvider,
         config: TurnConfig,
         *,
-        resolved_output_limit: int | None = None,
-        retry_delays: tuple[float, ...] = (0.1, 0.2),
+        resolved_output_limit: int | None | object = _UNSET_RESOLVED_OUTPUT_LIMIT,
+        retry_delays: tuple[float, ...] = (0.5, 1, 2, 4),
         default_context_window_tokens: int = 32_000,
     ) -> None:
         self._provider = provider
@@ -82,11 +96,28 @@ class ModelInvoker:
         # request so the two can never diverge.  Embedders that already
         # computed the limit pass it explicitly; standalone construction
         # recomputes it from the frozen config and the provider capabilities.
-        self._resolved_output_limit = (
-            resolved_output_limit
-            if resolved_output_limit is not None
-            else resolve_output_limit(config.max_tokens, provider.capabilities)
-        )
+        if resolved_output_limit is _UNSET_RESOLVED_OUTPUT_LIMIT:
+            explicit_max_tokens = (
+                _UNSET if config.max_tokens is None else config.max_tokens
+            )
+            resolved: int | None = resolve_output_limit(
+                explicit_max_tokens,
+                provider.capabilities,
+            )
+        else:
+            if resolved_output_limit is not None and (
+                isinstance(resolved_output_limit, bool)
+                or not isinstance(resolved_output_limit, int)
+                or resolved_output_limit <= 0
+            ):
+                raise ValueError(
+                    "resolved_output_limit must be a positive integer or None"
+                )
+            # The explicit None is meaningful: it is the resolver's decision
+            # to omit the provider output-limit field, not a request to
+            # recompute a model default in this executor.
+            resolved = resolved_output_limit
+        self._resolved_output_limit: int | None = resolved
         if config.thinking is not None:
             config.thinking.validate_for(provider.capabilities.thinking)
 
@@ -124,11 +155,11 @@ class ModelInvoker:
             max_tokens=self._resolved_output_limit,
             thinking=self._thinking_request(),
         )
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 return await self._provider.chat(request)
             except LLMError as error:
-                if not error.retryable or attempt == 2:
+                if not error.retryable or attempt == 4:
                     raise
                 delay = (
                     self._retry_delays[attempt]
@@ -161,7 +192,7 @@ class ModelInvoker:
             # canonical and must not manufacture duplicate UI deltas.
             return await self.chat(messages, tools)
 
-        for attempt in range(3):
+        for attempt in range(5):
             delta_seen = False
             error_event_delivered = False
             try:
@@ -172,7 +203,7 @@ class ModelInvoker:
                         should_retry = (
                             not delta_seen
                             and error.retryable
-                            and attempt < 2
+                            and attempt < 4
                         )
                         if on_event is not None and not should_retry:
                             on_event(event)
@@ -187,7 +218,7 @@ class ModelInvoker:
             except asyncio.CancelledError:
                 raise
             except LLMError as error:
-                terminal_error = delta_seen or not error.retryable or attempt == 2
+                terminal_error = delta_seen or not error.retryable or attempt == 4
                 if on_event is not None and terminal_error and not error_event_delivered:
                     on_event(
                         ErrorEvent(

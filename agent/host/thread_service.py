@@ -21,7 +21,6 @@ from agent.runtime import (
     ThreadRuntime,
     ThreadSettings,
     ThreadStore,
-    ThinkingKeep,
     ThinkingSettings,
     default_state_directory,
 )
@@ -36,14 +35,44 @@ def _disabled_capabilities() -> dict[str, object]:
 
     return {
         "thinking_supported": False,
-        "supports_thinking_budget": False,
-        "supported_keep_values": [],
         "thinking": {
             "supported": False,
-            "supports_budget_tokens": False,
-            "supported_keep_values": [],
         },
     }
+
+
+def _safe_capabilities(value: dict[str, object]) -> dict[str, object]:
+    """Strip internal thinking controls at the Host/public boundary."""
+
+    safe: dict[str, object] = {}
+    if isinstance(value.get("thinking_supported"), bool):
+        safe["thinking_supported"] = value["thinking_supported"]
+    context_window = value.get("context_window_tokens")
+    if isinstance(context_window, int) and not isinstance(context_window, bool):
+        safe["context_window_tokens"] = context_window
+    nested = value.get("thinking")
+    if isinstance(nested, dict):
+        safe_nested: dict[str, object] = {}
+        for key in (
+            "supported",
+            "default_enabled",
+            "toggle_supported",
+            "intensity_supported",
+            "intensity_options",
+            "default_intensity",
+        ):
+            candidate = nested.get(key)
+            if key == "intensity_options":
+                if isinstance(candidate, (list, tuple)):
+                    safe_nested[key] = [
+                        item for item in candidate if isinstance(item, str)
+                    ]
+            elif candidate is not None:
+                safe_nested[key] = candidate
+        safe["thinking"] = safe_nested
+    if not safe:
+        return _disabled_capabilities()
+    return safe
 
 
 class ConfigurationRequiredError(RuntimeError):
@@ -336,11 +365,9 @@ class ThreadHost:
                 return _disabled_capabilities()
         except Exception:
             return _disabled_capabilities()
-        return (
-            value
-            if isinstance(value, dict) and value
-            else _disabled_capabilities()
-        )
+        if not isinstance(value, dict) or not value:
+            return _disabled_capabilities()
+        return _safe_capabilities(value)
 
     @staticmethod
     def _normalize_settings(
@@ -360,20 +387,10 @@ class ThreadHost:
         )
         if not supported:
             return replace(settings, thinking=None)
-        supports_budget = bool(
-            capabilities.get("supports_thinking_budget", False)
-            or nested_capabilities.get("supports_budget_tokens", False)
-        )
-        keep_values = capabilities.get(
-            "supported_keep_values",
-            nested_capabilities.get("supported_keep_values", []),
-        )
-        if not isinstance(keep_values, (list, tuple, set, frozenset)):
-            keep_values = ()
-        keep_values = tuple(value for value in keep_values if isinstance(value, str))
-        keep = thinking.keep
-        if keep is not None and keep.value not in keep_values:
-            keep = None
+        # budget_tokens and keep are internal model controls.  Capability
+        # projections intentionally omit both, so ordinary Host requests can
+        # never persist or expose them even when a model supports one.
+        keep = None
         toggle_supported = nested_capabilities.get("toggle_supported", True)
         if not isinstance(toggle_supported, bool):
             toggle_supported = True
@@ -391,7 +408,7 @@ class ThreadHost:
             intensity = None
         normalized = ThinkingSettings(
             enabled=thinking.enabled if toggle_supported else True,
-            budget_tokens=thinking.budget_tokens if supports_budget else None,
+            budget_tokens=None,
             keep=keep,
             intensity=intensity,
         )

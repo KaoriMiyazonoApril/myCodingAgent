@@ -64,6 +64,7 @@ from .settings import (
     ThreadSettings,
     TurnConfig,
     TurnSettingsOverride,
+    _UNSET,
 )
 from .thread_store import (
     InMemoryThreadStore,
@@ -186,19 +187,19 @@ class ThreadRuntime:
         prompt_builder: PromptBuilder | None = None,
         event_buffer_capacity: int = 512,
         reasoning_visibility: str = "hidden",
-        model_retry_delays: tuple[float, ...] = (0.1, 0.2),
+        model_retry_delays: tuple[float, ...] = (0.5, 1, 2, 4),
         max_active_turns: int = 4,
         tool_policy: ToolPolicy | None = None,
-        approval_timeout_seconds: float = 5 * 60,
+        approval_timeout_seconds: float = 30 * 60,
         workspace_validation_max_entries: int = 100_000,
         workspace_validation_max_seconds: float = 10,
         workspace_validation_clock: Callable[[], float] | None = None,
         default_context_window_tokens: int = 32_000,
         store: ThreadStore | None = None,
     ) -> None:
-        if reasoning_visibility not in {"hidden", "visible", "debug"}:
+        if reasoning_visibility not in {"hidden", "debug"}:
             raise ValueError(
-                "reasoning_visibility must be 'hidden', 'visible' or 'debug'"
+                "reasoning_visibility must be 'hidden' or 'debug'"
             )
         if (
             isinstance(event_buffer_capacity, bool)
@@ -790,11 +791,24 @@ class ThreadRuntime:
                     turn_config.model,
                 )
                 provider_capabilities = provider.capabilities
+            # Preserve presence from TurnSettingsOverride through this seam:
+            # an explicit None means "omit the provider limit", while an
+            # unset override lets the model's Harness request policy apply.
             # One resolver produces the single effective per-request output
             # limit; the same value feeds the ContextBudget reserve below and
             # the provider request, so the two can never diverge again.
+            max_tokens_override = (
+                settings_override.max_tokens
+                if settings_override is not None
+                and settings_override.max_tokens is not _UNSET
+                else (
+                    _UNSET
+                    if turn_config.max_tokens is None
+                    else turn_config.max_tokens
+                )
+            )
             resolved_output_limit = resolve_output_limit(
-                turn_config.max_tokens,
+                max_tokens_override,
                 provider_capabilities,
             )
             # User text remains canonical Conversation intent.  TaskState is
@@ -1311,20 +1325,10 @@ class ThreadRuntime:
             capabilities = None
         thinking = None if capabilities is None else capabilities.thinking
         supported = bool(thinking is not None and thinking.supported)
-        budget = bool(
-            thinking is not None
-            and thinking.supported
-            and thinking.supports_budget_tokens
-        )
-        keep_values = () if thinking is None else thinking.supported_keep_values
         projection: dict[str, object] = {
             "thinking_supported": supported,
-            "supports_thinking_budget": budget,
-            "supported_keep_values": list(keep_values),
             "thinking": {
                 "supported": supported,
-                "supports_budget_tokens": budget,
-                "supported_keep_values": list(keep_values),
             },
         }
         if thinking is not None and thinking.supported and (

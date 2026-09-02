@@ -414,7 +414,7 @@ def test_model_stream_retries_before_first_delta_but_not_after_output() -> None:
                 [], [], on_event=terminal_events.append
             )
         )
-    assert terminal.calls == 3
+    assert terminal.calls == 5
     assert len(
         [event for event in terminal_events if isinstance(event, ErrorEvent)]
     ) == 1

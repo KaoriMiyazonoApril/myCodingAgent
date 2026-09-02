@@ -134,8 +134,6 @@ class ThinkingCapabilities:
             "supported": self.supported,
             "default_enabled": self.default_enabled,
             "toggle_supported": bool(self.toggle_supported),
-            "supports_budget_tokens": self.supports_budget_tokens,
-            "supported_keep_values": list(self.supported_keep_values),
             "intensity_supported": self.intensity_supported,
             "intensity_options": list(self.intensity_options),
             "default_intensity": self.default_intensity,
@@ -148,6 +146,10 @@ class ProviderCapabilities:
 
     reasoning_retention: ReasoningRetention = ReasoningRetention.NEVER
     reasoning_input_field: str | None = None
+    # Generic adapters historically recognize the common OpenAI-compatible
+    # response names.  Conservative ProviderProfile lookups explicitly clear
+    # this tuple for unknown models; exact provider profiles narrow it to the
+    # fields documented by that vendor.
     reasoning_output_fields: tuple[str, ...] = ("reasoning_content", "thinking")
     requires_assistant_content_for_tool_calls: bool = False
     thinking: ThinkingCapabilities = field(default_factory=ThinkingCapabilities)
@@ -232,6 +234,7 @@ class ProviderCapabilities:
             raise LLMConfigurationError(
                 "reasoning_output_fields must be a tuple of non-empty strings"
             )
+
 
 @dataclass(frozen=True, slots=True)
 class ModelProfile:
@@ -339,15 +342,12 @@ class ProviderProfile:
         profile = self.model_profiles.get(model)
         if profile is None:
             if self.conservative_unknown_models:
-                return ProviderCapabilities(
-                    reasoning_retention=self.default_capabilities.reasoning_retention,
-                    reasoning_input_field=self.default_capabilities.reasoning_input_field,
-                    reasoning_output_fields=self.default_capabilities.reasoning_output_fields,
-                    requires_assistant_content_for_tool_calls=(
-                        self.default_capabilities.requires_assistant_content_for_tool_calls
-                    ),
-                    working_tail_mode=self.default_capabilities.working_tail_mode,
-                )
+                # Provider defaults are intentionally not inherited for an
+                # unrecognised model.  Name similarity is not a protocol
+                # contract: optional thinking, reasoning fields, context, and
+                # output limits all remain disabled until an exact profile is
+                # verified.
+                return ProviderCapabilities(reasoning_output_fields=())
             return self.default_capabilities
         return profile.apply(self.default_capabilities)
 
@@ -427,6 +427,26 @@ class ThinkingRequest:
     budget_tokens: int | None = None
     keep: str | None = None
     intensity: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise LLMConfigurationError("thinking request enabled must be a boolean")
+        if self.budget_tokens is not None and (
+            isinstance(self.budget_tokens, bool)
+            or not isinstance(self.budget_tokens, int)
+            or self.budget_tokens <= 0
+        ):
+            raise LLMConfigurationError(
+                "thinking request budget_tokens must be a positive integer"
+            )
+        for name in ("keep", "intensity"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise LLMConfigurationError(
+                    f"thinking request {name} must be a non-empty string"
+                )
 
 
 @dataclass(slots=True)

@@ -108,17 +108,17 @@ export type WorkspaceSelectionResponse = {
   workspace: WorkspaceRecord;
 };
 
+export type ThinkingSettings = {
+  enabled: boolean;
+  intensity?: string | null;
+};
+
 export type ThreadSettings = {
   provider_config_id: string;
   model: string;
   temperature: number | null;
   max_tokens: number | null;
-  thinking: {
-    enabled: boolean;
-    budget_tokens: number | null;
-    keep: "none" | "all" | null;
-    intensity?: string | null;
-  } | null;
+  thinking: ThinkingSettings | null;
   limits: {
     max_iterations: number;
     max_tool_calls: number;
@@ -147,12 +147,8 @@ export type ThreadSkills = {
 
 export type ThreadCapabilities = {
   thinking_supported: boolean;
-  supports_thinking_budget: boolean;
-  supported_keep_values: string[];
   thinking?: {
     supported: boolean;
-    supports_budget_tokens: boolean;
-    supported_keep_values: string[];
     default_enabled?: boolean;
     toggle_supported?: boolean;
     intensity_supported?: boolean;
@@ -337,6 +333,15 @@ export async function updateThreadSettings(
   threadId: string,
   settings: ThreadSettings,
 ): Promise<ThreadView> {
+  const thinking =
+    settings.thinking === null
+      ? null
+      : {
+          enabled: settings.thinking.enabled,
+          ...(settings.thinking.intensity !== undefined
+            ? { intensity: settings.thinking.intensity }
+            : {}),
+        };
   return (
     await requestJson<ThreadResponse>(`/api/threads/${threadId}/settings`, {
       method: "PATCH",
@@ -347,7 +352,7 @@ export async function updateThreadSettings(
         model: settings.model,
         temperature: settings.temperature,
         max_tokens: settings.max_tokens,
-        thinking: settings.thinking,
+        thinking,
         limits: settings.limits,
         approval_mode: settings.approval_mode,
       }),

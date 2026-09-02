@@ -428,7 +428,7 @@ def test_deepseek_thinking_never_serializes_budget_tokens() -> None:
 
 def test_glm_thinking_serializes_type_and_verbatim_effort() -> None:
     glm = OpenAICompatibleProvider(
-        create_provider_config("glm", api_key="test-key", model="glm-5.3"),
+        create_provider_config("glm", api_key="test-key", model="glm-5.2"),
         client=object(),
     )
     base = [Message(role="user", content=[TextBlock(text="hello")])]
@@ -487,8 +487,9 @@ def test_provider_defaults_and_model_overrides_resolve_capabilities() -> None:
 
     assert deepseek.capabilities.reasoning_retention is ReasoningRetention.TOOL_CHAIN_ONLY
     assert deepseek.capabilities.requires_assistant_content_for_tool_calls is True
-    assert kimi.capabilities.reasoning_retention is ReasoningRetention.ALWAYS
-    assert glm.capabilities.reasoning_retention is ReasoningRetention.TOOL_CHAIN_ONLY
+    # Unknown models fail closed rather than inheriting provider defaults.
+    assert kimi.capabilities.reasoning_retention is ReasoningRetention.NEVER
+    assert glm.capabilities.reasoning_retention is ReasoningRetention.NEVER
     assert kimi.capabilities.requires_assistant_content_for_tool_calls is False
 
 

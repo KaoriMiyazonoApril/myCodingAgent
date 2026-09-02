@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -14,13 +15,31 @@ import pytest
 
 from agent.core.messages import ToolCallBlock
 from agent.runtime.policy import ExecutionProfile
-from agent.tools.local import create_local_tool_registry
-from agent.tools.local import MAX_READ_RETURN_BYTES
-from agent.tools.filesystem import WorkspaceFilesystem, content_fingerprint
+from agent.tools.local import (
+    MAX_READ_RETURN_BYTES,
+    MAX_RETURNED_MATCHES,
+    MAX_SCANNED_FILES,
+    MAX_SEARCH_DURATION_SECONDS,
+    MAX_SEARCH_FILE_BYTES,
+    MAX_SEARCH_TOTAL_BYTES,
+    create_local_tool_registry,
+)
+from agent.tools.filesystem import (
+    ToolOperationError,
+    WorkspaceFilesystem,
+    content_fingerprint,
+)
 from agent.tools.process import (
     BubblewrapSandboxBackend,
     CommandSandboxBackend,
     CommandSandboxUnavailableError,
+    CommandRunner,
+    DEFAULT_EXEC_COMMAND_TIMEOUT_MS,
+    DEFAULT_PROCESS_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_RUN_COMMAND_TIMEOUT_MS,
+    MAX_EXEC_COMMAND_TIMEOUT_MS,
+    MAX_RUN_COMMAND_TIMEOUT_MS,
+    ProcessManager,
 )
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
@@ -1179,6 +1198,63 @@ def test_all_filesystem_definitions_are_closed_object_schemas(tmp_path) -> None:
     assert registry.lookup("missing") is None
 
 
+def test_command_timeout_schemas_match_process_defaults_and_caps(tmp_path) -> None:
+    registry = create_test_tool_registry(tmp_path)
+
+    run_timeout = registry.lookup("run_command").parameters["properties"]["timeout_ms"]
+    exec_timeout = registry.lookup("exec_command").parameters["properties"]["timeout_ms"]
+
+    assert run_timeout == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": MAX_RUN_COMMAND_TIMEOUT_MS,
+        "default": DEFAULT_RUN_COMMAND_TIMEOUT_MS,
+    }
+    assert exec_timeout == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": MAX_EXEC_COMMAND_TIMEOUT_MS,
+        "default": DEFAULT_EXEC_COMMAND_TIMEOUT_MS,
+    }
+    assert inspect.signature(CommandRunner.run).parameters["timeout_ms"].default == (
+        DEFAULT_RUN_COMMAND_TIMEOUT_MS
+    )
+    assert inspect.signature(ProcessManager.exec).parameters["timeout_ms"].default == (
+        DEFAULT_EXEC_COMMAND_TIMEOUT_MS
+    )
+    assert inspect.signature(ProcessManager).parameters[
+        "idle_timeout_seconds"
+    ].default == DEFAULT_PROCESS_IDLE_TIMEOUT_SECONDS
+
+
+def test_process_timeout_caps_are_enforced_for_direct_callers(tmp_path) -> None:
+    runner = CommandRunner(
+        WorkspaceFilesystem(tmp_path),
+        sandbox_backend=DeterministicSandboxBackend(),
+    )
+    with pytest.raises(ToolOperationError, match="between 1 and 900000"):
+        runner.run("true", ".", MAX_RUN_COMMAND_TIMEOUT_MS + 1)
+    runner.close()
+
+    manager = ProcessManager(
+        WorkspaceFilesystem(tmp_path),
+        sandbox_backend=DeterministicSandboxBackend(),
+    )
+    with pytest.raises(ToolOperationError, match="between 1 and 3600000"):
+        asyncio.run(
+            manager.exec("true", timeout_ms=MAX_EXEC_COMMAND_TIMEOUT_MS + 1)
+        )
+    manager.close()
+
+
+def test_search_budgets_are_explicit_and_truncation_remains_public() -> None:
+    assert MAX_RETURNED_MATCHES == 500
+    assert MAX_SCANNED_FILES == 50_000
+    assert MAX_SEARCH_FILE_BYTES == 5 * 1024 * 1024
+    assert MAX_SEARCH_TOTAL_BYTES == 200 * 1024 * 1024
+    assert MAX_SEARCH_DURATION_SECONDS == 20.0
+
+
 def test_registry_uses_tool_schema_for_validation_and_defaults() -> None:
     registry = ToolRegistry()
     received: list[dict[str, object]] = []
@@ -1241,7 +1317,7 @@ def test_glob_stops_after_detecting_the_first_truncated_match(
     registry = create_test_tool_registry(tmp_path)
 
     def files(*_args, **_kwargs):
-        for index in range(201):
+        for index in range(501):
             yield tmp_path / f"{index:03}.py", f"{index:03}.py"
         raise AssertionError("glob scanned beyond the truncation sentinel")
 
@@ -1254,14 +1330,14 @@ def test_glob_stops_after_detecting_the_first_truncated_match(
     )
 
     assert result.error_code is None
-    assert result.metadata == {"path": ".", "matches": 200, "truncated": True}
+    assert result.metadata == {"path": ".", "matches": 500, "truncated": True}
 
 
 def test_grep_stops_after_detecting_the_first_truncated_match(
     tmp_path, monkeypatch
 ) -> None:
     source = tmp_path / "matches.txt"
-    source.write_text("needle\n" * 201, encoding="utf-8")
+    source.write_text("needle\n" * 501, encoding="utf-8")
     registry = create_test_tool_registry(tmp_path)
 
     def files(*_args, **_kwargs):
@@ -1275,7 +1351,7 @@ def test_grep_stops_after_detecting_the_first_truncated_match(
     )
 
     assert result.error_code is None
-    assert result.metadata == {"path": ".", "matches": 200, "truncated": True}
+    assert result.metadata == {"path": ".", "matches": 500, "truncated": True}
 
 
 def test_grep_marks_results_incomplete_at_scanned_file_limit(

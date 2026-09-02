@@ -42,9 +42,9 @@ class ApprovalMode(str, Enum):
 class AgentLimits:
     """Public, bounded execution budgets frozen into one Turn."""
 
-    max_iterations: int = 20
-    max_tool_calls: int = 50
-    max_execution_seconds: float = 15 * 60
+    max_iterations: int = 60
+    max_tool_calls: int = 200
+    max_execution_seconds: float = 60 * 60
 
     def __post_init__(self) -> None:
         self._validate_integer("max_iterations", self.max_iterations, maximum=100)
@@ -69,7 +69,12 @@ class AgentLimits:
 
 @dataclass(frozen=True, slots=True)
 class ThinkingSettings:
-    """Public thinking controls accepted from a future transport adapter."""
+    """Provider-independent thinking intent.
+
+    ``budget_tokens`` and ``keep`` are retained only for internal adapters
+    whose exact capability profile allows them; ordinary Host/Web DTOs omit
+    both fields.
+    """
 
     enabled: bool
     budget_tokens: int | None = None
@@ -101,6 +106,8 @@ class ThinkingSettings:
             )
 
     def to_extra_body(self) -> dict[str, object]:
+        """Legacy generic helper; production requests use ModelInvoker."""
+
         thinking: dict[str, object] = {
             "type": "enabled" if self.enabled else "disabled"
         }
@@ -262,9 +269,9 @@ class TurnConfig(ModelSettings):
 
     def __post_init__(self) -> None:
         ModelSettings.__post_init__(self)
-        if self.reasoning_visibility not in {"hidden", "visible", "debug"}:
+        if self.reasoning_visibility not in {"hidden", "debug"}:
             raise ValueError(
-                "reasoning_visibility must be 'hidden', 'visible' or 'debug'"
+                "reasoning_visibility must be 'hidden' or 'debug'"
             )
 
     @classmethod

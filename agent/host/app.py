@@ -22,7 +22,6 @@ from agent.runtime import (
     ApprovalMode,
     ModelSettings,
     SettingsConflictError,
-    ThinkingKeep,
     ThinkingSettings,
     ThreadClosedError,
     ThreadStore,
@@ -120,17 +119,15 @@ class ThinkingUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool
-    budget_tokens: int | None = None
-    keep: ThinkingKeep | None = None
     intensity: str | None = None
 
 
 class LimitsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    max_iterations: int = 20
-    max_tool_calls: int = 50
-    max_execution_seconds: float = 15 * 60
+    max_iterations: int = 60
+    max_tool_calls: int = 200
+    max_execution_seconds: float = 60 * 60
 
 
 class ThreadSettingsUpdate(BaseModel):
@@ -874,6 +871,15 @@ def _provider_with_catalog_status(
     result = dict(provider)
     preset = PROVIDER_PRESETS.get(str(provider.get("provider_id", "")))
     status = _catalog_status(catalog, str(provider.get("provider_id", "")))
+    configured = bool(provider.get("configured", False))
+    if not configured:
+        result["credential_status"] = "unconfigured"
+    elif status is not None and status.get("status") == "ready":
+        result["credential_status"] = "verified"
+    elif status is not None and status.get("status") == "error":
+        result["credential_status"] = "verification_failed"
+    else:
+        result["credential_status"] = "configured"
     if preset is not None:
         if preset.description:
             result["description"] = preset.description

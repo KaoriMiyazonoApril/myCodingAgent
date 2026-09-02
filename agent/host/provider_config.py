@@ -189,6 +189,13 @@ class ProviderStore:
             "provider_id": provider_id,
             "display_name": PROVIDERS[provider_id],
             "configured": isinstance(api_key, str) and bool(api_key),
+            # Credential existence is deliberately distinct from an actual
+            # provider verification.  The catalog projection upgrades this
+            # to ``verified`` only after a successful discovery request.
+            "credential_status": (
+                "configured" if isinstance(api_key, str) and bool(api_key)
+                else "unconfigured"
+            ),
             "credential_mask": self._mask(api_key) if isinstance(api_key, str) else None,
             "selected_model": (
                 selected_model if isinstance(selected_model, str) else None

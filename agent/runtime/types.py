@@ -81,8 +81,14 @@ class ThreadSnapshot:
             thinking = settings.get("thinking")
             # Keep the V1 wire shape stable for settings that do not use the
             # optional model-specific intensity control.
-            if isinstance(thinking, dict) and thinking.get("intensity") is None:
-                thinking.pop("intensity", None)
+            if isinstance(thinking, dict):
+                # budget_tokens/keep are model-internal controls (K2.6
+                # preserved-thinking is handled by the Runtime capability
+                # profile) and are never ordinary Web settings.
+                thinking.pop("budget_tokens", None)
+                thinking.pop("keep", None)
+                if thinking.get("intensity") is None:
+                    thinking.pop("intensity", None)
         return payload
 
 

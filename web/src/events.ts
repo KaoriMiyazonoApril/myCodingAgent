@@ -27,7 +27,6 @@ export type ConversationMessage = {
   id: string;
   role: "user" | "assistant";
   text: string;
-  reasoning?: ReasoningPreview;
 };
 
 export type ReasoningPreview = {
@@ -35,10 +34,6 @@ export type ReasoningPreview = {
   truncated?: boolean;
   total_chars?: number;
 };
-
-// Reasoning chains can be far larger than the visible answer.  Keep the
-// live stream and the committed preview bounded so the UI stays responsive.
-const REASONING_LIVE_CAP = 4096;
 
 export type ToolActivity = {
   id: string;
@@ -60,14 +55,25 @@ export type ProvisionalToolCall = {
 export type ProvisionalAssistant = {
   turn_id: string | null;
   text: string;
-  reasoning: string;
+  /** Whether the transient narration hit the client-side display cap. */
+  text_truncated: boolean;
   tool_calls: ProvisionalToolCall[];
   message_end: boolean;
 };
 
+// A streamed model narration is progress feedback, not durable conversation
+// content. Keep it small even if a provider emits a very long text delta.
+export const PROVISIONAL_TEXT_MAX_CHARS = 320;
+
 // Phase-change-only model activity (normal Web never receives raw reasoning).
-// Backend announces each phase at most once per transition.
-export type ActivityPhase = "thinking" | "writing" | "acting";
+// The current public vocabulary is thinking/generating/idle.  writing/acting
+// are accepted as legacy aliases because older Hosts may still emit them.
+export type ActivityPhase =
+  | "thinking"
+  | "generating"
+  | "idle"
+  | "writing"
+  | "acting";
 
 export type ActivityState = {
   phase: ActivityPhase;
@@ -95,6 +101,8 @@ export type EventState = {
   approval: ApprovalRequest | null;
   provisional: ProvisionalAssistant | null;
   activity: ActivityState | null;
+  /** Current Turn boundary used to reject stale SSE deltas and tool events. */
+  current_turn_id: string | null;
   seen_event_ids: string[];
   skills: ThreadSkills;
 };
@@ -109,6 +117,44 @@ export type ApprovalRequest = {
   message: string;
 };
 
+/**
+ * Reconcile only approval metadata after an approval command is accepted.
+ *
+ * The authoritative Thread read is still needed to handle races, but it must
+ * not rebuild the durable message/tool projection while the Turn is running.
+ * Reconnect/cursor recovery continues to use hydrateThread instead.
+ */
+export function reconcileApprovalSnapshot(
+  state: EventState,
+  view: ThreadView,
+): EventState {
+  const pending = safeApproval(view.snapshot.pending_approval);
+  const currentTurn =
+    typeof view.snapshot.active_turn_id === "string"
+      ? view.snapshot.active_turn_id
+      : view.snapshot.status === "idle" || view.snapshot.status === "closed"
+        ? null
+        : state.current_turn_id;
+  const next: EventState = {
+    ...state,
+    tools: state.tools.map((tool) => ({ ...tool })),
+    approval: pending,
+    current_turn_id: currentTurn,
+  };
+  const call = pending?.tool_call;
+  if (isRecord(call) && typeof call.id === "string") {
+    mergeTool(next, {
+      id: call.id,
+      name: typeof call.name === "string" ? call.name : "tool",
+      arguments: call.arguments,
+      status: "requested",
+      result: null,
+      error_code: null,
+    });
+  }
+  return next;
+}
+
 export function hydrateThread(view: ThreadView): EventState {
   const state: EventState = {
     messages: [],
@@ -120,12 +166,28 @@ export function hydrateThread(view: ThreadView): EventState {
     approval: null,
     provisional: null,
     activity: null,
+    current_turn_id:
+      typeof view.snapshot.active_turn_id === "string"
+        ? view.snapshot.active_turn_id
+        : null,
     seen_event_ids: [],
     skills: normalizeSkills(view.snapshot.skills),
   };
   view.snapshot.messages.forEach((message, index) => {
     hydrateMessage(state, message, `snapshot-${index}`);
   });
+  // A Snapshot contains the entire canonical conversation, but the activity
+  // rail is intentionally scoped to the latest/current Turn.  Message roles
+  // are the only stable boundary available on the existing wire contract: the
+  // latest user message starts the latest Turn, followed by its assistant and
+  // tool messages.  Do not flatten tool artifacts from older Turns here.
+  state.tools = [];
+  const latestTurnStart = latestTurnMessageStart(view.snapshot.messages);
+  if (latestTurnStart !== -1) {
+    view.snapshot.messages.slice(latestTurnStart).forEach((message) => {
+      hydrateToolBlocks(state, message);
+    });
+  }
   const latestError = view.snapshot.latest_turn?.error;
   if (isRecord(latestError)) {
     state.error = safeError(latestError);
@@ -134,29 +196,23 @@ export function hydrateThread(view: ThreadView): EventState {
     state.error = safeError(view.host_error);
     state.terminal = { status: "rejected", error: state.error };
   }
-  const pending = view.snapshot.pending_approval;
-  if (isRecord(pending) && typeof pending.approval_id === "string") {
-    state.approval = {
-      approval_id: pending.approval_id,
-      tool_call: isRecord(pending.tool_call) ? pending.tool_call : null,
-      ...(typeof pending.timeout_seconds === "number"
-        ? { timeout_seconds: pending.timeout_seconds }
-        : {}),
-      ...(typeof pending.decision === "string"
-        ? { decision: pending.decision }
-        : {}),
-      ...(typeof pending.execution_profile === "string"
-        ? { execution_profile: pending.execution_profile }
-        : {}),
-      reason_code:
-        typeof pending.reason_code === "string"
-          ? pending.reason_code
-          : "APPROVAL_REQUIRED",
-      message:
-        typeof pending.message === "string"
-          ? pending.message
-          : "该命令需要确认",
-    };
+  const pending = safeApproval(view.snapshot.pending_approval);
+  if (pending !== null) {
+    state.approval = pending;
+    // The pending call is part of the current Turn even when a Snapshot was
+    // taken before its durable tool result.  Keep one compact requested row so
+    // the approval card and activity list describe the same operation.
+    const call = pending.tool_call;
+    if (isRecord(call) && typeof call.id === "string") {
+      mergeTool(state, {
+        id: call.id,
+        name: typeof call.name === "string" ? call.name : "tool",
+        arguments: call.arguments,
+        status: "requested",
+        result: null,
+        error_code: null,
+      });
+    }
   }
   hydrateSummaryFiles(state, view.snapshot.latest_turn);
   return state;
@@ -182,6 +238,7 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
             tool_calls: state.provisional.tool_calls.map((call) => ({ ...call })),
           },
     activity: state.activity,
+    current_turn_id: state.current_turn_id,
     seen_event_ids: [...state.seen_event_ids, event.event_id],
     skills: {
       schema_version: state.skills.schema_version,
@@ -192,11 +249,16 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
   };
 
   if (event.type === "turn_started") {
+    next.current_turn_id = event.turn_id;
     next.terminal = null;
     next.error = null;
     next.files = [];
     next.cancel_requested = false;
     next.approval = null;
+    // Tool activity belongs to one Turn, never to the whole Thread.  The
+    // next Turn starts with an empty working set even though canonical
+    // messages remain durable below.
+    next.tools = [];
     // Loaded Skills are turn-local.  Keep the complete available catalog but
     // never carry a prior Turn's bodies/metadata into the next execution.
     next.skills.available = [
@@ -214,7 +276,7 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     next.provisional = {
       turn_id: event.turn_id,
       text: "",
-      reasoning: "",
+      text_truncated: false,
       tool_calls: [],
       message_end: false,
     };
@@ -224,48 +286,65 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
       next.messages.push({ id: event.event_id, role: "user", text });
     }
   } else if (event.type === "model_activity") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const phase = event.payload.phase;
-    if (phase === "thinking" || phase === "writing" || phase === "acting") {
+    const normalizedPhase = normalizeActivityPhase(phase);
+    if (normalizedPhase !== null && normalizedPhase !== "idle") {
       // Phase-change-only semantics: a stray duplicate of the live phase must
       // not restart the duration timer.
-      if (next.activity?.phase !== phase || next.activity.finished) {
+      if (next.activity?.phase !== normalizedPhase || next.activity.finished) {
         next.activity = {
-          phase,
+          phase: normalizedPhase,
           since: event.timestamp,
           finished: false,
         };
       }
-    } else if (phase === "idle" && next.activity !== null) {
+    } else if (normalizedPhase === "idle" && next.activity !== null) {
       next.activity = {
         ...next.activity,
+        phase: "idle",
         finished: true,
         ended_at: event.timestamp,
       };
     }
   } else if (event.type === "model_response") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     next.provisional = null;
     const message = event.payload.message;
     if (isRecord(message)) {
-      const preview = safeReasoningPreview(event.payload.reasoning_preview);
-      hydrateMessage(next, message, event.event_id, preview);
+      // Deliberately ignore reasoning_preview in the normal Web projection.
+      // A stale/overly-permissive Host must not turn diagnostic text into a
+      // user-visible message.
+      hydrateMessage(next, message, event.event_id);
     }
   } else if (event.type === "model_text_delta") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const provisional = ensureProvisional(next, event.turn_id);
     if (typeof event.payload.text === "string") {
-      provisional.text += event.payload.text;
+      const remaining = PROVISIONAL_TEXT_MAX_CHARS - provisional.text.length;
+      if (remaining <= 0) {
+        provisional.text_truncated = true;
+      } else if (event.payload.text.length > remaining) {
+        provisional.text += event.payload.text.slice(0, remaining);
+        provisional.text_truncated = true;
+      } else {
+        provisional.text += event.payload.text;
+      }
     }
   } else if (event.type === "model_reasoning_delta") {
-    const provisional = ensureProvisional(next, event.turn_id);
-    if (
-      typeof event.payload.text === "string" &&
-      provisional.reasoning.length < REASONING_LIVE_CAP
-    ) {
-      provisional.reasoning += event.payload.text.slice(
-        0,
-        REASONING_LIVE_CAP - provisional.reasoning.length,
-      );
-    }
+    // Raw reasoning is never retained by the normal Web reducer.  The
+    // phase-only model_activity event is the complete public signal.
+    return next;
   } else if (event.type === "model_tool_call_delta") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const provisional = ensureProvisional(next, event.turn_id);
     const index = event.payload.index;
     if (typeof index === "number" && Number.isInteger(index) && index >= 0) {
@@ -285,8 +364,25 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
       }
     }
   } else if (event.type === "model_message_end") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     ensureProvisional(next, event.turn_id).message_end = true;
+    // Hosts normally announce this transition immediately before the message
+    // end event. Keep the reducer correct when an older/replayed Host only
+    // sends the durable boundary event.
+    if (next.activity !== null && !next.activity.finished) {
+      next.activity = {
+        ...next.activity,
+        phase: "idle",
+        finished: true,
+        ended_at: event.timestamp,
+      };
+    }
   } else if (event.type === "model_error") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     next.error = {
       code:
         typeof event.payload.error_code === "string"
@@ -300,11 +396,15 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     if (next.activity !== null && !next.activity.finished) {
       next.activity = {
         ...next.activity,
+        phase: "idle",
         finished: true,
         ended_at: event.timestamp,
       };
     }
   } else if (event.type === "tool_requested") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const call = event.payload.tool_call;
     if (isRecord(call) && typeof call.id === "string") {
       mergeTool(next, {
@@ -317,6 +417,9 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
       });
     }
   } else if (event.type === "tool_started") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const id = event.payload.tool_call_id;
     if (typeof id === "string") {
       mergeTool(next, {
@@ -329,6 +432,9 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
       });
     }
   } else if (event.type === "tool_finished") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const result = event.payload.result;
     if (isRecord(result) && typeof result.tool_call_id === "string") {
       mergeTool(next, {
@@ -343,11 +449,17 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
       });
     }
   } else if (event.type === "file_changed") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const change = safeFileChange(event.payload);
     if (change !== null) {
       mergeFile(next, change);
     }
   } else if (event.type === "skill_loaded") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const skill = safeSkill(event.payload);
     if (skill !== null && !next.skills.loaded.some((item) => item.name === skill.name)) {
       next.skills.loaded.push(skill);
@@ -356,6 +468,9 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
       );
     }
   } else if (event.type === "skill_activation_failed") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const name = event.payload.name;
     if (typeof name === "string" && name.trim()) {
       next.skills.diagnostics.push({
@@ -367,8 +482,14 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
       });
     }
   } else if (event.type === "turn_cancel_requested") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     next.cancel_requested = true;
   } else if (event.type === "approval_requested") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const approvalId = event.payload.approval_id;
     if (typeof approvalId === "string") {
       next.approval = {
@@ -394,8 +515,22 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
             ? event.payload.message
             : "该命令需要确认",
       };
+      const call = next.approval.tool_call;
+      if (isRecord(call) && typeof call.id === "string") {
+        mergeTool(next, {
+          id: call.id,
+          name: typeof call.name === "string" ? call.name : "tool",
+          arguments: call.arguments,
+          status: "requested",
+          result: null,
+          error_code: null,
+        });
+      }
     }
   } else if (event.type === "approval_resolved") {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const approvalId = event.payload.approval_id;
     // Resolution events can race with a replacement approval or arrive from
     // a replayed/late SSE connection.  Only the active matching ID may clear
@@ -415,18 +550,36 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     event.type === "turn_failed" ||
     event.type === "turn_limit_reached"
   ) {
+    if (!eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const summary = event.payload.summary;
+    next.terminal = isRecord(summary) ? summary : null;
+    next.provisional = null;
+    next.cancel_requested = false;
+    next.approval = null;
+    next.current_turn_id = null;
+    if (next.activity !== null && !next.activity.finished) {
+      next.activity = {
+        ...next.activity,
+        phase: "idle",
+        finished: true,
+        ended_at: event.timestamp,
+      };
+    }
     if (isRecord(summary)) {
-      next.terminal = summary;
-      next.provisional = null;
-      next.cancel_requested = false;
-      next.approval = null;
       hydrateSummaryFiles(next, summary);
       if (isRecord(summary.error)) {
         next.error = safeError(summary.error);
       }
     }
   } else if (event.type === "turn_rejected") {
+    // A preflight rejection has no preceding turn_started event, so it is
+    // accepted while idle. Once another Turn is active, reject a stale
+    // rejection just like any other turn-scoped event.
+    if (next.current_turn_id !== null && !eventBelongsToCurrentTurn(next, event)) {
+      return next;
+    }
     const error = event.payload.error;
     next.error = isRecord(error)
       ? safeError(error)
@@ -435,6 +588,7 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     next.provisional = null;
     next.cancel_requested = false;
     next.approval = null;
+    next.current_turn_id = null;
   }
   return next;
 }
@@ -447,7 +601,7 @@ function ensureProvisional(
     state.provisional = {
       turn_id: turnId,
       text: "",
-      reasoning: "",
+      text_truncated: false,
       tool_calls: [],
       message_end: false,
     };
@@ -455,11 +609,57 @@ function ensureProvisional(
   return state.provisional;
 }
 
+function eventBelongsToCurrentTurn(state: EventState, event: AgentEvent): boolean {
+  return (
+    state.current_turn_id !== null &&
+    event.turn_id !== null &&
+    state.current_turn_id === event.turn_id
+  );
+}
+
+function safeApproval(value: unknown): ApprovalRequest | null {
+  if (!isRecord(value) || typeof value.approval_id !== "string" || !value.approval_id) {
+    return null;
+  }
+  return {
+    approval_id: value.approval_id,
+    tool_call: isRecord(value.tool_call) ? value.tool_call : null,
+    ...(typeof value.timeout_seconds === "number"
+      ? { timeout_seconds: value.timeout_seconds }
+      : {}),
+    ...(typeof value.decision === "string" ? { decision: value.decision } : {}),
+    ...(typeof value.execution_profile === "string"
+      ? { execution_profile: value.execution_profile }
+      : {}),
+    reason_code:
+      typeof value.reason_code === "string"
+        ? value.reason_code
+        : "APPROVAL_REQUIRED",
+    message:
+      typeof value.message === "string" ? value.message : "该命令需要确认",
+  };
+}
+
+function normalizeActivityPhase(value: unknown): ActivityPhase | null {
+  if (value === "thinking") {
+    return "thinking";
+  }
+  if (value === "generating") {
+    return "generating";
+  }
+  if (value === "writing" || value === "acting") {
+    return "generating";
+  }
+  if (value === "idle") {
+    return "idle";
+  }
+  return null;
+}
+
 function hydrateMessage(
   state: EventState,
   message: Record<string, unknown>,
   idPrefix: string,
-  reasoning?: ReasoningPreview,
 ) {
   const role = message.role;
   const content = message.content;
@@ -467,19 +667,34 @@ function hydrateMessage(
     return;
   }
   if (role === "user" || role === "assistant") {
+    const hasToolCall = content.some(
+      (block) => isRecord(block) && block.type === "tool_call",
+    );
     const text = content
       .filter(isRecord)
       .filter((block) => block.type === "text" && typeof block.text === "string")
       .map((block) => block.text as string)
       .join("");
-    if (text) {
+    // An assistant message containing a ToolCall is an intermediate model
+    // step. Its text is narration for that step, not an ordinary answer.
+    if (text && (role === "user" || !hasToolCall)) {
       state.messages.push({
         id: `${idPrefix}-text`,
         role,
         text,
-        ...(reasoning === undefined ? {} : { reasoning }),
       });
     }
+  }
+  hydrateToolBlocks(state, message);
+}
+
+function hydrateToolBlocks(
+  state: EventState,
+  message: Record<string, unknown>,
+) {
+  const content = message.content;
+  if (!Array.isArray(content)) {
+    return;
   }
   content.filter(isRecord).forEach((block) => {
     if (block.type === "tool_call" && typeof block.id === "string") {
@@ -505,6 +720,15 @@ function hydrateMessage(
       });
     }
   });
+}
+
+function latestTurnMessageStart(messages: Array<Record<string, unknown>>): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      return index;
+    }
+  }
+  return -1;
 }
 
 function mergeTool(state: EventState, incoming: ToolActivity) {
@@ -583,20 +807,6 @@ function safeError(value: Record<string, unknown>) {
     error.detail = value.detail;
   }
   return error;
-}
-
-function safeReasoningPreview(value: unknown): ReasoningPreview | undefined {
-  if (!isRecord(value) || typeof value.text !== "string") {
-    return undefined;
-  }
-  const preview: ReasoningPreview = { text: value.text };
-  if (typeof value.truncated === "boolean") {
-    preview.truncated = value.truncated;
-  }
-  if (typeof value.total_chars === "number") {
-    preview.total_chars = value.total_chars;
-  }
-  return preview;
 }
 
 function normalizeSkills(value: unknown): ThreadSkills {

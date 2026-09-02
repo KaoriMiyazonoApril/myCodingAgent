@@ -12,17 +12,25 @@ import regex
 
 from agent.tools.apply_patch import apply_patch
 from agent.tools.filesystem import ToolOperationError, WorkspaceFilesystem, truncate_utf8
-from agent.tools.process import CommandRunner, CommandSandboxBackend, ProcessManager
+from agent.tools.process import (
+    DEFAULT_EXEC_COMMAND_TIMEOUT_MS,
+    DEFAULT_RUN_COMMAND_TIMEOUT_MS,
+    MAX_EXEC_COMMAND_TIMEOUT_MS,
+    MAX_RUN_COMMAND_TIMEOUT_MS,
+    CommandRunner,
+    CommandSandboxBackend,
+    ProcessManager,
+)
 from agent.tools.registry import ToolRegistry
 from agent.tools.types import ToolDefinition, ToolResult
 
 
-MAX_RETURNED_MATCHES = 200
-MAX_SCANNED_FILES = 10_000
+MAX_RETURNED_MATCHES = 500
+MAX_SCANNED_FILES = 50_000
 MAX_SEARCH_FILE_BYTES = 5 * 1024 * 1024
-MAX_SEARCH_TOTAL_BYTES = 50 * 1024 * 1024
+MAX_SEARCH_TOTAL_BYTES = 200 * 1024 * 1024
 MAX_SEARCH_LINE_CHARS = 100_000
-MAX_SEARCH_DURATION_SECONDS = 5.0
+MAX_SEARCH_DURATION_SECONDS = 20.0
 REGEX_TIMEOUT_SECONDS = 0.05
 MAX_READ_RETURN_BYTES = 256 * 1024
 WORKSPACE_SKILL_DIRECTORIES = frozenset({".agents", ".claude", ".opencode"})
@@ -460,8 +468,8 @@ def create_local_tool_registry(
                     "timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 300000,
-                        "default": 60000,
+                        "maximum": MAX_RUN_COMMAND_TIMEOUT_MS,
+                        "default": DEFAULT_RUN_COMMAND_TIMEOUT_MS,
                     },
                 },
                 ["command"],
@@ -487,8 +495,8 @@ def create_local_tool_registry(
                     "timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 900000,
-                        "default": 60000,
+                        "maximum": MAX_EXEC_COMMAND_TIMEOUT_MS,
+                        "default": DEFAULT_EXEC_COMMAND_TIMEOUT_MS,
                     },
                     "tty": {"type": "boolean", "default": False},
                 },

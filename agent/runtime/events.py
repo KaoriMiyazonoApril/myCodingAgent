@@ -32,10 +32,6 @@ from agent.tools.types import ToolResult
 
 from .types import SCHEMA_VERSION
 
-# Bounded reasoning text carried on durable model_response events so the UI
-# can render the thinking chain without persisting the full stream.
-_REASONING_PREVIEW_CHARS = 3000
-
 
 def utc_now() -> str:
     """Return an RFC 3339 UTC timestamp suitable for the public API."""
@@ -68,11 +64,17 @@ def public_message(message: Message) -> dict[str, Any] | None:
 
     if message.role == "system":
         return None
+    # A response that includes a tool call is an intermediate model step.
+    # Its text is narration for that step, not ordinary conversation history;
+    # keep the canonical block in Conversation but omit it from this public
+    # transcript projection.  The same structural rule is used for snapshots
+    # and model_response events.
+    has_tool_call = any(isinstance(block, ToolCallBlock) for block in message.content)
     content: list[dict[str, Any]] = []
     for block in message.content:
         if isinstance(block, ReasoningBlock):
             continue
-        if isinstance(block, TextBlock):
+        if isinstance(block, TextBlock) and not has_tool_call:
             content.append({"type": "text", "text": block.text})
         elif isinstance(block, ToolCallBlock):
             content.append(
@@ -455,6 +457,8 @@ class TurnEventEmitter:
         buffer: EventBuffer,
         reasoning_visibility: str,
     ) -> None:
+        if reasoning_visibility not in {"hidden", "debug"}:
+            raise ValueError("reasoning_visibility must be 'hidden' or 'debug'")
         self._thread_id = thread_id
         self._turn_id = turn_id
         self._buffer = buffer
@@ -462,7 +466,7 @@ class TurnEventEmitter:
         self._terminal_event: AgentEvent | None = None
         # Low-frequency activity feedback: the last announced phase, used to
         # emit one "model_activity" event only when the phase actually
-        # changes (thinking / writing / acting / idle).  Never per-token.
+        # changes (thinking / generating / idle).  Never per-token.
         self._activity_phase: str | None = None
 
     def emit(
@@ -508,7 +512,7 @@ class TurnEventEmitter:
                 for block in response.message.content
                 if isinstance(block, ReasoningBlock)
             )
-            if self._reasoning_visibility != "hidden"
+            if self._reasoning_visibility == "debug"
             else ""
         )
         payload: dict[str, Any] = {
@@ -517,21 +521,6 @@ class TurnEventEmitter:
             "finish_reason": response.finish_reason,
             "usage": public_usage(response),
         }
-        if reasoning:
-            # "visible" keeps a bounded preview on the durable event so the UI
-            # can show the thinking chain without persisting the full stream;
-            # "debug" keeps the complete chain for diagnostics.
-            bounded = (
-                self._reasoning_visibility != "debug"
-                and len(reasoning) > _REASONING_PREVIEW_CHARS
-            )
-            payload["reasoning_preview"] = {
-                "text": (
-                    reasoning[:_REASONING_PREVIEW_CHARS] if bounded else reasoning
-                ),
-                "truncated": bounded,
-                "total_chars": len(reasoning),
-            }
         self.emit("model_response", payload)
         if self._reasoning_visibility == "debug" and reasoning:
             self.emit(
@@ -558,17 +547,17 @@ class TurnEventEmitter:
         """Publish provisional model output without constructing history."""
 
         if isinstance(event, TextDeltaEvent):
-            self._advance_activity("writing")
+            self._advance_activity("generating")
             self.emit("model_text_delta", {"text": event.text})
         elif isinstance(event, ReasoningDeltaEvent):
             # Raw reasoning stays visibility-gated, but normal Web still needs
             # an accurate "the model is thinking" signal: announce the phase
             # once per transition, never the text and never per token.
             self._advance_activity("thinking")
-            if self._reasoning_visibility != "hidden":
+            if self._reasoning_visibility == "debug":
                 self.emit("model_reasoning_delta", {"text": event.text})
         elif isinstance(event, ToolCallDeltaEvent):
-            self._advance_activity("acting")
+            self._advance_activity("generating")
             self.emit(
                 "model_tool_call_delta",
                 {

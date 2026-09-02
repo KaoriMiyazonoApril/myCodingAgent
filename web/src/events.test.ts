@@ -5,6 +5,8 @@ import {
   applyAgentEvent,
   eventRequiresSnapshotRefresh,
   hydrateThread,
+  PROVISIONAL_TEXT_MAX_CHARS,
+  reconcileApprovalSnapshot,
   type AgentEvent,
 } from "./events";
 
@@ -91,7 +93,6 @@ test("hydrates messages tools and terminal outcome from a Snapshot", () => {
 
   expect(state.messages.map(({ role, text }) => ({ role, text }))).toEqual([
     { role: "user", text: "Inspect the project" },
-    { role: "assistant", text: "I will inspect it." },
   ]);
   expect(state.tools).toEqual([
     {
@@ -141,6 +142,7 @@ test("deduplicates event IDs and merges a tool lifecycle by call ID", () => {
     ...view(),
     snapshot: { ...view().snapshot, messages: [], latest_turn: null },
   });
+  state = applyAgentEvent(state, event("turn_started", { user_message: "Run" }));
   const requested = event("tool_requested", {
     tool_call: { id: "call-2", name: "run_command", arguments: { command: "pytest" } },
   });
@@ -164,7 +166,7 @@ test("deduplicates event IDs and merges a tool lifecycle by call ID", () => {
     }),
   );
 
-  expect(state.seen_event_ids).toHaveLength(3);
+  expect(state.seen_event_ids).toHaveLength(4);
   expect(state.tools).toEqual([
     {
       id: "call-2",
@@ -234,6 +236,7 @@ test("updates loaded Skills from live events and resets them at the next Turn", 
     diagnostics: [],
   };
   let state = hydrateThread(initial);
+  state = applyAgentEvent(state, event("turn_started", { user_message: "Skills" }));
   expect(state.skills.loaded).toHaveLength(0);
   state = applyAgentEvent(
     state,
@@ -266,7 +269,11 @@ test("updates loaded Skills from live events and resets them at the next Turn", 
   expect(state.skills.diagnostics).toEqual([
     { code: "SKILL_NOT_FOUND", name: "missing-skill" },
   ]);
-  state = applyAgentEvent(state, event("turn_started", { user_message: "Next" }));
+  state = applyAgentEvent(state, {
+    ...event("turn_started", { user_message: "Next" }),
+    event_id: "turn-2-started",
+    turn_id: "turn-2",
+  });
   expect(state.skills.available.map(({ name }) => name)).toEqual(["repo-guide"]);
   expect(state.skills.loaded).toEqual([]);
   expect(state.skills.diagnostics).toEqual([
@@ -295,6 +302,10 @@ test("preserves terminal tools and reconstructs cancellation and file activity",
     ...view(),
     snapshot: { ...view().snapshot, messages: [], latest_turn: null },
   });
+  state = applyAgentEvent(
+    state,
+    event("turn_started", { user_message: "Edit" }),
+  );
   state = applyAgentEvent(
     state,
     event("tool_finished", {
@@ -366,6 +377,7 @@ test("keeps policy reason in the approval state until runtime resolves it", () =
     ...view(),
     snapshot: { ...view().snapshot, messages: [], latest_turn: null },
   });
+  state = applyAgentEvent(state, event("turn_started", { user_message: "Approve" }));
   state = applyAgentEvent(
     state,
     event("approval_requested", {
@@ -395,6 +407,7 @@ test("does not let a stale approval resolution clear a newer approval", () => {
     ...view(),
     snapshot: { ...view().snapshot, messages: [], latest_turn: null },
   });
+  state = applyAgentEvent(state, event("turn_started", { user_message: "Approve" }));
   state = applyAgentEvent(
     state,
     event("approval_requested", {
@@ -435,6 +448,7 @@ test("ignores an approval resolution without a valid matching id", () => {
     ...view(),
     snapshot: { ...view().snapshot, messages: [], latest_turn: null },
   });
+  state = applyAgentEvent(state, event("turn_started", { user_message: "Approve" }));
   state = applyAgentEvent(
     state,
     event("approval_requested", {
@@ -511,7 +525,7 @@ test("renders streaming deltas provisionally and clears them on canonical respon
   expect(state.provisional).toEqual({
     turn_id: "turn-1",
     text: "生",
-    reasoning: "",
+    text_truncated: false,
     tool_calls: [
       { index: 0, id: "call", name: "read_file", arguments: '{"path":' },
     ],
@@ -540,7 +554,37 @@ test("renders streaming deltas provisionally and clears them on canonical respon
   });
 });
 
-test("bounds live reasoning deltas and keeps the committed preview on the message", () => {
+test("bounds provisional narration and keeps it out of durable messages", () => {
+  let state = hydrateThread({
+    ...view(),
+    snapshot: { ...view().snapshot, messages: [], latest_turn: null },
+  });
+  state = applyAgentEvent(state, event("turn_started", { user_message: "Bound it" }));
+  state = applyAgentEvent(
+    state,
+    event("model_text_delta", { text: "n".repeat(PROVISIONAL_TEXT_MAX_CHARS + 80) }),
+  );
+
+  expect(state.provisional?.text).toHaveLength(PROVISIONAL_TEXT_MAX_CHARS);
+  expect(state.provisional?.text_truncated).toBe(true);
+  expect(state.messages).toEqual([
+    { id: "turn_started-id", role: "user", text: "Bound it" },
+  ]);
+
+  state = applyAgentEvent(
+    state,
+    event("model_tool_call_delta", {
+      index: 0,
+      id: "call-bound",
+      name: "read_file",
+      arguments_delta: '{"path":"README.md"}',
+    }),
+  );
+  expect(state.messages.some((message) => message.role === "assistant")).toBe(false);
+  expect(state.provisional?.tool_calls).toHaveLength(1);
+});
+
+test("drops raw reasoning deltas and previews from the normal Web projection", () => {
   let state = hydrateThread({
     ...view(),
     snapshot: { ...view().snapshot, messages: [], latest_turn: null },
@@ -554,7 +598,13 @@ test("bounds live reasoning deltas and keeps the committed preview on the messag
     state,
     event("model_reasoning_delta", { text: hugeReasoning }),
   );
-  expect(state.provisional?.reasoning.length).toBe(4096);
+  expect(state.provisional).toEqual({
+    turn_id: "turn-1",
+    text: "",
+    text_truncated: false,
+    tool_calls: [],
+    message_end: false,
+  });
 
   state = applyAgentEvent(
     state,
@@ -576,11 +626,6 @@ test("bounds live reasoning deltas and keeps the committed preview on the messag
     id: "model_response-id-text",
     role: "assistant",
     text: "Done.",
-    reasoning: {
-      text: "first 3000 chars",
-      truncated: true,
-      total_chars: 5000,
-    },
   });
 });
 
@@ -647,13 +692,13 @@ test("model_activity tracks phase changes with a stable since and no text", () =
   expect(duplicate.activity).toEqual(state.activity);
 
   state = applyAgentEvent(state, activityEvent("model_activity", { phase: "writing" }, "-2"));
-  expect(state.activity?.phase).toBe("writing");
+  expect(state.activity?.phase).toBe("generating");
   expect(state.activity?.finished).toBe(false);
 
-  // "idle" freezes the last active phase with its ending timestamp.
+  // "idle" freezes the current phase with its ending timestamp.
   state = applyAgentEvent(state, activityEvent("model_activity", { phase: "idle" }, "-idle"));
   expect(state.activity).toEqual({
-    phase: "writing",
+    phase: "idle",
     since: "2026-08-29T00:00:01Z",
     finished: true,
     ended_at: "2026-08-29T00:00:01Z",
@@ -670,12 +715,81 @@ test("model_activity tracks phase changes with a stable since and no text", () =
 
 test("model_activity resets when the next turn starts", () => {
   let state = hydrateThread(view());
+  state = applyAgentEvent(
+    state,
+    activityEvent("turn_started", { user_message: "first" }),
+  );
   state = applyAgentEvent(state, activityEvent("model_activity", { phase: "thinking" }));
   expect(state.activity?.phase).toBe("thinking");
 
   state = applyAgentEvent(
     state,
-    activityEvent("turn_started", { user_message: "再来一轮" }, "-2"),
+    {
+      ...activityEvent("turn_started", { user_message: "再来一轮" }, "-2"),
+      turn_id: "turn-2",
+    },
   );
   expect(state.activity).toBeNull();
+});
+
+test("reconciles approval metadata without rebuilding the live projection", () => {
+  let state = hydrateThread({
+    ...view(),
+    snapshot: { ...view().snapshot, messages: [], latest_turn: null },
+  });
+  state = applyAgentEvent(state, event("turn_started", { user_message: "approve" }));
+  state = applyAgentEvent(
+    state,
+    event("model_text_delta", { text: "partial answer" }),
+  );
+  state = applyAgentEvent(
+    state,
+    event("tool_started", { tool_call_id: "call-live", name: "read_file" }),
+  );
+  const next = reconcileApprovalSnapshot(state, {
+    ...view(),
+    snapshot: {
+      ...view().snapshot,
+      status: "waiting_approval",
+      active_turn_id: "turn-1",
+      pending_approval: {
+        approval_id: "approval-live",
+        tool_call: { id: "call-approval", name: "run_command", arguments: { command: "echo ok" } },
+        reason_code: "COMMAND_REQUIRES_APPROVAL",
+        message: "command requires approval",
+      },
+    },
+  });
+
+  expect(next.messages).toEqual(state.messages);
+  expect(next.provisional).toEqual(state.provisional);
+  expect(next.tools).toEqual([
+    expect.objectContaining({ id: "call-live", status: "running" }),
+    expect.objectContaining({ id: "call-approval", status: "requested" }),
+  ]);
+  expect(next.approval?.approval_id).toBe("approval-live");
+});
+
+test("rejects stale turn deltas and clears activity at a new Turn boundary", () => {
+  let state = hydrateThread({
+    ...view(),
+    snapshot: { ...view().snapshot, messages: [], latest_turn: null },
+  });
+  state = applyAgentEvent(state, event("turn_started", { user_message: "current" }));
+  state = applyAgentEvent(state, event("model_text_delta", { text: "current" }));
+  const stale = applyAgentEvent(state, {
+    ...event("model_text_delta", { text: "stale" }),
+    event_id: "stale-delta",
+    turn_id: "old-turn",
+  });
+  expect(stale.provisional?.text).toBe("current");
+
+  state = applyAgentEvent(state, {
+    ...event("turn_started", { user_message: "next" }),
+    event_id: "turn-2-started",
+    turn_id: "turn-2",
+  });
+  expect(state.tools).toEqual([]);
+  expect(state.activity).toBeNull();
+  expect(state.current_turn_id).toBe("turn-2");
 });

@@ -39,10 +39,12 @@ def test_official_model_profiles_are_the_single_capability_source() -> None:
         "kimi-k2.7-code-highspeed",
         "kimi-k3",
     }
-    assert set(glm.model_profiles) == {"glm-5.2", "glm-5.3"}
+    # Only the officially verified exact GLM model is profiled.  Provider
+    # discovery may still return glm-5.3, but it must remain unknown.
+    assert set(glm.model_profiles) == {"glm-5.2"}
     assert deepseek.capabilities_for("deepseek-v4-pro").context_window_tokens == 1_000_000
     assert kimi.capabilities_for("kimi-k2.7-code").context_window_tokens == 256_000
-    assert glm.capabilities_for("glm-5.3").context_window_tokens == 1_000_000
+    assert glm.capabilities_for("glm-5.3").context_window_tokens is None
 
     unknown = deepseek.capabilities_for("provider-reported-but-unknown")
     assert unknown.context_window_tokens is None
@@ -125,7 +127,7 @@ def test_provider_adapters_map_unified_thinking_to_documented_payloads() -> None
         "thinking": {"type": "disabled"}
     }
 
-    assert body("glm", "glm-5.3", high) == {
+    assert body("glm", "glm-5.2", high) == {
         "thinking": {"type": "enabled"},
         "reasoning_effort": "high",
     }
@@ -143,17 +145,22 @@ def test_output_capability_and_request_policy_are_split() -> None:
     assert flash.model_max_output_tokens == 384_000
     assert flash.default_request_max_tokens == 131_072
 
-    # Unverified families declare no output facts; provider default applies.
+    # Kimi K3's documented completion field has a verified default and hard
+    # maximum; other unverified families defer to provider defaults.
+    kimi_k3 = PROVIDER_PRESETS["moonshot"].capabilities_for("kimi-k3")
+    assert kimi_k3.model_max_output_tokens == 1_048_576
+    assert kimi_k3.default_request_max_tokens == 131_072
     for provider_id, model in (
-        ("moonshot", "kimi-k3"),
         ("moonshot", "kimi-k2.6"),
         ("glm", "glm-5.3"),
-        ("glm", "glm-5.2"),
     ):
         capabilities = PROVIDER_PRESETS[provider_id].capabilities_for(model)
         assert capabilities.model_max_output_tokens is None
         assert capabilities.default_request_max_tokens is None
         assert capabilities.thinking.supports_budget_tokens is False
+    glm = PROVIDER_PRESETS["glm"].capabilities_for("glm-5.2")
+    assert glm.model_max_output_tokens == 128_000
+    assert glm.default_request_max_tokens is None
 
     # Unknown models are never guessed.
     unknown = PROVIDER_PRESETS["deepseek"].capabilities_for("deepseek-unknown")

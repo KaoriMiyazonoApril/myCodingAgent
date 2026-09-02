@@ -30,6 +30,21 @@ if TYPE_CHECKING:
 
 
 OUTPUT_LIMIT_BYTES = 100 * 1024
+DEFAULT_RUN_COMMAND_TIMEOUT_MS = 120_000
+MAX_RUN_COMMAND_TIMEOUT_MS = 900_000
+DEFAULT_EXEC_COMMAND_TIMEOUT_MS = 600_000
+MAX_EXEC_COMMAND_TIMEOUT_MS = 3_600_000
+DEFAULT_PROCESS_IDLE_TIMEOUT_SECONDS = 30 * 60
+
+
+def _validate_timeout_ms(timeout_ms: int, *, maximum: int, name: str) -> None:
+    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int):
+        raise ToolOperationError("INVALID_ARGUMENTS", f"{name} must be an integer")
+    if not 1 <= timeout_ms <= maximum:
+        raise ToolOperationError(
+            "INVALID_ARGUMENTS",
+            f"{name} must be between 1 and {maximum} ms",
+        )
 
 
 async def _write_fd_async(fd: int, data: bytes) -> int:
@@ -631,7 +646,7 @@ class CommandRunner:
         self,
         command: str,
         cwd: str,
-        timeout_ms: int,
+        timeout_ms: int = DEFAULT_RUN_COMMAND_TIMEOUT_MS,
         execution_profile: "ExecutionProfile | None" = None,
     ) -> ToolResult:
         """Synchronous entry point for CLI code and synchronous tests."""
@@ -644,11 +659,17 @@ class CommandRunner:
         self,
         command: str,
         cwd: str,
-        timeout_ms: int,
+        timeout_ms: int = DEFAULT_RUN_COMMAND_TIMEOUT_MS,
         *,
         execution_profile: "ExecutionProfile | None" = None,
     ) -> ToolResult:
         """Run a command with cancellable process-group ownership."""
+
+        _validate_timeout_ms(
+            timeout_ms,
+            maximum=MAX_RUN_COMMAND_TIMEOUT_MS,
+            name="run_command timeout_ms",
+        )
 
         working_directory, relative_cwd = self._filesystem.resolve(cwd)
         if not working_directory.exists():
@@ -1150,7 +1171,7 @@ class ProcessManager:
         *,
         sandbox_backend: CommandSandboxBackend,
         max_sessions: int = 4,
-        idle_timeout_seconds: float = 15 * 60,
+        idle_timeout_seconds: float = DEFAULT_PROCESS_IDLE_TIMEOUT_SECONDS,
         event_sink: Callable[[str, dict[str, Any]], object] | None = None,
         owner_thread_id: str | None = None,
         max_completed_sessions: int | None = None,
@@ -1281,11 +1302,16 @@ class ProcessManager:
         command: str,
         cwd: str = ".",
         yield_time_ms: int = 1000,
-        timeout_ms: int = 60_000,
+        timeout_ms: int = DEFAULT_EXEC_COMMAND_TIMEOUT_MS,
         tty: bool = False,
     ) -> ToolResult:
         if self._closed:
             raise ToolOperationError("PROCESS_MANAGER_CLOSED", "process manager is closed")
+        _validate_timeout_ms(
+            timeout_ms,
+            maximum=MAX_EXEC_COMMAND_TIMEOUT_MS,
+            name="exec_command timeout_ms",
+        )
         working_directory, relative_cwd = self._filesystem.resolve(cwd)
         if not working_directory.exists():
             raise ToolOperationError("NOT_FOUND", f"directory not found: {relative_cwd}")

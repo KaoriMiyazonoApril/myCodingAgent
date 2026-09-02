@@ -196,7 +196,7 @@ TTY 合并输出时必须在 interface/metadata 中明确，不伪造独立 stde
 ### P3.2 ProcessManager lifecycle
 
 每个 Thread 的 local tool composition 拥有一个 `ProcessManager`；session 不进入 AgentLoop/Conversation
-state ownership。默认最大 4 个 active sessions/thread、15 分钟无 interaction idle timeout、每流 100 KiB
+state ownership。默认最大 4 个 active sessions/thread、30 分钟无 interaction idle timeout、每流 100 KiB
 bounded head/tail 或等价明确预算。所有 output reader 必须持续 drain，慢 UI 不得阻塞 child。
 
 Session 在 process exit 后保留最后 unread output，读取终态后回收；timeout 终止 process group；start failure、

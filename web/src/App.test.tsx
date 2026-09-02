@@ -5,7 +5,7 @@ import { App } from "./App";
 
 function appThread(
   threadId: string,
-  thinking: { enabled: boolean; budget_tokens: number | null; keep: null } | null = null,
+  thinking: { enabled: boolean; intensity?: string | null } | null = null,
 ) {
   return {
     schema_version: 1,
@@ -59,8 +59,6 @@ function appThread(
     },
     capabilities: {
       thinking_supported: true,
-      supports_thinking_budget: true,
-      supported_keep_values: ["none", "all"],
     },
   };
 }
@@ -431,7 +429,7 @@ test("keeps a Provider configured when background model discovery fails", async 
     await screen.findByRole("alert"),
   ).toHaveTextContent("模型目录同步失败 · Provider rejected the configured credential");
   expect(screen.getByText("凭据已保存 · ••••-key")).toBeInTheDocument();
-  expect(screen.getByText("已配置")).toBeInTheDocument();
+  expect(screen.getByText("已配置 · 验证失败")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "使用 Custom Model ID" })).toBeInTheDocument();
 });
 
@@ -902,8 +900,6 @@ test("creates switches refreshes and closes Host threads", async () => {
             thread_id: "thread-new",
             capabilities: {
               thinking_supported: false,
-              supports_thinking_budget: false,
-              supported_keep_values: [],
             },
           }),
         } as Response;
@@ -952,7 +948,7 @@ test("creates switches refreshes and closes Host threads", async () => {
     }),
   ).toBeInTheDocument();
   expect(
-    screen.getByRole("button", { name: "当前项目：old" }),
+    await screen.findByRole("button", { name: "当前项目：old" }),
   ).toBeInTheDocument();
   expect(screen.queryByText("thread-existing")).not.toBeInTheDocument();
   expect(
@@ -1349,8 +1345,6 @@ test("shows Skills metadata and capability-gated thread settings", async () => {
     },
     capabilities: {
       thinking_supported: true,
-      supports_thinking_budget: true,
-      supported_keep_values: ["none", "all"],
     },
   };
   vi.stubGlobal(
@@ -1417,8 +1411,6 @@ test("shows Skills metadata and capability-gated thread settings", async () => {
               provider === "moonshot"
                 ? {
                     thinking_supported: false,
-                    supports_thinking_budget: false,
-                    supported_keep_values: [],
                   }
                 : thread.capabilities,
           }),
@@ -1469,8 +1461,6 @@ test("shows Skills metadata and capability-gated thread settings", async () => {
 test("opening and saving unchanged Settings preserves enabled Thinking", async () => {
   const thread = appThread("thread-thinking", {
     enabled: true,
-    budget_tokens: 1_024,
-    keep: null,
   });
   const requests: Array<{ path: string; method: string; body?: string }> = [];
   vi.stubGlobal(
@@ -1546,11 +1536,12 @@ test("opening and saving unchanged Settings preserves enabled Thinking", async (
     ({ path, method }) =>
       path === `/api/threads/${thread.snapshot.thread_id}/settings` && method === "PATCH",
   );
-  expect(JSON.parse(patch?.body ?? "{}").thinking).toEqual({
+  const thinkingPayload = JSON.parse(patch?.body ?? "{}").thinking;
+  expect(thinkingPayload).toEqual({
     enabled: true,
-    budget_tokens: null,
-    keep: null,
   });
+  expect(thinkingPayload).not.toHaveProperty("budget_tokens");
+  expect(thinkingPayload).not.toHaveProperty("keep");
 });
 
 test("keeps Settings save disabled until the exact capability preview resolves", async () => {
@@ -1558,8 +1549,6 @@ test("keeps Settings save disabled until the exact capability preview resolves",
   try {
     const thread = appThread("thread-thinking-pending", {
       enabled: true,
-      budget_tokens: null,
-      keep: null,
     });
     const requests: Array<{ path: string; method: string; body?: string }> = [];
     let resolvePreview: (response: Response) => void = () => undefined;
@@ -1658,11 +1647,12 @@ test("keeps Settings save disabled until the exact capability preview resolves",
       await Promise.resolve();
     });
     const patch = requests.find(({ method }) => method === "PATCH");
-    expect(JSON.parse(patch?.body ?? "{}").thinking).toEqual({
+    const thinkingPayload = JSON.parse(patch?.body ?? "{}").thinking;
+    expect(thinkingPayload).toEqual({
       enabled: true,
-      budget_tokens: null,
-      keep: null,
     });
+    expect(thinkingPayload).not.toHaveProperty("budget_tokens");
+    expect(thinkingPayload).not.toHaveProperty("keep");
   } finally {
     vi.useRealTimers();
   }
@@ -1673,8 +1663,6 @@ test("keeps Settings save disabled when the capability preview fails", async () 
   try {
     const thread = appThread("thread-thinking-error", {
       enabled: true,
-      budget_tokens: 1_024,
-      keep: null,
     });
     const requests: Array<{ path: string; method: string; body?: string }> = [];
     let rejectPreview: (reason?: unknown) => void = () => undefined;
@@ -1804,6 +1792,16 @@ test("updates the Skills button from a live skill_loaded event", async () => {
       return current;
     });
     source.onopen?.(new Event("open"));
+    source.emit("turn_started", {
+      schema_version: 1,
+      event_id: "turn-live-started",
+      thread_id: thread.snapshot.thread_id,
+      turn_id: "turn-live",
+      sequence: 1,
+      type: "turn_started",
+      timestamp: "2026-08-29T00:00:00Z",
+      payload: { user_message: "load skills" },
+    });
     source.emit("skill_loaded", {
       schema_version: 1,
       event_id: "skill-loaded-live",
@@ -1899,7 +1897,7 @@ test("hydrates an approval card, shows its risk summary, and resolves once", asy
   try {
     render(<App />);
     await screen.findByRole("button", { name: "技能" });
-    expect(screen.getByText("run_command")).toBeInTheDocument();
+    expect(screen.getAllByText("run_command").length).toBeGreaterThan(0);
     expect(screen.getByRole("alert", { name: "等待确认" })).toHaveTextContent(
       "rm -rf build",
     );

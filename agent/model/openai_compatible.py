@@ -62,6 +62,18 @@ _DEEPSEEK_EFFORT_MAPPING = {
     "max": "max",
 }
 
+# GLM accepts a broader compatibility effort vocabulary but applies these
+# canonical mappings on its Chat Completions endpoint.  ``none`` and
+# ``minimal`` intentionally disable thinking rather than being sent as an
+# unsupported effort value.
+_GLM_EFFORT_MAPPING = {
+    "low": "high",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+
 
 class OpenAICompatibleProvider(LLMProvider):
     """One Chat Completions adapter for DeepSeek, Kimi/Moonshot, and GLM.
@@ -241,9 +253,21 @@ class OpenAICompatibleProvider(LLMProvider):
             )
 
     def _build_request_payload(self, request: LLMRequest, *, stream: bool) -> dict[str, Any]:
+        output_field = "max_tokens"
+        if (
+            self.capabilities.thinking_parameter_style
+            is ThinkingParameterStyle.KIMI_REASONING_EFFORT
+        ):
+            # Kimi K3 documents max_completion_tokens.  The value has already
+            # been resolved by Runtime; this adapter only translates the
+            # vendor field name and never creates a default limit.
+            output_field = "max_completion_tokens"
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "messages": self._encode_messages(request.messages),
+            "messages": self._encode_messages(
+                request.messages,
+                thinking_request=request.thinking,
+            ),
             "stream": stream,
         }
         if request.tools:
@@ -251,7 +275,7 @@ class OpenAICompatibleProvider(LLMProvider):
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.max_tokens is not None:
-            payload["max_tokens"] = request.max_tokens
+            payload[output_field] = request.max_tokens
         adapter_body = self._thinking_extra_body(request.thinking)
         if request.extra_body and adapter_body:
             adapter_body = {**request.extra_body, **adapter_body}
@@ -270,27 +294,54 @@ class OpenAICompatibleProvider(LLMProvider):
 
         if thinking_request is None:
             return None
+        # An unknown model is represented by a fully conservative capability
+        # object.  Do not serialize a generic thinking shape merely because a
+        # caller supplied one at this low-level seam.
+        if not self.capabilities.thinking.supported:
+            return None
         style = self.capabilities.thinking_parameter_style
         enabled = thinking_request.enabled
         intensity = thinking_request.intensity
         if style is ThinkingParameterStyle.KIMI_ALWAYS_ON:
+            # Kimi K2.7 Code/Highspeed documentation says no thinking
+            # parameter is needed: omission keeps the model's fixed
+            # Preserved Thinking=all behavior. Never invent keep=all here.
             return None
         if style is ThinkingParameterStyle.KIMI_REASONING_EFFORT:
-            return {"reasoning_effort": intensity} if enabled and intensity else None
+            if enabled and intensity in {"low", "high", "max"}:
+                return {"reasoning_effort": intensity}
+            return None
         if style is ThinkingParameterStyle.KIMI_TOGGLE:
-            return {"thinking": {"type": "enabled" if enabled else "disabled"}}
+            vendor_thinking: dict[str, object] = {
+                "type": "enabled" if enabled else "disabled"
+            }
+            # K2.6 is the only exact profile that supports an explicit
+            # preserved-thinking request.  Do not send ``keep: none`` or an
+            # implicit default; absence is the documented default.
+            if enabled and thinking_request.keep == "all":
+                vendor_thinking["keep"] = "all"
+            return {"thinking": vendor_thinking}
         if style in {ThinkingParameterStyle.DEEPSEEK_V4, ThinkingParameterStyle.GLM}:
             # Official wire format (2026-09): thinking.type toggles; the
             # reasoning effort travels as a top-level request parameter.
             # Neither vendor supports budget_tokens or keep on these styles.
+            effective_enabled = enabled
+            mapped: str | None = None
+            if enabled and intensity is not None:
+                if style is ThinkingParameterStyle.DEEPSEEK_V4:
+                    mapped = _DEEPSEEK_EFFORT_MAPPING.get(intensity)
+                else:
+                    # GLM's ``none``/``minimal`` compatibility inputs mean
+                    # the same thing as disabling thinking.
+                    if intensity in {"none", "minimal"}:
+                        effective_enabled = False
+                    else:
+                        mapped = _GLM_EFFORT_MAPPING.get(intensity)
             vendor_thinking: dict[str, object] = {
-                "type": "enabled" if enabled else "disabled"
+                "type": "enabled" if effective_enabled else "disabled"
             }
             result: dict[str, object] = {"thinking": vendor_thinking}
-            if enabled and intensity is not None:
-                mapped = intensity
-                if style is ThinkingParameterStyle.DEEPSEEK_V4:
-                    mapped = _DEEPSEEK_EFFORT_MAPPING.get(intensity, intensity)
+            if effective_enabled and mapped is not None:
                 result["reasoning_effort"] = mapped
             return result
         # Generic fallback keeps the full escape hatch for endpoints that
@@ -304,13 +355,25 @@ class OpenAICompatibleProvider(LLMProvider):
             vendor_thinking["intensity"] = intensity
         return {"thinking": vendor_thinking}
 
-    def _encode_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
+    def _encode_messages(
+        self,
+        messages: list[Message],
+        *,
+        thinking_request: ThinkingRequest | None = None,
+    ) -> list[dict[str, Any]]:
         encoded: list[dict[str, Any]] = []
         for message in messages:
-            encoded.extend(self._encode_message(message))
+            encoded.extend(
+                self._encode_message(message, thinking_request=thinking_request)
+            )
         return encoded
 
-    def _encode_message(self, message: Message) -> list[dict[str, Any]]:
+    def _encode_message(
+        self,
+        message: Message,
+        *,
+        thinking_request: ThinkingRequest | None = None,
+    ) -> list[dict[str, Any]]:
         if message.role == "tool":
             return self._encode_tool_results(message.content)
 
@@ -331,6 +394,14 @@ class OpenAICompatibleProvider(LLMProvider):
             capabilities.reasoning_retention is ReasoningRetention.TOOL_CHAIN_ONLY
             and bool(tool_calls)
         )
+        if capabilities.thinking_parameter_style is ThinkingParameterStyle.KIMI_TOGGLE:
+            # Kimi K2.6 only asks the API to preserve thinking when the
+            # request explicitly carries keep=all.  Its static provider
+            # default is intentionally not enough to replay reasoning.
+            preserve_reasoning = bool(
+                thinking_request is not None
+                and thinking_request.keep == "all"
+            )
         if (
             reasoning_parts
             and preserve_reasoning

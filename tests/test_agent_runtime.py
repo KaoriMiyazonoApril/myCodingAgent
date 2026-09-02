@@ -416,9 +416,10 @@ def test_runtime_capability_preview_uses_candidate_provider_and_model(tmp_path) 
     )
 
     assert first["thinking_supported"] is True
-    assert first["supports_thinking_budget"] is True
+    assert "supports_thinking_budget" not in first
+    assert "supported_keep_values" not in first
     assert candidate["thinking_supported"] is False
-    assert candidate["supports_thinking_budget"] is False
+    assert "supports_thinking_budget" not in candidate
 
     # Empty drafts are invalid candidates, not a request to inherit the
     # current Thread values.  A capability preview must fail closed before a
@@ -434,9 +435,9 @@ def test_runtime_capability_preview_uses_candidate_provider_and_model(tmp_path) 
         model="model-missing",
     )
     assert empty["thinking_supported"] is False
-    assert empty["supports_thinking_budget"] is False
+    assert "supports_thinking_budget" not in empty
     assert unknown["thinking_supported"] is False
-    assert unknown["supports_thinking_budget"] is False
+    assert "supports_thinking_budget" not in unknown
 
 
 def test_checkpoint_save_rolls_back_memory_when_persistence_fails(tmp_path) -> None:
@@ -476,9 +477,9 @@ def test_runtime_public_defaults_are_explicit_and_versioned(tmp_path) -> None:
     snapshot = runtime.create_thread(tmp_path)
 
     assert snapshot.settings.version == 0
-    assert snapshot.settings.limits.max_iterations == 20
-    assert snapshot.settings.limits.max_tool_calls == 50
-    assert snapshot.settings.limits.max_execution_seconds == 900
+    assert snapshot.settings.limits.max_iterations == 60
+    assert snapshot.settings.limits.max_tool_calls == 200
+    assert snapshot.settings.limits.max_execution_seconds == 3600
 
 
 def test_thread_creation_can_freeze_optional_initial_settings(tmp_path) -> None:
@@ -1133,7 +1134,7 @@ def test_event_ring_buffer_drops_old_events_and_marks_expired_cursor(
 
 @pytest.mark.parametrize(
     ("visibility", "reasoning_event_count", "preview_present"),
-    [("hidden", 0, False), ("visible", 0, True), ("debug", 1, True)],
+    [("hidden", 0, False), ("debug", 1, False)],
 )
 def test_reasoning_is_only_emitted_as_a_dedicated_debug_event(
     tmp_path, visibility, reasoning_event_count, preview_present
@@ -1169,19 +1170,15 @@ def test_reasoning_is_only_emitted_as_a_dedicated_debug_event(
     snapshot_json = json.dumps(runtime.get_snapshot(thread.thread_id).to_dict())
 
     assert len(reasoning_events) == reasoning_event_count
-    # The canonical conversation never carries reasoning, regardless of mode.
+    # Public snapshot hydration filters reasoning, while canonical internal
+    # history remains complete for provider continuity.
     assert "sensitive chain" not in snapshot_json
     model_payload = next(
         event.payload for event in events if event.type == "model_response"
     )
-    if preview_present:
-        assert model_payload["reasoning_preview"] == {
-            "text": "sensitive chain",
-            "truncated": False,
-            "total_chars": 15,
-        }
-    else:
-        assert "reasoning_preview" not in model_payload
+    # Reasoning is never embedded in model_response.  Debug diagnostics use
+    # the separately named model_reasoning event only.
+    assert "reasoning_preview" not in model_payload
     if visibility == "debug":
         assert reasoning_events[0].payload == {
             "iteration": 1,
@@ -1588,7 +1585,7 @@ def test_turn_request_max_tokens_matches_resolved_output_limit(tmp_path) -> None
     assert asyncio.run(scenario(ProviderCapabilities())) is None
 
 
-@pytest.mark.parametrize("visibility", ["hidden", "visible", "debug"])
+@pytest.mark.parametrize("visibility", ["hidden", "debug"])
 def test_reasoning_delta_gating_follows_visibility(tmp_path, visibility) -> None:
     class DeltaProvider(LLMProvider):
         capabilities = ProviderCapabilities(
@@ -1629,13 +1626,13 @@ def test_reasoning_delta_gating_follows_visibility(tmp_path, visibility) -> None
         ]
         assert reasoning_deltas == ["private reasoning text"]
     # Activity feedback is phase-change-only and carries no reasoning text:
-    # one "thinking", one "writing" (first text), one "idle" (response end).
+    # one "thinking", one "generating" (first text), one "idle" (response end).
     activity_phases = [
         event.payload["phase"]
         for event in events
         if event.type == "model_activity"
     ]
-    assert activity_phases == ["thinking", "writing", "idle"]
+    assert activity_phases == ["thinking", "generating", "idle"]
     assert all(
         "text" not in event.payload for event in events if event.type == "model_activity"
     )
@@ -2150,14 +2147,14 @@ def final_response(text: str = "Done.") -> LLMResponse:
     )
 
 
-def test_retryable_model_errors_recover_within_three_attempts(tmp_path) -> None:
+def test_retryable_model_errors_recover_within_five_attempts(tmp_path) -> None:
     class RecoveringProvider(LLMProvider):
         def __init__(self) -> None:
             self.calls = 0
 
         async def chat(self, request: LLMRequest) -> LLMResponse:
             self.calls += 1
-            if self.calls < 3:
+            if self.calls < 5:
                 raise LLMConnectionError("temporary provider outage")
             return final_response("Recovered.")
 
@@ -2167,7 +2164,7 @@ def test_retryable_model_errors_recover_within_three_attempts(tmp_path) -> None:
 
     summary = asyncio.run(runtime.run_turn(thread.thread_id, "Retry safely."))
 
-    assert provider.calls == 3
+    assert provider.calls == 5
     assert summary.status is TurnStatus.COMPLETED
     assert summary.final_text == "Recovered."
     assert summary.iterations == 1
@@ -2313,7 +2310,7 @@ def test_truncated_response_with_tool_calls_still_executes_tools(tmp_path) -> No
     assert summary.final_text == "Done."
 
 
-def test_visible_reasoning_preview_is_bounded_on_model_response(tmp_path) -> None:
+def test_debug_reasoning_is_dedicated_and_not_embedded_in_model_response(tmp_path) -> None:
     long_reasoning = "r" * 5000
     provider = ScriptedProvider(
         [
@@ -2336,7 +2333,7 @@ def test_visible_reasoning_preview_is_bounded_on_model_response(tmp_path) -> Non
             provider_config_id="test-provider", model="test-model"
         ),
         tool_registry_factory=empty_tools,
-        reasoning_visibility="visible",
+        reasoning_visibility="debug",
     )
     thread = runtime.create_thread(tmp_path)
 
@@ -2346,10 +2343,9 @@ def test_visible_reasoning_preview_is_bounded_on_model_response(tmp_path) -> Non
         event.payload for event in events if event.type == "model_response"
     )
 
-    preview = model_payload["reasoning_preview"]
-    assert preview["truncated"] is True
-    assert preview["total_chars"] == 5000
-    assert len(preview["text"]) == 3000
+    assert "reasoning_preview" not in model_payload
+    debug = next(event for event in events if event.type == "model_reasoning")
+    assert debug.payload["text"] == long_reasoning
 
 
 def test_tool_budget_preserves_a_result_for_every_unexecuted_call(tmp_path) -> None:
