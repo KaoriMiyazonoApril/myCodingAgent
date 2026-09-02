@@ -15,9 +15,11 @@ from agent.model.types import (
     LLMRequest,
     LLMResponse,
     MessageEndEvent,
+    ProviderCapabilities,
     ProviderConfig,
     ReasoningDeltaEvent,
     TextDeltaEvent,
+    ThinkingCapabilities,
     ToolCallDeltaEvent,
     Usage,
 )
@@ -197,6 +199,95 @@ def _config() -> TurnConfig:
         system_prompt="system",
         reasoning_visibility="hidden",
     )
+
+
+def test_model_invoker_fills_default_thinking_budget_when_supported() -> None:
+    from agent.runtime import ThinkingSettings
+    from agent.runtime.settings import ModelSettings
+
+    class Recording(LLMProvider):
+        def __init__(self, supports_budget: bool) -> None:
+            self.capabilities = ProviderCapabilities(
+                thinking=ThinkingCapabilities(
+                    supported=True,
+                    default_enabled=True,
+                    supports_budget_tokens=supports_budget,
+                )
+            )
+            self.requests: list[LLMRequest] = []
+
+        async def chat(self, request: LLMRequest) -> LLMResponse:
+            self.requests.append(request)
+            return LLMResponse(
+                message=Message(role="assistant", content=[TextBlock(text="ok")]),
+                finish_reason="stop",
+                usage=Usage(),
+            )
+
+    def config_with_thinking() -> TurnConfig:
+        return TurnConfig.from_model_settings(
+            ModelSettings(
+                provider_config_id="p",
+                model="m",
+                thinking=ThinkingSettings(enabled=True),
+            ),
+            settings_version=0,
+            system_prompt="system",
+            reasoning_visibility="hidden",
+        )
+
+    def config_without_thinking() -> TurnConfig:
+        return TurnConfig.from_model_settings(
+            ModelSettings(provider_config_id="p", model="m"),
+            settings_version=0,
+            system_prompt="system",
+            reasoning_visibility="hidden",
+        )
+
+    with_budget = Recording(supports_budget=True)
+    asyncio.run(ModelInvoker(with_budget, config_with_thinking()).chat([], []))
+    assert with_budget.requests[0].thinking is not None
+    assert with_budget.requests[0].thinking.budget_tokens == 32_768
+
+    without_budget = Recording(supports_budget=False)
+    asyncio.run(ModelInvoker(without_budget, config_with_thinking()).chat([], []))
+    assert without_budget.requests[0].thinking is not None
+    assert without_budget.requests[0].thinking.budget_tokens is None
+
+    # No explicit settings but the model thinks by default and accepts a
+    # budget: synthesize an explicit bounded thinking request instead of
+    # leaving the provider to spend the whole output allowance on reasoning.
+    unbounded = Recording(supports_budget=True)
+    asyncio.run(ModelInvoker(unbounded, config_without_thinking()).chat([], []))
+    synthesized = unbounded.requests[0].thinking
+    assert synthesized is not None
+    assert synthesized.enabled is True
+    assert synthesized.budget_tokens == 32_768
+
+    # Default-on thinking without budget support keeps the established "no
+    # thinking parameter" behavior; only budget-capable providers change.
+    no_budget = Recording(supports_budget=False)
+    no_budget.capabilities = ProviderCapabilities(
+        thinking=ThinkingCapabilities(
+            supported=True,
+            default_enabled=True,
+            supports_budget_tokens=False,
+        )
+    )
+    asyncio.run(ModelInvoker(no_budget, config_without_thinking()).chat([], []))
+    assert no_budget.requests[0].thinking is None
+
+    # A model that does not think by default stays untouched when unconfigured.
+    explicit_off = Recording(supports_budget=False)
+    explicit_off.capabilities = ProviderCapabilities(
+        thinking=ThinkingCapabilities(
+            supported=True,
+            default_enabled=False,
+            supports_budget_tokens=True,
+        )
+    )
+    asyncio.run(ModelInvoker(explicit_off, config_without_thinking()).chat([], []))
+    assert explicit_off.requests[0].thinking is None
 
 
 def test_model_stream_retries_before_first_delta_but_not_after_output() -> None:

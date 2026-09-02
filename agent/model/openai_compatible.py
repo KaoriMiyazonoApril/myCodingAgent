@@ -240,6 +240,8 @@ class OpenAICompatibleProvider(LLMProvider):
             payload["temperature"] = request.temperature
         if request.max_tokens is not None:
             payload["max_tokens"] = request.max_tokens
+        elif self.config.max_output_tokens is not None:
+            payload["max_tokens"] = self.config.max_output_tokens
         adapter_body = self._thinking_extra_body(request.thinking)
         if request.extra_body and adapter_body:
             adapter_body = {**request.extra_body, **adapter_body}

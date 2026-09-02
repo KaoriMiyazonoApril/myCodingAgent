@@ -2357,6 +2357,17 @@ function ConversationFeed({
             <p className="message-role">
               {message.role === "user" ? "你" : "编码助手"}
             </p>
+            {message.role === "assistant" && message.reasoning ? (
+              <details className="message-reasoning">
+                <summary>
+                  思考过程
+                  {message.reasoning.truncated
+                    ? `(已截断，共 ${message.reasoning.total_chars ?? "?"} 字符)`
+                    : ""}
+                </summary>
+                <p>{message.reasoning.text}</p>
+              </details>
+            ) : null}
             <p>{message.text}</p>
           </article>
         ))}
@@ -2372,10 +2383,13 @@ function ConversationFeed({
           state.provisional.tool_calls.length > 0) ? (
           <article className="message assistant provisional-message" aria-live="polite">
             <p className="message-role">编码助手 · 正在生成</p>
-            {state.provisional.text ? <p>{state.provisional.text}</p> : null}
             {state.provisional.reasoning ? (
-              <p className="message-reasoning">{state.provisional.reasoning}</p>
+              <details className="message-reasoning" open>
+                <summary>思考中…</summary>
+                <p>{state.provisional.reasoning}</p>
+              </details>
             ) : null}
+            {state.provisional.text ? <p>{state.provisional.text}</p> : null}
             {state.provisional.tool_calls.length > 0 ? (
               <ul className="provisional-tool-calls">
                 {state.provisional.tool_calls.map((call) => (
@@ -2482,11 +2496,25 @@ function ConversationFeed({
       {state.error ? (
         <div className="inline-error" role="alert">
           <strong>{state.error.code}</strong> · {state.error.message}
+          {state.error.detail ? (
+            <p className="inline-error-detail">{state.error.detail}</p>
+          ) : null}
+          {BUSY_ERROR_HINTS[state.error.code] ? (
+            <p className="inline-error-detail">{BUSY_ERROR_HINTS[state.error.code]}</p>
+          ) : null}
         </div>
       ) : null}
     </section>
   );
 }
+
+// Busy rejections are transient: the workspace lease is released when the
+// occupying Turn ends.  Explain that instead of letting the code look fatal.
+const BUSY_ERROR_HINTS: Record<string, string> = {
+  WORKSPACE_BUSY:
+    "同一工作区（或其上级/子目录）正被另一个任务占用，任务结束后会自动释放，请稍后重试。",
+  THREAD_BUSY: "该对话已有任务在进行中，请等待当前任务结束。",
+};
 
 function ApprovalCard({
   approval,

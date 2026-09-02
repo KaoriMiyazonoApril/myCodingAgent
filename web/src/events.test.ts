@@ -539,3 +539,70 @@ test("renders streaming deltas provisionally and clears them on canonical respon
     text: "生",
   });
 });
+
+test("bounds live reasoning deltas and keeps the committed preview on the message", () => {
+  let state = hydrateThread({
+    ...view(),
+    snapshot: { ...view().snapshot, messages: [], latest_turn: null },
+  });
+  state = applyAgentEvent(
+    state,
+    event("turn_started", { user_message: "Explain it" }),
+  );
+  const hugeReasoning = "r".repeat(5000);
+  state = applyAgentEvent(
+    state,
+    event("model_reasoning_delta", { text: hugeReasoning }),
+  );
+  expect(state.provisional?.reasoning.length).toBe(4096);
+
+  state = applyAgentEvent(
+    state,
+    event("model_response", {
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Done." }],
+      },
+      reasoning_preview: {
+        text: "first 3000 chars",
+        truncated: true,
+        total_chars: 5000,
+      },
+    }),
+  );
+
+  expect(state.provisional).toBeNull();
+  expect(state.messages.at(-1)).toEqual({
+    id: "model_response-id-text",
+    role: "assistant",
+    text: "Done.",
+    reasoning: {
+      text: "first 3000 chars",
+      truncated: true,
+      total_chars: 5000,
+    },
+  });
+});
+
+test("keeps rejection detail and carries busy codes verbatim", () => {
+  let state = hydrateThread({
+    ...view(),
+    snapshot: { ...view().snapshot, messages: [], latest_turn: null },
+  });
+  state = applyAgentEvent(
+    state,
+    event("turn_rejected", {
+      error: {
+        code: "WORKSPACE_BUSY",
+        message: "Turn could not start",
+        detail: "workspace overlaps an active Turn: /workspace",
+      },
+    }),
+  );
+
+  expect(state.error).toEqual({
+    code: "WORKSPACE_BUSY",
+    message: "Turn could not start",
+    detail: "workspace overlaps an active Turn: /workspace",
+  });
+});

@@ -27,7 +27,18 @@ export type ConversationMessage = {
   id: string;
   role: "user" | "assistant";
   text: string;
+  reasoning?: ReasoningPreview;
 };
+
+export type ReasoningPreview = {
+  text: string;
+  truncated?: boolean;
+  total_chars?: number;
+};
+
+// Reasoning chains can be far larger than the visible answer.  Keep the
+// live stream and the committed preview bounded so the UI stays responsive.
+const REASONING_LIVE_CAP = 4096;
 
 export type ToolActivity = {
   id: string;
@@ -64,7 +75,7 @@ export type EventState = {
   messages: ConversationMessage[];
   tools: ToolActivity[];
   terminal: Record<string, unknown> | null;
-  error: { code: string; message: string } | null;
+  error: { code: string; message: string; detail?: string } | null;
   files: FileChange[];
   cancel_requested: boolean;
   approval: ApprovalRequest | null;
@@ -198,7 +209,8 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     next.provisional = null;
     const message = event.payload.message;
     if (isRecord(message)) {
-      hydrateMessage(next, message, event.event_id);
+      const preview = safeReasoningPreview(event.payload.reasoning_preview);
+      hydrateMessage(next, message, event.event_id, preview);
     }
   } else if (event.type === "model_text_delta") {
     const provisional = ensureProvisional(next, event.turn_id);
@@ -207,8 +219,14 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
     }
   } else if (event.type === "model_reasoning_delta") {
     const provisional = ensureProvisional(next, event.turn_id);
-    if (typeof event.payload.text === "string") {
-      provisional.reasoning += event.payload.text;
+    if (
+      typeof event.payload.text === "string" &&
+      provisional.reasoning.length < REASONING_LIVE_CAP
+    ) {
+      provisional.reasoning += event.payload.text.slice(
+        0,
+        REASONING_LIVE_CAP - provisional.reasoning.length,
+      );
     }
   } else if (event.type === "model_tool_call_delta") {
     const provisional = ensureProvisional(next, event.turn_id);
@@ -397,6 +415,7 @@ function hydrateMessage(
   state: EventState,
   message: Record<string, unknown>,
   idPrefix: string,
+  reasoning?: ReasoningPreview,
 ) {
   const role = message.role;
   const content = message.content;
@@ -410,7 +429,12 @@ function hydrateMessage(
       .map((block) => block.text as string)
       .join("");
     if (text) {
-      state.messages.push({ id: `${idPrefix}-text`, role, text });
+      state.messages.push({
+        id: `${idPrefix}-text`,
+        role,
+        text,
+        ...(reasoning === undefined ? {} : { reasoning }),
+      });
     }
   }
   content.filter(isRecord).forEach((block) => {
@@ -507,10 +531,28 @@ function mergeFile(state: EventState, incoming: FileChange) {
 }
 
 function safeError(value: Record<string, unknown>) {
-  return {
+  const error: { code: string; message: string; detail?: string } = {
     code: typeof value.code === "string" ? value.code : "RUNTIME_ERROR",
     message: typeof value.message === "string" ? value.message : "Turn failed",
   };
+  if (typeof value.detail === "string" && value.detail) {
+    error.detail = value.detail;
+  }
+  return error;
+}
+
+function safeReasoningPreview(value: unknown): ReasoningPreview | undefined {
+  if (!isRecord(value) || typeof value.text !== "string") {
+    return undefined;
+  }
+  const preview: ReasoningPreview = { text: value.text };
+  if (typeof value.truncated === "boolean") {
+    preview.truncated = value.truncated;
+  }
+  if (typeof value.total_chars === "number") {
+    preview.total_chars = value.total_chars;
+  }
+  return preview;
 }
 
 function normalizeSkills(value: unknown): ThreadSkills {

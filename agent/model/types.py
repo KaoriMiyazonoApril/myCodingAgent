@@ -227,6 +227,7 @@ class ModelProfile:
     requires_assistant_content_for_tool_calls: bool | None = None
     thinking: ThinkingCapabilities | None = None
     context_window_tokens: int | None | _Unset = _UNSET
+    max_output_tokens: int | None = None
     working_tail_mode: WorkingTailMode | str | _Unset = _UNSET
     thinking_parameter_style: ThinkingParameterStyle | str | _Unset = _UNSET
 
@@ -342,6 +343,7 @@ class ProviderConfig:
     api_key: str = field(repr=False)
     model: str
     timeout: float | None = None
+    max_output_tokens: int | None = None
     capabilities: ProviderCapabilities = field(default_factory=ProviderCapabilities)
 
     def __post_init__(self) -> None:
@@ -372,6 +374,12 @@ class ProviderConfig:
             or self.timeout <= 0
         ):
             raise LLMConfigurationError("timeout must be a positive number")
+        if self.max_output_tokens is not None and (
+            isinstance(self.max_output_tokens, bool)
+            or not isinstance(self.max_output_tokens, int)
+            or self.max_output_tokens <= 0
+        ):
+            raise LLMConfigurationError("max_output_tokens must be a positive integer")
 
 
 @dataclass(slots=True)

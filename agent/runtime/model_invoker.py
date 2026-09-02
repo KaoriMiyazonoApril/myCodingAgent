@@ -26,6 +26,11 @@ from agent.tools.types import ToolDefinition
 from .message_assembler import MessageAssembler
 from .settings import TurnConfig
 
+# Reasoning runs inside the provider's output budget; without a budget the
+# model can spend the entire allowance thinking and get truncated before any
+# content appears.  Cap thinking so content keeps headroom.
+_DEFAULT_THINKING_BUDGET_TOKENS = 32_768
+
 
 class ModelInvoker:
     """Apply one frozen Turn configuration to every model request."""
@@ -48,6 +53,48 @@ class ModelInvoker:
         if config.thinking is not None:
             config.thinking.validate_for(provider.capabilities.thinking)
 
+    def _thinking_request(self) -> ThinkingRequest | None:
+        """Freeze thinking settings, filling a default budget when the provider
+        supports one and none was configured."""
+
+        settings = self._config.thinking
+        capabilities = self._provider.capabilities.thinking
+        if settings is None:
+            # Only synthesize an explicit request when the provider also
+            # accepts a thinking budget: that is where an unbounded default
+            # can silently consume the whole output allowance before any
+            # content appears.  Other providers keep their established
+            # "no thinking parameter" default.
+            if not (
+                capabilities.supported
+                and capabilities.default_enabled
+                and capabilities.supports_budget_tokens
+            ):
+                return None
+            return ThinkingRequest(
+                enabled=True,
+                budget_tokens=_DEFAULT_THINKING_BUDGET_TOKENS,
+                keep=None,
+                intensity=None,
+            )
+        budget_tokens = settings.budget_tokens
+        if (
+            settings.enabled
+            and budget_tokens is None
+            and capabilities.supports_budget_tokens
+        ):
+            budget_tokens = _DEFAULT_THINKING_BUDGET_TOKENS
+        return ThinkingRequest(
+            enabled=settings.enabled,
+            budget_tokens=budget_tokens,
+            keep=(
+                None
+                if settings.keep is None
+                else settings.keep.value
+            ),
+            intensity=settings.intensity,
+        )
+
     async def chat(
         self,
         messages: list[Message],
@@ -58,20 +105,7 @@ class ModelInvoker:
             tools=tools,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
-            thinking=(
-                ThinkingRequest(
-                    enabled=self._config.thinking.enabled,
-                    budget_tokens=self._config.thinking.budget_tokens,
-                    keep=(
-                        None
-                        if self._config.thinking.keep is None
-                        else self._config.thinking.keep.value
-                    ),
-                    intensity=self._config.thinking.intensity,
-                )
-                if self._config.thinking is not None
-                else None
-            ),
+            thinking=self._thinking_request(),
         )
         for attempt in range(3):
             try:
@@ -102,20 +136,7 @@ class ModelInvoker:
             tools=tools,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
-            thinking=(
-                ThinkingRequest(
-                    enabled=self._config.thinking.enabled,
-                    budget_tokens=self._config.thinking.budget_tokens,
-                    keep=(
-                        None
-                        if self._config.thinking.keep is None
-                        else self._config.thinking.keep.value
-                    ),
-                    intensity=self._config.thinking.intensity,
-                )
-                if self._config.thinking is not None
-                else None
-            ),
+            thinking=self._thinking_request(),
         )
         if type(self._provider).stream is LLMProvider.stream:
             # Preserve the established chat seam for providers that have not

@@ -196,8 +196,10 @@ class ThreadRuntime:
         default_context_window_tokens: int = 32_000,
         store: ThreadStore | None = None,
     ) -> None:
-        if reasoning_visibility not in {"hidden", "debug"}:
-            raise ValueError("reasoning_visibility must be 'hidden' or 'debug'")
+        if reasoning_visibility not in {"hidden", "visible", "debug"}:
+            raise ValueError(
+                "reasoning_visibility must be 'hidden', 'visible' or 'debug'"
+            )
         if (
             isinstance(event_buffer_capacity, bool)
             or not isinstance(event_buffer_capacity, int)
@@ -1145,6 +1147,19 @@ class ThreadRuntime:
                 event_type="turn_completed",
             )
         except TurnLimitReached as error:
+            public_error = None
+            if error.reason == "output_length":
+                public_error = {
+                    "code": "OUTPUT_TRUNCATED",
+                    "message": (
+                        "model output was truncated before the response completed"
+                    ),
+                }
+            elif error.reason == "empty_response":
+                public_error = {
+                    "code": "EMPTY_RESPONSE",
+                    "message": "model finished without any text or tool calls",
+                }
             return self._finish_turn(
                 record,
                 active_turn,
@@ -1152,6 +1167,7 @@ class ThreadRuntime:
                 stop_reason=error.reason,
                 final_text=controller.last_assistant_text,
                 event_type="turn_limit_reached",
+                error=public_error,
             )
         except asyncio.CancelledError:
             # Cancellation can arrive after a process-starting tool has returned,
@@ -1450,7 +1466,16 @@ class ThreadRuntime:
             public_code = getattr(error, "code", None)
             code = public_code if isinstance(public_code, str) else "PREFLIGHT_FAILED"
             message = "Turn could not start"
-        return {"error": {"code": code, "message": message}}
+        # Expose the concrete reason (e.g. which workspace overlaps an active
+        # Turn) without leaking internal exception types.
+        detail = str(error) if str(error) else None
+        return {
+            "error": {
+                "code": code,
+                "message": message,
+                "detail": detail,
+            }
+        }
 
     @staticmethod
     def _set_waiting(record: _ThreadRecord, waiting: bool) -> None:

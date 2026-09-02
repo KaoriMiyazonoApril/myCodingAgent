@@ -219,12 +219,14 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 - Turn submission never awaits the terminal Turn result. It schedules `run_turn` and returns accepted as soon as the task is registered.
 - Workspace validation reaches an actual asynchronous suspension promptly because its scan runs in a worker. A large workspace therefore cannot block the Host event loop while preflight runs.
 - The TaskManager's submission record covers the interval before Runtime becomes active, allowing refresh, duplicate detection, and Stop during preflight.
-- Expected Runtime rejection is represented by `turn_rejected`. Infrastructure exceptions are converted to safe Host errors and remain visible through the Thread view; Host errors do not masquerade as Runtime AgentEvents or create a competing replay cursor.
+- Expected Runtime rejection is represented by `turn_rejected`. Its error envelope carries a stable code, safe message and optional `detail` (for example the overlapping workspace path). `WORKSPACE_BUSY` / `THREAD_BUSY` are transient rejections: the lease is released when the occupying Turn ends, so the UI explains them and invites a retry instead of treating them as fatal. Infrastructure exceptions are converted to safe Host errors and remain visible through the Thread view; Host errors do not masquerade as Runtime AgentEvents or create a competing replay cursor.
+- A model response with no tool calls but `finish_reason=length`, or with no text and no tool calls, no longer ends the Turn as a silent success: the Turn stops with `turn_limit_reached` and an error code of `OUTPUT_TRUNCATED` or `EMPTY_RESPONSE` so the UI can show why nothing usable was produced.
 
 ### SSE event transport and recovery
 
 - Browser-to-Host commands use HTTP; Host-to-browser progress uses SSE. WebSocket is not introduced.
 - Runtime `AgentEvent` envelopes and payloads pass through without domain renaming. SSE `event` is the Runtime event type, `id` is `event_id`, and `data` is strict JSON.
+- Reasoning never enters canonical Conversation messages or Snapshot serialization. With `reasoning_visibility` at `visible` or `debug`, `model_reasoning_delta` streams live; the durable `model_response` event carries a bounded `reasoning_preview {text, truncated, total_chars}` (complete chain stays a `debug`-only `model_reasoning` event). The Web Host runs Threads at `visible` so long thinking phases stay observable in the UI.
 - The adapter subscribes to the Runtime EventBuffer for immediate delivery, retains polling-compatible
   replay/cursor recovery behavior for injected legacy runtimes, and sends a comment heartbeat every
 - An explicit `after_event_id` query parameter takes precedence over the `Last-Event-ID` header. Both refer to Runtime event IDs rather than sequence values.
@@ -238,7 +240,7 @@ React UI 使用桌面优先三栏布局：左侧 workspace 与 Thread，中央 C
 
 - The frontend uses React, TypeScript, Vite, React hooks, ordinary CSS/CSS variables, ESLint, Vitest, and React Testing Library. Tailwind, shadcn, Redux, and Zustand are not used.
 - The primary desktop layout has workspace and Thread navigation on the left, Conversation and Composer in the center, and Activity on the right. It is an execution-oriented Coding Agent UI rather than a plain chat clone.
-- Conversation renders user and assistant messages, tool request/running/result cards, bounded approval cards recovered from Snapshot/SSE, file-change cards, Turn errors, Runtime rejection, and Host connection/configuration errors.
+- Conversation renders user and assistant messages, tool request/running/result cards, bounded approval cards recovered from Snapshot/SSE, file-change cards, Turn errors, Runtime rejection, and Host connection/configuration errors. Assistant messages show the thinking chain in a collapsible panel (open while streaming, collapsed afterwards, marked when truncated); rejection errors display the `detail` and a recovery hint for transient busy codes.
 - Activity renders current status, submission/Turn metadata, tool calls, changed files, diff completeness, and simplified unified diffs. Tool output and diffs use bounded scrollable monospace regions.
 - Composer supports multiline text, submit, pending/running disable rules, and Stop. It never interprets Policy or treats SSE disconnect as cancellation.
 - Provider settings use a password input with save, clear, masked configured state, automatic background model discovery, explicit refresh, manual model entry, and default selection. Model IDs use one searchable/combobox-style control backed by the Host catalog; the UI shows only profile facts that Host supplied and labels unknown facts as unknown. Basic settings expose Provider, Model, Thinking, Thinking intensity when supported, and Approval mode; transport-only temperature, output, budget, context, and agent-limit fields are not presented there.

@@ -68,7 +68,10 @@ thinking 启用参数在该底层边界仍通过 `extra_body` 指定。Agent Run
 任意参数逃生口，而是从 allowlisted `ThinkingSettings` 生成受限的 `thinking` 对象。
 `ProviderCapabilities.thinking` 使用 `ThinkingCapabilities` 声明所选模型是否支持开关、
 默认状态、`budget_tokens`、强度选项以及允许的 `keep` 值；`ModelInvoker` 在第一次请求前逐项校验，未知或
-不支持的组合 fail closed 为 `UNSUPPORTED_MODEL_SETTING`。Capability 还可通过
+不支持的组合 fail closed 为 `UNSUPPORTED_MODEL_SETTING`。推理消耗的是 Provider 的共享输出
+预算：支持 `budget_tokens` 且模型默认开启思考时，`ModelInvoker` 即使没有显式配置也会合成显式
+thinking 请求并附 32768 token 默认预算；显式开启但未设预算的请求同样补上该默认值，避免推理
+耗尽整体输出预算后在正文出现前被 `length` 截断。Capability 还可通过
 `context_window_tokens` 声明所选模型的上下文容量；Runtime 用它在每次请求前执行保守
 容量检查，但该字段不改变底层 API payload。
 
@@ -109,9 +112,13 @@ envelope：`ok`、`content`、`metadata`、`error_code` 会一起进入 tool mes
 退役的 `deepseek-chat` / `deepseek-reasoner` 特例；其 reasoning 使用
 `TOOL_CHAIN_ONLY`，且 tool-call assistant message 需要非 null content。Kimi/Moonshot
 预设使用 `ALWAYS`，与 preserved thinking 默认保留完整历史的行为对齐，并声明其
-`thinking.keep` allowlist；DeepSeek 与 GLM 声明支持 thinking 开关，但不声称支持当前
-OpenAI-compatible 协议未列出的 budget/keep 字段；精确模型 profile 只增加已确认的
-Thinking 默认值、开关和强度，不会把未知能力继承到未知模型。Runtime 调用方只使用安全的
+`thinking.keep` allowlist；DeepSeek 与 GLM 声明支持 thinking 开关；DeepSeek V4
+精确 profile 额外声明 `supports_budget_tokens`（budget 参数已在官方端点验证）与
+`max_output_tokens=131072`——Provider 默认输出上限只有 65535 token，思考型长任务会在
+正文写出前耗尽预算，该上限随 `ProviderConfig` 携带，请求未显式给出 `max_tokens` 时由
+`OpenAICompatibleProvider` 写入 payload。两者均不声称支持协议未列出的 keep 字段；
+精确模型 profile 只增加已确认的 Thinking 默认值、开关、强度和输出上限，不会把未知能力
+继承到未知模型。Runtime 调用方只使用安全的
 `ThinkingSettings`。GLM 预设继续使用 `TOOL_CHAIN_ONLY`。API key 不会出现在
 `ProviderConfig` 的默认 repr 中，
 示例也只从环境变量读取 key。

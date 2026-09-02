@@ -32,6 +32,10 @@ from agent.tools.types import ToolResult
 
 from .types import SCHEMA_VERSION
 
+# Bounded reasoning text carried on durable model_response events so the UI
+# can render the thinking chain without persisting the full stream.
+_REASONING_PREVIEW_CHARS = 3000
+
 
 def utc_now() -> str:
     """Return an RFC 3339 UTC timestamp suitable for the public API."""
@@ -493,26 +497,42 @@ class TurnEventEmitter:
 
     def model_response(self, response: LLMResponse, iteration: int) -> None:
         message = public_message(response.message)
-        self.emit(
-            "model_response",
-            {
-                "iteration": iteration,
-                "message": message,
-                "finish_reason": response.finish_reason,
-                "usage": public_usage(response),
-            },
-        )
-        if self._reasoning_visibility == "debug":
-            reasoning = "".join(
+        reasoning = (
+            "".join(
                 block.text
                 for block in response.message.content
                 if isinstance(block, ReasoningBlock)
             )
-            if reasoning:
-                self.emit(
-                    "model_reasoning",
-                    {"iteration": iteration, "text": reasoning},
-                )
+            if self._reasoning_visibility != "hidden"
+            else ""
+        )
+        payload: dict[str, Any] = {
+            "iteration": iteration,
+            "message": message,
+            "finish_reason": response.finish_reason,
+            "usage": public_usage(response),
+        }
+        if reasoning:
+            # "visible" keeps a bounded preview on the durable event so the UI
+            # can show the thinking chain without persisting the full stream;
+            # "debug" keeps the complete chain for diagnostics.
+            bounded = (
+                self._reasoning_visibility != "debug"
+                and len(reasoning) > _REASONING_PREVIEW_CHARS
+            )
+            payload["reasoning_preview"] = {
+                "text": (
+                    reasoning[:_REASONING_PREVIEW_CHARS] if bounded else reasoning
+                ),
+                "truncated": bounded,
+                "total_chars": len(reasoning),
+            }
+        self.emit("model_response", payload)
+        if self._reasoning_visibility == "debug" and reasoning:
+            self.emit(
+                "model_reasoning",
+                {"iteration": iteration, "text": reasoning},
+            )
 
     def model_delta(
         self,
@@ -527,7 +547,7 @@ class TurnEventEmitter:
         if isinstance(event, TextDeltaEvent):
             self.emit("model_text_delta", {"text": event.text})
         elif isinstance(event, ReasoningDeltaEvent):
-            if self._reasoning_visibility == "debug":
+            if self._reasoning_visibility != "hidden":
                 self.emit("model_reasoning_delta", {"text": event.text})
         elif isinstance(event, ToolCallDeltaEvent):
             self.emit(

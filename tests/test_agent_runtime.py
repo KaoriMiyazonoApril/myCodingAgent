@@ -1129,11 +1129,11 @@ def test_event_ring_buffer_drops_old_events_and_marks_expired_cursor(
 
 
 @pytest.mark.parametrize(
-    ("visibility", "reasoning_event_count"),
-    [("hidden", 0), ("debug", 1)],
+    ("visibility", "reasoning_event_count", "preview_present"),
+    [("hidden", 0, False), ("visible", 0, True), ("debug", 1, True)],
 )
 def test_reasoning_is_only_emitted_as_a_dedicated_debug_event(
-    tmp_path, visibility, reasoning_event_count
+    tmp_path, visibility, reasoning_event_count, preview_present
 ) -> None:
     provider = ScriptedProvider(
         [
@@ -1166,11 +1166,19 @@ def test_reasoning_is_only_emitted_as_a_dedicated_debug_event(
     snapshot_json = json.dumps(runtime.get_snapshot(thread.thread_id).to_dict())
 
     assert len(reasoning_events) == reasoning_event_count
+    # The canonical conversation never carries reasoning, regardless of mode.
     assert "sensitive chain" not in snapshot_json
     model_payload = next(
         event.payload for event in events if event.type == "model_response"
     )
-    assert "sensitive chain" not in json.dumps(model_payload)
+    if preview_present:
+        assert model_payload["reasoning_preview"] == {
+            "text": "sensitive chain",
+            "truncated": False,
+            "total_chars": 15,
+        }
+    else:
+        assert "reasoning_preview" not in model_payload
     if visibility == "debug":
         assert reasoning_events[0].payload == {
             "iteration": 1,
@@ -1540,6 +1548,7 @@ def test_oversized_first_request_is_rejected_without_mutating_history(tmp_path) 
         "error": {
             "code": "CONTEXT_LIMIT",
             "message": "Turn could not start",
+            "detail": "conversation exceeds the configured model context budget",
         }
     }
 
@@ -1592,6 +1601,7 @@ def test_preflight_validation_is_async_and_cancellation_releases_lease(
             "error": {
                 "code": "TURN_CANCELLED_BEFORE_START",
                 "message": "Turn was cancelled before it started",
+                "detail": None,
             }
         }
     ]
@@ -2117,6 +2127,133 @@ def test_iteration_budget_stops_before_an_extra_model_request(tmp_path) -> None:
     assert summary.stop_reason == "max_iterations"
     assert summary.iterations == 1
     assert summary.tool_calls == 1
+
+
+def test_truncated_model_response_without_tool_calls_stops_as_output_length(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[TextBlock(text="partial answer")],
+                ),
+                finish_reason="length",
+                usage=Usage(output_tokens=65535),
+            )
+        ]
+    )
+    runtime = runtime_for_provider(provider)
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Write the maze."))
+
+    assert summary.status is TurnStatus.LIMIT_REACHED
+    assert summary.stop_reason == "output_length"
+    assert summary.final_text == "partial answer"
+    assert summary.error == {
+        "code": "OUTPUT_TRUNCATED",
+        "message": "model output was truncated before the response completed",
+    }
+    events = [event.type for event in runtime.get_events(thread.thread_id).events]
+    assert events[-1] == "turn_limit_reached"
+
+
+def test_empty_model_response_stops_as_empty_response(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(role="assistant", content=[]),
+                finish_reason="stop",
+                usage=Usage(),
+            )
+        ]
+    )
+    runtime = runtime_for_provider(provider)
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Answer."))
+
+    assert summary.status is TurnStatus.LIMIT_REACHED
+    assert summary.stop_reason == "empty_response"
+    assert summary.final_text == ""
+    assert summary.error == {
+        "code": "EMPTY_RESPONSE",
+        "message": "model finished without any text or tool calls",
+    }
+
+
+def test_truncated_response_with_tool_calls_still_executes_tools(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[
+                        ToolCallBlock(
+                            id="call_mk",
+                            name="write_file",
+                            arguments={"path": "test.txt", "content": "123"},
+                            raw_arguments='{"path": "test.txt", "content": "123"}',
+                        )
+                    ],
+                ),
+                finish_reason="length",
+                usage=Usage(output_tokens=65535),
+            ),
+            final_response("Done."),
+        ]
+    )
+    runtime = runtime_for_provider(
+        provider, tool_registry_factory=create_test_tool_registry
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Write it."))
+
+    assert summary.status is TurnStatus.COMPLETED
+    assert (tmp_path / "test.txt").read_text(encoding="utf-8") == "123"
+    assert summary.final_text == "Done."
+
+
+def test_visible_reasoning_preview_is_bounded_on_model_response(tmp_path) -> None:
+    long_reasoning = "r" * 5000
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=[
+                        ReasoningBlock(text=long_reasoning),
+                        TextBlock(text="Answer."),
+                    ],
+                ),
+                finish_reason="stop",
+                usage=Usage(),
+            )
+        ]
+    )
+    runtime = ThreadRuntime(
+        provider_resolver=lambda _config_id, _model: provider,
+        default_settings=ModelSettings(
+            provider_config_id="test-provider", model="test-model"
+        ),
+        tool_registry_factory=empty_tools,
+        reasoning_visibility="visible",
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    asyncio.run(runtime.run_turn(thread.thread_id, "Explain."))
+    events = runtime.get_events(thread.thread_id).events
+    model_payload = next(
+        event.payload for event in events if event.type == "model_response"
+    )
+
+    preview = model_payload["reasoning_preview"]
+    assert preview["truncated"] is True
+    assert preview["total_chars"] == 5000
+    assert len(preview["text"]) == 3000
 
 
 def test_tool_budget_preserves_a_result_for_every_unexecuted_call(tmp_path) -> None:

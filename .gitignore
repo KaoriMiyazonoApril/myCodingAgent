@@ -8,3 +8,6 @@ web/dist/
 web/*.tsbuildinfo
 *.zip
 requirement.md
+# Playwright 浏览器审计运行产物与截图
+.playwright-cli/
+output/

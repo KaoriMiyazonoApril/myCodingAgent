@@ -13,6 +13,7 @@ from .runtime_environment import RuntimeContext
 from .task_state import TaskState
 from .history import AsyncHistoryCompactor, CompactionCheckpoint
 from .events import TurnEventEmitter
+from .errors import TurnLimitReached
 from .model_invoker import ModelInvoker
 from .run_controller import RunController
 from .tool_coordinator import ToolCoordinator
@@ -97,6 +98,12 @@ class AgentLoop:
                 if isinstance(block, ToolCallBlock)
             ]
             if not tool_calls:
+                # A response without tool calls ends the Turn, but a silent
+                # truncation must not masquerade as successful completion.
+                if response.finish_reason == "length":
+                    raise TurnLimitReached("output_length")
+                if not assistant_text:
+                    raise TurnLimitReached("empty_response")
                 return LoopOutcome(final_text=assistant_text)
 
             await tools.execute(tool_calls)

@@ -352,6 +352,30 @@ def test_request_encoding_keeps_sdk_shapes_at_provider_boundary() -> None:
     assert payload["max_tokens"] == 100
 
 
+def test_request_encoding_uses_profile_output_ceiling_when_max_tokens_unset() -> None:
+    deepseek = OpenAICompatibleProvider(
+        create_provider_config(
+            "deepseek", api_key="test-key", model="deepseek-v4-pro"
+        ),
+        client=object(),
+    )
+    request = LLMRequest(
+        messages=[Message(role="user", content=[TextBlock(text="hello")])],
+    )
+
+    payload = deepseek._build_request_payload(request, stream=False)
+    assert payload["max_tokens"] == 131_072
+
+    explicit = LLMRequest(
+        messages=[Message(role="user", content=[TextBlock(text="hello")])],
+        max_tokens=2048,
+    )
+    assert (
+        deepseek._build_request_payload(explicit, stream=False)["max_tokens"]
+        == 2048
+    )
+
+
 def test_reasoning_is_preserved_for_thinking_tool_call_turns() -> None:
     deepseek = OpenAICompatibleProvider(
         create_provider_config(

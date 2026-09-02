@@ -262,8 +262,10 @@ class TurnConfig(ModelSettings):
 
     def __post_init__(self) -> None:
         ModelSettings.__post_init__(self)
-        if self.reasoning_visibility not in {"hidden", "debug"}:
-            raise ValueError("reasoning_visibility must be 'hidden' or 'debug'")
+        if self.reasoning_visibility not in {"hidden", "visible", "debug"}:
+            raise ValueError(
+                "reasoning_visibility must be 'hidden', 'visible' or 'debug'"
+            )
 
     @classmethod
     def from_thread_settings(
