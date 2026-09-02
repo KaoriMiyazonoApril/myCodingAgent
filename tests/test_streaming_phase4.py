@@ -20,6 +20,7 @@ from agent.model.types import (
     ReasoningDeltaEvent,
     TextDeltaEvent,
     ThinkingCapabilities,
+    ThinkingRequest,
     ToolCallDeltaEvent,
     Usage,
 )
@@ -201,19 +202,24 @@ def _config() -> TurnConfig:
     )
 
 
-def test_model_invoker_fills_default_thinking_budget_when_supported() -> None:
+def _thinking_config(**settings_kwargs) -> TurnConfig:
     from agent.runtime import ThinkingSettings
     from agent.runtime.settings import ModelSettings
 
+    return TurnConfig.from_model_settings(
+        ModelSettings(provider_config_id="p", model="m", **settings_kwargs),
+        settings_version=0,
+        system_prompt="system",
+        reasoning_visibility="hidden",
+    )
+
+
+def test_model_invoker_never_synthesizes_default_thinking_budget() -> None:
+    from agent.runtime import ThinkingSettings
+
     class Recording(LLMProvider):
-        def __init__(self, supports_budget: bool) -> None:
-            self.capabilities = ProviderCapabilities(
-                thinking=ThinkingCapabilities(
-                    supported=True,
-                    default_enabled=True,
-                    supports_budget_tokens=supports_budget,
-                )
-            )
+        def __init__(self, capabilities: ProviderCapabilities) -> None:
+            self.capabilities = capabilities
             self.requests: list[LLMRequest] = []
 
         async def chat(self, request: LLMRequest) -> LLMResponse:
@@ -224,70 +230,117 @@ def test_model_invoker_fills_default_thinking_budget_when_supported() -> None:
                 usage=Usage(),
             )
 
-    def config_with_thinking() -> TurnConfig:
-        return TurnConfig.from_model_settings(
-            ModelSettings(
-                provider_config_id="p",
-                model="m",
-                thinking=ThinkingSettings(enabled=True),
-            ),
-            settings_version=0,
-            system_prompt="system",
-            reasoning_visibility="hidden",
+    budget_capable = ProviderCapabilities(
+        thinking=ThinkingCapabilities(
+            supported=True,
+            default_enabled=True,
+            supports_budget_tokens=True,
         )
-
-    def config_without_thinking() -> TurnConfig:
-        return TurnConfig.from_model_settings(
-            ModelSettings(provider_config_id="p", model="m"),
-            settings_version=0,
-            system_prompt="system",
-            reasoning_visibility="hidden",
-        )
-
-    with_budget = Recording(supports_budget=True)
-    asyncio.run(ModelInvoker(with_budget, config_with_thinking()).chat([], []))
-    assert with_budget.requests[0].thinking is not None
-    assert with_budget.requests[0].thinking.budget_tokens == 32_768
-
-    without_budget = Recording(supports_budget=False)
-    asyncio.run(ModelInvoker(without_budget, config_with_thinking()).chat([], []))
-    assert without_budget.requests[0].thinking is not None
-    assert without_budget.requests[0].thinking.budget_tokens is None
-
-    # No explicit settings but the model thinks by default and accepts a
-    # budget: synthesize an explicit bounded thinking request instead of
-    # leaving the provider to spend the whole output allowance on reasoning.
-    unbounded = Recording(supports_budget=True)
-    asyncio.run(ModelInvoker(unbounded, config_without_thinking()).chat([], []))
-    synthesized = unbounded.requests[0].thinking
-    assert synthesized is not None
-    assert synthesized.enabled is True
-    assert synthesized.budget_tokens == 32_768
-
-    # Default-on thinking without budget support keeps the established "no
-    # thinking parameter" behavior; only budget-capable providers change.
-    no_budget = Recording(supports_budget=False)
-    no_budget.capabilities = ProviderCapabilities(
+    )
+    plain_capable = ProviderCapabilities(
         thinking=ThinkingCapabilities(
             supported=True,
             default_enabled=True,
             supports_budget_tokens=False,
         )
     )
-    asyncio.run(ModelInvoker(no_budget, config_without_thinking()).chat([], []))
-    assert no_budget.requests[0].thinking is None
 
-    # A model that does not think by default stays untouched when unconfigured.
-    explicit_off = Recording(supports_budget=False)
-    explicit_off.capabilities = ProviderCapabilities(
-        thinking=ThinkingCapabilities(
-            supported=True,
-            default_enabled=False,
-            supports_budget_tokens=True,
-        )
+    # User-enabled thinking maps 1:1; no budget is ever invented, whether or
+    # not the capability advertises budget support.
+    enabled = Recording(budget_capable)
+    asyncio.run(
+        ModelInvoker(
+            enabled, _thinking_config(thinking=ThinkingSettings(enabled=True))
+        ).chat([], [])
     )
-    asyncio.run(ModelInvoker(explicit_off, config_without_thinking()).chat([], []))
-    assert explicit_off.requests[0].thinking is None
+    assert enabled.requests[0].thinking == ThinkingRequest(
+        enabled=True, budget_tokens=None, keep=None, intensity=None
+    )
+
+    plain = Recording(plain_capable)
+    asyncio.run(
+        ModelInvoker(
+            plain, _thinking_config(thinking=ThinkingSettings(enabled=True))
+        ).chat([], [])
+    )
+    assert plain.requests[0].thinking.budget_tokens is None
+
+    # No explicit settings: even a budget-capable default-on model receives no
+    # synthesized thinking request - provider documented defaults apply.
+    for capabilities in (budget_capable, plain_capable):
+        recording = Recording(capabilities)
+        asyncio.run(
+            ModelInvoker(recording, _thinking_config()).chat([], [])
+        )
+        assert recording.requests[0].thinking is None
+
+    # User-disabled thinking still maps to an explicit disabled request.
+    disabled = Recording(plain_capable)
+    asyncio.run(
+        ModelInvoker(
+            disabled, _thinking_config(thinking=ThinkingSettings(enabled=False))
+        ).chat([], [])
+    )
+    assert disabled.requests[0].thinking.enabled is False
+
+
+def test_model_invoker_resolves_output_limit_from_capability_and_policy() -> None:
+    class Recording(LLMProvider):
+        def __init__(self, capabilities: ProviderCapabilities) -> None:
+            self.capabilities = capabilities
+            self.requests: list[LLMRequest] = []
+
+        async def chat(self, request: LLMRequest) -> LLMResponse:
+            self.requests.append(request)
+            return LLMResponse(
+                message=Message(role="assistant", content=[TextBlock(text="ok")]),
+                finish_reason="stop",
+                usage=Usage(),
+            )
+
+    deepseek_like = ProviderCapabilities(
+        model_max_output_tokens=384_000,
+        default_request_max_tokens=131_072,
+    )
+
+    # No explicit thread override: harness request policy applies.
+    recording = Recording(deepseek_like)
+    asyncio.run(ModelInvoker(recording, _thinking_config()).chat([], []))
+    assert recording.requests[0].max_tokens == 131_072
+
+    # Explicit override below the official maximum passes through.
+    recording = Recording(deepseek_like)
+    asyncio.run(
+        ModelInvoker(
+            recording, _thinking_config(max_tokens=100_000)
+        ).chat([], [])
+    )
+    assert recording.requests[0].max_tokens == 100_000
+
+    # Explicit override above the official maximum is clamped to capability.
+    recording = Recording(deepseek_like)
+    asyncio.run(
+        ModelInvoker(
+            recording, _thinking_config(max_tokens=500_000)
+        ).chat([], [])
+    )
+    assert recording.requests[0].max_tokens == 384_000
+
+    # Unverified capabilities and no override: omit max_tokens entirely.
+    recording = Recording(ProviderCapabilities())
+    asyncio.run(ModelInvoker(recording, _thinking_config()).chat([], []))
+    assert recording.requests[0].max_tokens is None
+
+    # An embedder-computed resolved limit is honored verbatim.
+    recording = Recording(deepseek_like)
+    asyncio.run(
+        ModelInvoker(
+            recording,
+            _thinking_config(max_tokens=1_000_000),
+            resolved_output_limit=99_999,
+        ).chat([], [])
+    )
+    assert recording.requests[0].max_tokens == 99_999
 
 
 def test_model_stream_retries_before_first_delta_but_not_after_output() -> None:

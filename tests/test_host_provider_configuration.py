@@ -57,6 +57,40 @@ def test_production_factory_closes_store_even_if_provider_shutdown_fails() -> No
     assert thread_store.closed is True
 
 
+def test_production_factory_defaults_web_threads_to_hidden_reasoning(
+    monkeypatch,
+) -> None:
+    from agent.runtime import ModelSettings
+
+    captured: dict[str, object] = {}
+
+    class RecorderRuntime:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    class Pool:
+        async def aclose(self) -> None:
+            pass
+
+    class Store:
+        def get_credential(self, provider_id: str) -> str | None:
+            return "key"
+
+    factory = object.__new__(ProductionRuntimeFactory)
+    factory._provider_pool = Pool()
+    factory._thread_store = Store()
+    monkeypatch.setattr(
+        "agent.host.thread_service.ThreadRuntime", RecorderRuntime
+    )
+
+    factory(ModelSettings(provider_config_id="deepseek", model="deepseek-v4-flash"))
+
+    # Web Threads no longer force raw reasoning into the normal UI; the
+    # runtime's own "hidden" default applies.
+    assert "reasoning_visibility" not in captured
+    assert captured["default_settings"].model == "deepseek-v4-flash"
+
+
 def test_provider_configuration_persists_without_exposing_secret(tmp_path) -> None:
     config_path = tmp_path / "config" / "providers.json"
     store = ProviderStore(config_path)

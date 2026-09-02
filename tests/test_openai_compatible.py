@@ -36,6 +36,7 @@ from agent.model.types import (
     ProviderProfile,
     ReasoningRetention,
     ThinkingCapabilities,
+    ThinkingRequest,
 )
 from agent.tools.types import ToolDefinition, ToolResult
 
@@ -352,7 +353,10 @@ def test_request_encoding_keeps_sdk_shapes_at_provider_boundary() -> None:
     assert payload["max_tokens"] == 100
 
 
-def test_request_encoding_uses_profile_output_ceiling_when_max_tokens_unset() -> None:
+def test_request_encoding_never_fills_an_implicit_output_ceiling() -> None:
+    # The adapter must not silently invent a max_tokens the runtime and
+    # ContextBudget do not know about.  A request without max_tokens simply
+    # omits the field and the provider default applies.
     deepseek = OpenAICompatibleProvider(
         create_provider_config(
             "deepseek", api_key="test-key", model="deepseek-v4-pro"
@@ -364,7 +368,7 @@ def test_request_encoding_uses_profile_output_ceiling_when_max_tokens_unset() ->
     )
 
     payload = deepseek._build_request_payload(request, stream=False)
-    assert payload["max_tokens"] == 131_072
+    assert "max_tokens" not in payload
 
     explicit = LLMRequest(
         messages=[Message(role="user", content=[TextBlock(text="hello")])],
@@ -374,6 +378,77 @@ def test_request_encoding_uses_profile_output_ceiling_when_max_tokens_unset() ->
         deepseek._build_request_payload(explicit, stream=False)["max_tokens"]
         == 2048
     )
+
+
+def test_deepseek_thinking_never_serializes_budget_tokens() -> None:
+    # Official DeepSeek Thinking Mode accepts thinking.type plus a top-level
+    # reasoning_effort (low/high/max); budget_tokens does not exist on the
+    # API and must never reach the wire even when the request carries one.
+    deepseek = OpenAICompatibleProvider(
+        create_provider_config(
+            "deepseek", api_key="test-key", model="deepseek-v4-pro"
+        ),
+        client=object(),
+    )
+    base = [Message(role="user", content=[TextBlock(text="hello")])]
+
+    enabled = LLMRequest(
+        messages=base,
+        thinking=ThinkingRequest(
+            enabled=True, budget_tokens=777, intensity="high", keep="all"
+        ),
+    )
+    assert deepseek._build_request_payload(enabled, stream=False)["extra_body"] == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "high",
+    }
+
+    for requested, mapped in (("medium", "high"), ("xhigh", "high"), ("low", "low"),
+                              ("max", "max")):
+        effort = LLMRequest(
+            messages=base,
+            thinking=ThinkingRequest(enabled=True, intensity=requested),
+        )
+        assert deepseek._build_request_payload(
+            effort, stream=False
+        )["extra_body"]["reasoning_effort"] == mapped
+
+    disabled = LLMRequest(
+        messages=base,
+        thinking=ThinkingRequest(enabled=False, intensity="high"),
+    )
+    assert deepseek._build_request_payload(disabled, stream=False)["extra_body"] == {
+        "thinking": {"type": "disabled"},
+    }
+
+    assert deepseek._build_request_payload(
+        LLMRequest(messages=base, thinking=None), stream=False
+    ).get("extra_body") is None
+
+
+def test_glm_thinking_serializes_type_and_verbatim_effort() -> None:
+    glm = OpenAICompatibleProvider(
+        create_provider_config("glm", api_key="test-key", model="glm-5.3"),
+        client=object(),
+    )
+    base = [Message(role="user", content=[TextBlock(text="hello")])]
+
+    enabled = LLMRequest(
+        messages=base,
+        thinking=ThinkingRequest(enabled=True, intensity="max"),
+    )
+    assert glm._build_request_payload(enabled, stream=False)["extra_body"] == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+    }
+
+    disabled = LLMRequest(
+        messages=base,
+        thinking=ThinkingRequest(enabled=False),
+    )
+    assert glm._build_request_payload(disabled, stream=False)["extra_body"] == {
+        "thinking": {"type": "disabled"},
+    }
 
 
 def test_reasoning_is_preserved_for_thinking_tool_call_turns() -> None:

@@ -49,14 +49,17 @@ def _deepseek_v4_profile(model_id: str, display_name: str) -> tuple[str, ModelPr
         display_name=display_name,
         description="DeepSeek V4 思考模型，支持低/高/最大 Thinking 强度。",
         context_window_tokens=1_000_000,
-        # Provider 默认输出上限只有 65535 token；思考型任务会在写出正文前
-        # 就耗尽输出预算。显式提高上限并允许思考预算，避免长任务被截断。
-        max_output_tokens=131_072,
+        # 能力与请求策略分离：model_max_output_tokens 是官方硬上限（pricing
+        # 页 384K），仅用于 clamp；default_request_max_tokens 是 Harness 内部
+        # 请求策略（官方未显式给出 max_tokens 时默认上限较低，思考型任务会
+        # 在写出正文前耗尽输出预算，故显式提高单次请求上限，避免长任务截断）。
+        # 两者不可混用；官方 API 不存在 thinking budget_tokens 参数。
+        model_max_output_tokens=384_000,
+        default_request_max_tokens=131_072,
         thinking=ThinkingCapabilities(
             supported=True,
             default_enabled=True,
             toggle_supported=True,
-            supports_budget_tokens=True,
             intensity_supported=True,
             intensity_options=("low", "high", "max"),
             default_intensity="high",
@@ -226,15 +229,11 @@ def create_provider_config(
             f"Unsupported provider {provider!r}. Expected one of: {choices}"
         ) from error
 
-    model_profile = preset.model_profiles.get(model)
     return ProviderConfig(
         provider=normalized_provider,
         base_url=base_url or preset.base_url,
         api_key=api_key,
         model=model,
         timeout=timeout,
-        max_output_tokens=(
-            None if model_profile is None else model_profile.max_output_tokens
-        ),
         capabilities=capabilities or preset.capabilities_for(model),
     )

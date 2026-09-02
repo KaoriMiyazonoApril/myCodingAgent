@@ -26,9 +26,12 @@ from agent.model.provider import LLMProvider
 from agent.model.types import (
     LLMRequest,
     LLMResponse,
+    MessageEndEvent,
     ProviderCapabilities,
     ProviderConfig,
+    ReasoningDeltaEvent,
     ReasoningRetention,
+    TextDeltaEvent,
     ThinkingCapabilities,
     Usage,
     WorkingTailMode,
@@ -1551,6 +1554,89 @@ def test_oversized_first_request_is_rejected_without_mutating_history(tmp_path) 
             "detail": "conversation exceeds the configured model context budget",
         }
     }
+
+
+def test_turn_request_max_tokens_matches_resolved_output_limit(tmp_path) -> None:
+    # The ContextBudget reserve and the provider request both derive from one
+    # resolved output limit: official maximum only clamps, the Harness default
+    # request policy applies only without an explicit thread override.
+    async def scenario(capabilities, *, max_tokens=None):
+        provider = ScriptedProvider([final_response()])
+        provider.capabilities = capabilities
+        runtime = runtime_for_provider(
+            provider,
+            default_settings=ModelSettings(
+                provider_config_id="test-provider",
+                model="test-model",
+                max_tokens=max_tokens,
+            ),
+        )
+        thread = runtime.create_thread(tmp_path)
+        await runtime.run_turn(thread.thread_id, "Work.")
+        return provider.requests[0].max_tokens
+
+    deepseek_like = ProviderCapabilities(
+        context_window_tokens=1_000_000,
+        model_max_output_tokens=384_000,
+        default_request_max_tokens=131_072,
+    )
+    assert asyncio.run(scenario(deepseek_like)) == 131_072
+    # Explicit overrides are honored and clamped by the official maximum.
+    assert asyncio.run(scenario(deepseek_like, max_tokens=500_000)) == 384_000
+    assert asyncio.run(scenario(deepseek_like, max_tokens=100_000)) == 100_000
+    # Unverified capabilities: omit max_tokens and let the provider default.
+    assert asyncio.run(scenario(ProviderCapabilities())) is None
+
+
+@pytest.mark.parametrize("visibility", ["hidden", "visible", "debug"])
+def test_reasoning_delta_gating_follows_visibility(tmp_path, visibility) -> None:
+    class DeltaProvider(LLMProvider):
+        capabilities = ProviderCapabilities(
+            thinking=ThinkingCapabilities(supported=True, default_enabled=True),
+            reasoning_output_fields=("reasoning_content",),
+        )
+
+        async def chat(self, request: LLMRequest) -> LLMResponse:  # pragma: no cover
+            raise AssertionError("stream should be used")
+
+        async def stream(self, request: LLMRequest):
+            yield ReasoningDeltaEvent(text="private reasoning text")
+            yield TextDeltaEvent(text="Public answer.")
+            yield MessageEndEvent(
+                finish_reason="stop",
+                usage=Usage(input_tokens=3, output_tokens=2, total_tokens=5),
+            )
+
+    provider = DeltaProvider()
+    runtime = runtime_for_provider(
+        provider,
+        reasoning_visibility=visibility,
+    )
+    thread = runtime.create_thread(tmp_path)
+
+    summary = asyncio.run(runtime.run_turn(thread.thread_id, "Answer."))
+
+    assert summary.status is TurnStatus.COMPLETED
+    event_types = [
+        event.type for event in runtime.get_events(thread.thread_id).events
+    ]
+    if visibility == "hidden":
+        assert "model_reasoning_delta" not in event_types
+    else:
+        reasoning_deltas = [
+            event.payload["text"]
+            for event in runtime.get_events(thread.thread_id).events
+            if event.type == "model_reasoning_delta"
+        ]
+        assert reasoning_deltas == ["private reasoning text"]
+    # Provider continuity survives the public hiding: the next-turn canonical
+    # history keeps the ReasoningBlock even under "hidden".
+    turn2 = asyncio.run(runtime.run_turn(thread.thread_id, "Continue."))
+    assert turn2.status is TurnStatus.COMPLETED
+    if visibility == "hidden":
+        assert "private reasoning text" not in json.dumps(
+            runtime.get_snapshot(thread.thread_id).to_dict()
+        )
 
 
 def test_preflight_validation_is_async_and_cancellation_releases_lease(

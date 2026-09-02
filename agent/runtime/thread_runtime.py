@@ -55,7 +55,7 @@ from .events import (
     utc_now,
 )
 from .loop import AgentLoop
-from .model_invoker import ModelInvoker
+from .model_invoker import ModelInvoker, resolve_output_limit
 from .prompt import PromptBuilder
 from .policy import CommandAwarePolicy, ToolPolicy
 from .run_controller import RunController
@@ -790,6 +790,13 @@ class ThreadRuntime:
                     turn_config.model,
                 )
                 provider_capabilities = provider.capabilities
+            # One resolver produces the single effective per-request output
+            # limit; the same value feeds the ContextBudget reserve below and
+            # the provider request, so the two can never diverge again.
+            resolved_output_limit = resolve_output_limit(
+                turn_config.max_tokens,
+                provider_capabilities,
+            )
             # User text remains canonical Conversation intent.  TaskState is
             # deliberately limited to model-maintained plan plus objective
             # Harness evidence and never mirrors that goal.
@@ -843,6 +850,7 @@ class ThreadRuntime:
                 provider_capabilities,
                 skill_catalog=record.skill_catalog,
                 skill_state=skill_state,
+                resolved_output_limit=resolved_output_limit,
             )
             # Preflight only the irreducible request prefix.  Reducible
             # durable history is handled after provider resolution by the
@@ -867,6 +875,7 @@ class ThreadRuntime:
             model = ModelInvoker(
                 provider,
                 turn_config,
+                resolved_output_limit=resolved_output_limit,
                 retry_delays=self._model_retry_delays,
                 default_context_window_tokens=self._default_context_window_tokens,
             )
@@ -1010,6 +1019,7 @@ class ThreadRuntime:
         *,
         skill_catalog: SkillCatalog | None = None,
         skill_state: SkillTurnState | None = None,
+        resolved_output_limit: int | None = None,
     ) -> ContextManager:
         """Create one request-context assembler for a frozen Turn config."""
 
@@ -1030,7 +1040,7 @@ class ThreadRuntime:
                     )
                     or self._default_context_window_tokens
                 ),
-                output_tokens=turn_config.max_tokens,
+                output_tokens=resolved_output_limit,
             ),
             skill_catalog=skill_catalog or record.skill_catalog,
             skill_state=skill_state,

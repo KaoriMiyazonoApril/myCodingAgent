@@ -68,10 +68,10 @@ thinking 启用参数在该底层边界仍通过 `extra_body` 指定。Agent Run
 任意参数逃生口，而是从 allowlisted `ThinkingSettings` 生成受限的 `thinking` 对象。
 `ProviderCapabilities.thinking` 使用 `ThinkingCapabilities` 声明所选模型是否支持开关、
 默认状态、`budget_tokens`、强度选项以及允许的 `keep` 值；`ModelInvoker` 在第一次请求前逐项校验，未知或
-不支持的组合 fail closed 为 `UNSUPPORTED_MODEL_SETTING`。推理消耗的是 Provider 的共享输出
-预算：支持 `budget_tokens` 且模型默认开启思考时，`ModelInvoker` 即使没有显式配置也会合成显式
-thinking 请求并附 32768 token 默认预算；显式开启但未设预算的请求同样补上该默认值，避免推理
-耗尽整体输出预算后在正文出现前被 `length` 截断。Capability 还可通过
+不支持的组合 fail closed 为 `UNSUPPORTED_MODEL_SETTING`。`ThinkingSettings` 到
+`ThinkingRequest` 是 1:1 映射：`ModelInvoker` 不合成默认 thinking 请求，也不为任何
+Provider 发明 thinking 预算——模型"默认开启思考"由其文档化默认行为体现（不发送参数即
+保持开启），三种已收录 Provider 的官方 API 均不存在 `budget_tokens`。Capability 还可通过
 `context_window_tokens` 声明所选模型的上下文容量；Runtime 用它在每次请求前执行保守
 容量检查，但该字段不改变底层 API payload。
 
@@ -113,12 +113,12 @@ envelope：`ok`、`content`、`metadata`、`error_code` 会一起进入 tool mes
 `TOOL_CHAIN_ONLY`，且 tool-call assistant message 需要非 null content。Kimi/Moonshot
 预设使用 `ALWAYS`，与 preserved thinking 默认保留完整历史的行为对齐，并声明其
 `thinking.keep` allowlist；DeepSeek 与 GLM 声明支持 thinking 开关；DeepSeek V4
-精确 profile 额外声明 `supports_budget_tokens`（budget 参数已在官方端点验证）与
-`max_output_tokens=131072`——Provider 默认输出上限只有 65535 token，思考型长任务会在
-正文写出前耗尽预算，该上限随 `ProviderConfig` 携带，请求未显式给出 `max_tokens` 时由
-`OpenAICompatibleProvider` 写入 payload。两者均不声称支持协议未列出的 keep 字段；
-精确模型 profile 只增加已确认的 Thinking 默认值、开关、强度和输出上限，不会把未知能力
-继承到未知模型。Runtime 调用方只使用安全的
+精确 profile 区分两个字段：`model_max_output_tokens=384000`（官方 pricing 页硬上限，
+仅用于 clamp）与 `default_request_max_tokens=131072`（Harness 内部请求策略——官方在
+未显式给出 `max_tokens` 时使用较低默认上限，思考型长任务会在正文写出前耗尽预算，故策略性
+提高单次请求上限避免截断）。两者均不声称支持协议未列出的 budget/keep 字段；精确模型
+profile 只增加已确认的 Thinking 默认值、开关、强度和输出上限，不会把未知能力继承到未知
+模型。Runtime 调用方只使用安全的
 `ThinkingSettings`。GLM 预设继续使用 `TOOL_CHAIN_ONLY`。API key 不会出现在
 `ProviderConfig` 的默认 repr 中，
 示例也只从环境变量读取 key。
@@ -129,22 +129,48 @@ envelope：`ok`、`content`、`metadata`、`error_code` 会一起进入 tool mes
 只把 Provider 返回的 ID 与这些精确 profile 合并，不在 Web 或 Runtime 复制一份模型注册表。
 截至 2026-09-02，内置的已确认 profile 如下：
 
-| Provider | 精确模型 | Context Window | Thinking |
-| --- | --- | ---: | --- |
-| DeepSeek | `deepseek-v4-flash`, `deepseek-v4-pro` | 1M | 默认开启，可切换 `low/high/max`，默认 `high` |
-| Moonshot/Kimi | `kimi-k3` | 1M | 始终开启，`low/high/max`，默认 `max` |
-| Moonshot/Kimi | `kimi-k2.7-code`, `kimi-k2.7-code-highspeed` | 256K | 始终开启，不声明强度选项 |
-| Moonshot/Kimi | `kimi-k2.6` | 256K | 默认开启，可关闭，不声明强度选项 |
-| GLM | `glm-5.3` | 1M | 始终开启，`low/high/max`，默认 `max` |
-| GLM | `glm-5.2` | 1M | 默认开启，可关闭，`none/minimal/low/medium/high/xhigh/max`，默认 `max` |
+| Provider | 精确模型 | Context Window | 官方最大输出（capability） | 内部默认请求上限（policy） | Thinking |
+| --- | --- | ---: | ---: | ---: | --- |
+| DeepSeek | `deepseek-v4-flash`, `deepseek-v4-pro` | 1M | 384K | 131072 | 默认开启，可切换 `low/high/max`，默认 `high` |
+| Moonshot/Kimi | `kimi-k3` | 1M | 未收录（不发送 `max_tokens`） | 未收录 | 始终开启，`low/high/max`，默认 `max` |
+| Moonshot/Kimi | `kimi-k2.7-code`, `kimi-k2.7-code-highspeed` | 256K | 未收录 | 未收录 | 始终开启，不声明强度选项 |
+| Moonshot/Kimi | `kimi-k2.6` | 256K | 未收录 | 未收录 | 默认开启，可关闭，不声明强度选项 |
+| GLM | `glm-5.3` | 1M | 未收录（不发送 `max_tokens`） | 未收录 | 始终开启，`low/high/max`，默认 `max` |
+| GLM | `glm-5.2` | 1M | 未收录 | 未收录 | 默认开启，可关闭，`none/minimal/low/medium/high/xhigh/max`，默认 `max` |
 
 未命中精确 profile 的 Provider-reported ID 仍可手动使用，但 capability 和 Context Window
-均按未知处理；该保守结果不会猜测 Thinking、上下文容量或工具兼容性。`ModelInvoker`
+均按未知处理；该保守结果不会猜测 Thinking、上下文容量、输出上限或工具兼容性。`ModelInvoker`
 只把已验证的 `ThinkingSettings` 转成统一 `ThinkingRequest`，Provider adapter 再映射到
 供应商协议：DeepSeek V4 与 GLM 使用
 `thinking.type` 并在有强度时发送顶层 `reasoning_effort`，Kimi K3 使用顶层
 `reasoning_effort`，可关闭的 Kimi 使用 `thinking.type`，始终开启的 Kimi 不发送关闭参数。
 这些映射由 `ThinkingParameterStyle` allowlist 实现，不能由前端提交任意 `extra_body`。
+DeepSeek 的 effort 在 adapter 边界按官方档位归一化（`medium`/`xhigh` → `high`）；
+generic 兜底分支仍保留 `budget_tokens`/`keep`/`intensity` 嵌套逃生口，供声明支持扩展思考
+的端点使用，但内置三个 Provider 永远不会触发该路径。
+
+### 输出上限与请求策略分离
+
+`ModelProfile.max_output_tokens` 已废除，不再存在"capability 与 policy 共用一个字段"
+的情况：
+
+- `model_max_output_tokens`：模型官方硬上限（Model Capability）。只用于 clamp
+  `resolved_output_limit`，永远不会成为未配置时的请求默认值；未核验则为 `None`。
+- `default_request_max_tokens`：Harness 内部请求默认上限（Request Policy）。线程没有
+  显式覆盖时才使用；`None` 表示不发送 `max_tokens`、交由 Provider 默认。
+- 未知模型对两个字段都不做猜测。
+
+每次 Turn 只调用一次统一 resolver
+`resolve_output_limit(explicit_max_tokens, capabilities)`（位于
+`agent/runtime/model_invoker.py`）：显式线程覆盖优先，其次 harness 默认，最后为
+`None`（省略请求字段）；结果按 `model_max_output_tokens` clamp。同一个
+`resolved_output_limit` 同时供给 `ContextBudget`（输出 reserve）与
+`ModelInvoker`（`LLMRequest.max_tokens`），因此 ContextBudget 与 Provider 实际发送的
+值永远一致；`OpenAICompatibleProvider` 不再在请求发送前静默回填任何输出上限。
+ContextBudget 的 reserve 规则：有 resolved 值时
+`max(1, min(resolved, context_window // 4))`；没有时沿用保守默认
+`max(1, min(4096, context_window // 4))`。输出能力与策略都不会经 capability 投影暴露
+给 Host/UI。
 
 能力声明依据供应商的 thinking + tool-call 协议文档：
 [DeepSeek Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/)、

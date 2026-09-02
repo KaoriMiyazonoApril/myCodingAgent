@@ -518,9 +518,6 @@ class ProductionRuntimeFactory:
             provider_resolver=resolve,
             default_settings=default_settings,
             store=self._thread_store,
-            # Web Threads stream the reasoning chain to the UI (bounded on
-            # durable events) so long thinking phases stay observable.
-            reasoning_visibility="visible",
         )
 
     async def close(self) -> None:

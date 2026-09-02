@@ -19,6 +19,7 @@ from agent.model.types import (
     LLMRequest,
     LLMResponse,
     MessageEndEvent,
+    ProviderCapabilities,
     ThinkingRequest,
 )
 from agent.tools.types import ToolDefinition
@@ -26,10 +27,36 @@ from agent.tools.types import ToolDefinition
 from .message_assembler import MessageAssembler
 from .settings import TurnConfig
 
-# Reasoning runs inside the provider's output budget; without a budget the
-# model can spend the entire allowance thinking and get truncated before any
-# content appears.  Cap thinking so content keeps headroom.
-_DEFAULT_THINKING_BUDGET_TOKENS = 32_768
+
+def resolve_output_limit(
+    explicit_max_tokens: int | None,
+    capabilities: ProviderCapabilities | None,
+) -> int | None:
+    """Resolve the single effective per-request output limit.
+
+    Capability and policy stay separate: the model's officially verified
+    maximum output only clamps; the Harness-internal default request limit
+    only applies when the Thread carries no explicit override.  ``None``
+    results mean "omit max_tokens, let the provider default apply".
+    """
+
+    model_max = (
+        None if capabilities is None else capabilities.model_max_output_tokens
+    )
+    request_default = (
+        None
+        if capabilities is None
+        else capabilities.default_request_max_tokens
+    )
+    if explicit_max_tokens is not None:
+        base = explicit_max_tokens
+    elif request_default is not None:
+        base = request_default
+    else:
+        return None
+    if model_max is not None:
+        return min(base, model_max)
+    return base
 
 
 class ModelInvoker:
@@ -40,6 +67,7 @@ class ModelInvoker:
         provider: LLMProvider,
         config: TurnConfig,
         *,
+        resolved_output_limit: int | None = None,
         retry_delays: tuple[float, ...] = (0.1, 0.2),
         default_context_window_tokens: int = 32_000,
     ) -> None:
@@ -50,43 +78,32 @@ class ModelInvoker:
         # old constructor option for embedders while making this invoker a
         # pure prepared-request executor.
         del default_context_window_tokens
+        # One resolver feeds both the ContextBudget reserve and the provider
+        # request so the two can never diverge.  Embedders that already
+        # computed the limit pass it explicitly; standalone construction
+        # recomputes it from the frozen config and the provider capabilities.
+        self._resolved_output_limit = (
+            resolved_output_limit
+            if resolved_output_limit is not None
+            else resolve_output_limit(config.max_tokens, provider.capabilities)
+        )
         if config.thinking is not None:
             config.thinking.validate_for(provider.capabilities.thinking)
 
     def _thinking_request(self) -> ThinkingRequest | None:
-        """Freeze thinking settings, filling a default budget when the provider
-        supports one and none was configured."""
+        """Map frozen ThinkingSettings to a provider request 1:1.
+
+        Nothing is synthesized here: a provider's documented default-on
+        behavior is honored by omitting the parameters entirely, and no
+        default thinking budget is invented for any provider.
+        """
 
         settings = self._config.thinking
-        capabilities = self._provider.capabilities.thinking
         if settings is None:
-            # Only synthesize an explicit request when the provider also
-            # accepts a thinking budget: that is where an unbounded default
-            # can silently consume the whole output allowance before any
-            # content appears.  Other providers keep their established
-            # "no thinking parameter" default.
-            if not (
-                capabilities.supported
-                and capabilities.default_enabled
-                and capabilities.supports_budget_tokens
-            ):
-                return None
-            return ThinkingRequest(
-                enabled=True,
-                budget_tokens=_DEFAULT_THINKING_BUDGET_TOKENS,
-                keep=None,
-                intensity=None,
-            )
-        budget_tokens = settings.budget_tokens
-        if (
-            settings.enabled
-            and budget_tokens is None
-            and capabilities.supports_budget_tokens
-        ):
-            budget_tokens = _DEFAULT_THINKING_BUDGET_TOKENS
+            return None
         return ThinkingRequest(
             enabled=settings.enabled,
-            budget_tokens=budget_tokens,
+            budget_tokens=settings.budget_tokens,
             keep=(
                 None
                 if settings.keep is None
@@ -104,7 +121,7 @@ class ModelInvoker:
             messages=list(messages),
             tools=tools,
             temperature=self._config.temperature,
-            max_tokens=self._config.max_tokens,
+            max_tokens=self._resolved_output_limit,
             thinking=self._thinking_request(),
         )
         for attempt in range(3):
@@ -135,7 +152,7 @@ class ModelInvoker:
             messages=list(messages),
             tools=tools,
             temperature=self._config.temperature,
-            max_tokens=self._config.max_tokens,
+            max_tokens=self._resolved_output_limit,
             thinking=self._thinking_request(),
         )
         if type(self._provider).stream is LLMProvider.stream:

@@ -219,6 +219,10 @@ class ContextBudgetPolicy:
         reserve = output_tokens if output_tokens is not None else output_reserve_tokens
         if reserve is not None:
             _positive_int(reserve, "output_reserve_tokens")
+            # The resolved request limit is the honest output ceiling; reserve
+            # it, but never more than a quarter of the window so a small or
+            # under-declared window cannot collapse the input budget.
+            reserve = max(1, min(reserve, context_window_tokens // 4))
         else:
             reserve = max(1, min(4096, context_window_tokens // 4))
         if safety_margin is not None:

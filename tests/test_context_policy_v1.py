@@ -155,6 +155,31 @@ def test_budget_policy_separates_reserve_margin_soft_and_hard_limits() -> None:
     assert policy.assess(701).fits is False
 
 
+def test_budget_reserve_tracks_the_resolved_request_output_limit() -> None:
+    # ContextBudget consumes the same resolved output limit as the provider
+    # request (DeepSeek-like: 1M window, policy 131072) so the two cannot
+    # diverge (reserve 4096 vs request 131072 must never happen again).
+    deepseek_like = ContextBudgetPolicy(
+        context_window_tokens=1_000_000,
+        output_tokens=131_072,
+    )
+    assert deepseek_like.output_reserve_tokens == 131_072
+    assert deepseek_like.usable_input_tokens == 1_000_000 - 131_072 - 256
+
+    # A resolved limit larger than a quarter of the window is capped so the
+    # input budget cannot collapse on small or under-declared windows.
+    capped = ContextBudgetPolicy(
+        context_window_tokens=1_000_000,
+        output_tokens=300_000,
+    )
+    assert capped.output_reserve_tokens == 250_000
+
+    # No resolved limit: the conservative default reserve still applies.
+    defaulted = ContextBudgetPolicy(context_window_tokens=1_000_000)
+    assert defaulted.output_reserve_tokens == 4096
+    assert defaulted.usable_input_tokens == 1_000_000 - 4096 - 256
+
+
 def test_task_plan_is_optional_bounded_and_has_one_in_progress() -> None:
     assert TaskState().plan is None
     plan = TaskPlan(

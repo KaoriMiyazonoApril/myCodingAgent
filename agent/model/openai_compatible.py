@@ -50,6 +50,18 @@ from .types import (
     Usage,
 )
 
+# Official DeepSeek Thinking Mode effort mapping (api-docs.deepseek.com,
+# 2026-09): the API accepts low/high/max only; medium and xhigh are folded
+# onto high.  Only the adapter may know vendor wire semantics, so the mapping
+# lives here rather than in the capability profile.
+_DEEPSEEK_EFFORT_MAPPING = {
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "high",
+    "max": "max",
+}
+
 
 class OpenAICompatibleProvider(LLMProvider):
     """One Chat Completions adapter for DeepSeek, Kimi/Moonshot, and GLM.
@@ -240,8 +252,6 @@ class OpenAICompatibleProvider(LLMProvider):
             payload["temperature"] = request.temperature
         if request.max_tokens is not None:
             payload["max_tokens"] = request.max_tokens
-        elif self.config.max_output_tokens is not None:
-            payload["max_tokens"] = self.config.max_output_tokens
         adapter_body = self._thinking_extra_body(request.thinking)
         if request.extra_body and adapter_body:
             adapter_body = {**request.extra_body, **adapter_body}
@@ -269,19 +279,27 @@ class OpenAICompatibleProvider(LLMProvider):
             return {"reasoning_effort": intensity} if enabled and intensity else None
         if style is ThinkingParameterStyle.KIMI_TOGGLE:
             return {"thinking": {"type": "enabled" if enabled else "disabled"}}
-
-        vendor_thinking: dict[str, object] = {
-            "type": "enabled" if enabled else "disabled"
-        }
+        if style in {ThinkingParameterStyle.DEEPSEEK_V4, ThinkingParameterStyle.GLM}:
+            # Official wire format (2026-09): thinking.type toggles; the
+            # reasoning effort travels as a top-level request parameter.
+            # Neither vendor supports budget_tokens or keep on these styles.
+            vendor_thinking: dict[str, object] = {
+                "type": "enabled" if enabled else "disabled"
+            }
+            result: dict[str, object] = {"thinking": vendor_thinking}
+            if enabled and intensity is not None:
+                mapped = intensity
+                if style is ThinkingParameterStyle.DEEPSEEK_V4:
+                    mapped = _DEEPSEEK_EFFORT_MAPPING.get(intensity, intensity)
+                result["reasoning_effort"] = mapped
+            return result
+        # Generic fallback keeps the full escape hatch for endpoints that
+        # declare extended-thinking support (budget/keep/intensity nesting).
+        vendor_thinking = {"type": "enabled" if enabled else "disabled"}
         if thinking_request.budget_tokens is not None:
             vendor_thinking["budget_tokens"] = thinking_request.budget_tokens
         if thinking_request.keep is not None:
             vendor_thinking["keep"] = thinking_request.keep
-        if style in {ThinkingParameterStyle.DEEPSEEK_V4, ThinkingParameterStyle.GLM}:
-            result: dict[str, object] = {"thinking": vendor_thinking}
-            if enabled and intensity is not None:
-                result["reasoning_effort"] = intensity
-            return result
         if intensity is not None:
             vendor_thinking["intensity"] = intensity
         return {"thinking": vendor_thinking}

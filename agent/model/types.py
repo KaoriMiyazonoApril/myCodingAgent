@@ -152,6 +152,15 @@ class ProviderCapabilities:
     requires_assistant_content_for_tool_calls: bool = False
     thinking: ThinkingCapabilities = field(default_factory=ThinkingCapabilities)
     context_window_tokens: int | None = None
+    # Official model maximum output in tokens.  A hard Capability fact used
+    # only to clamp the resolved request limit; it never becomes an implicit
+    # request default.  None means "not verified" - the provider default
+    # applies and nothing is clamped.
+    model_max_output_tokens: int | None = None
+    # Harness-internal default request output limit in tokens.  A Request
+    # Policy used only when the Thread carries no explicit override; None
+    # means "do not send max_tokens, let the provider default apply".
+    default_request_max_tokens: int | None = None
     # Unknown OpenAI-compatible providers use the conservative user-message
     # envelope.  A trailing system message is an explicit opt-in because
     # provider schemas do not guarantee its semantics after tool history.
@@ -184,6 +193,16 @@ class ProviderCapabilities:
             raise LLMConfigurationError(
                 "context_window_tokens must be a positive integer or None"
             )
+        for name in ("model_max_output_tokens", "default_request_max_tokens"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise LLMConfigurationError(
+                    f"{name} must be a positive integer or None"
+                )
         if not isinstance(self.working_tail_mode, WorkingTailMode):
             try:
                 object.__setattr__(
@@ -227,7 +246,12 @@ class ModelProfile:
     requires_assistant_content_for_tool_calls: bool | None = None
     thinking: ThinkingCapabilities | None = None
     context_window_tokens: int | None | _Unset = _UNSET
-    max_output_tokens: int | None = None
+    # Capability vs policy split: model_max_output_tokens is the officially
+    # verified hard maximum (clamp only); default_request_max_tokens is the
+    # Harness-internal request policy (used only when no explicit override).
+    # None means "not verified / no policy" - never guess.
+    model_max_output_tokens: int | None | _Unset = _UNSET
+    default_request_max_tokens: int | None | _Unset = _UNSET
     working_tail_mode: WorkingTailMode | str | _Unset = _UNSET
     thinking_parameter_style: ThinkingParameterStyle | str | _Unset = _UNSET
 
@@ -260,6 +284,16 @@ class ModelProfile:
                 defaults.context_window_tokens
                 if self.context_window_tokens is _UNSET
                 else self.context_window_tokens
+            ),
+            model_max_output_tokens=(
+                defaults.model_max_output_tokens
+                if self.model_max_output_tokens is _UNSET
+                else self.model_max_output_tokens
+            ),
+            default_request_max_tokens=(
+                defaults.default_request_max_tokens
+                if self.default_request_max_tokens is _UNSET
+                else self.default_request_max_tokens
             ),
             working_tail_mode=(
                 defaults.working_tail_mode
@@ -343,7 +377,6 @@ class ProviderConfig:
     api_key: str = field(repr=False)
     model: str
     timeout: float | None = None
-    max_output_tokens: int | None = None
     capabilities: ProviderCapabilities = field(default_factory=ProviderCapabilities)
 
     def __post_init__(self) -> None:
@@ -374,12 +407,6 @@ class ProviderConfig:
             or self.timeout <= 0
         ):
             raise LLMConfigurationError("timeout must be a positive number")
-        if self.max_output_tokens is not None and (
-            isinstance(self.max_output_tokens, bool)
-            or not isinstance(self.max_output_tokens, int)
-            or self.max_output_tokens <= 0
-        ):
-            raise LLMConfigurationError("max_output_tokens must be a positive integer")
 
 
 @dataclass(slots=True)

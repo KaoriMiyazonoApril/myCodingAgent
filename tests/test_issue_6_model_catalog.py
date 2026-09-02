@@ -131,6 +131,36 @@ def test_provider_adapters_map_unified_thinking_to_documented_payloads() -> None
     }
 
 
+def test_output_capability_and_request_policy_are_split() -> None:
+    # Official hard maximum (capability, clamp-only) and the Harness-internal
+    # request default (policy) are distinct facts for DeepSeek V4 models.
+    deepseek = PROVIDER_PRESETS["deepseek"].capabilities_for("deepseek-v4-pro")
+    assert deepseek.model_max_output_tokens == 384_000
+    assert deepseek.default_request_max_tokens == 131_072
+    assert deepseek.thinking.supports_budget_tokens is False
+
+    flash = PROVIDER_PRESETS["deepseek"].capabilities_for("deepseek-v4-flash")
+    assert flash.model_max_output_tokens == 384_000
+    assert flash.default_request_max_tokens == 131_072
+
+    # Unverified families declare no output facts; provider default applies.
+    for provider_id, model in (
+        ("moonshot", "kimi-k3"),
+        ("moonshot", "kimi-k2.6"),
+        ("glm", "glm-5.3"),
+        ("glm", "glm-5.2"),
+    ):
+        capabilities = PROVIDER_PRESETS[provider_id].capabilities_for(model)
+        assert capabilities.model_max_output_tokens is None
+        assert capabilities.default_request_max_tokens is None
+        assert capabilities.thinking.supports_budget_tokens is False
+
+    # Unknown models are never guessed.
+    unknown = PROVIDER_PRESETS["deepseek"].capabilities_for("deepseek-unknown")
+    assert unknown.model_max_output_tokens is None
+    assert unknown.default_request_max_tokens is None
+
+
 def test_model_catalog_single_flight_timeout_and_safe_status() -> None:
     calls: list[str] = []
     release = asyncio.Event()
