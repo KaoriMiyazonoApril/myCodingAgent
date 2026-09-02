@@ -182,6 +182,7 @@ _TRANSIENT_EVENT_TYPES = frozenset(
         "model_tool_call_delta",
         "model_message_end",
         "model_error",
+        "model_activity",
         "command_output_delta",
     }
 )
@@ -459,6 +460,10 @@ class TurnEventEmitter:
         self._buffer = buffer
         self._reasoning_visibility = reasoning_visibility
         self._terminal_event: AgentEvent | None = None
+        # Low-frequency activity feedback: the last announced phase, used to
+        # emit one "model_activity" event only when the phase actually
+        # changes (thinking / writing / acting / idle).  Never per-token.
+        self._activity_phase: str | None = None
 
     def emit(
         self,
@@ -534,6 +539,14 @@ class TurnEventEmitter:
                 {"iteration": iteration, "text": reasoning},
             )
 
+    def _advance_activity(self, phase: str) -> None:
+        """Announce one phase-change-only activity event (no reasoning text)."""
+
+        if self._activity_phase == phase:
+            return
+        self._activity_phase = phase
+        self.emit("model_activity", {"phase": phase})
+
     def model_delta(
         self,
         event: TextDeltaEvent
@@ -545,11 +558,17 @@ class TurnEventEmitter:
         """Publish provisional model output without constructing history."""
 
         if isinstance(event, TextDeltaEvent):
+            self._advance_activity("writing")
             self.emit("model_text_delta", {"text": event.text})
         elif isinstance(event, ReasoningDeltaEvent):
+            # Raw reasoning stays visibility-gated, but normal Web still needs
+            # an accurate "the model is thinking" signal: announce the phase
+            # once per transition, never the text and never per token.
+            self._advance_activity("thinking")
             if self._reasoning_visibility != "hidden":
                 self.emit("model_reasoning_delta", {"text": event.text})
         elif isinstance(event, ToolCallDeltaEvent):
+            self._advance_activity("acting")
             self.emit(
                 "model_tool_call_delta",
                 {
@@ -560,6 +579,10 @@ class TurnEventEmitter:
                 },
             )
         elif isinstance(event, MessageEndEvent):
+            # One model call is over: close the current activity so the UI can
+            # freeze its duration, and reset so the next call starts fresh.
+            self._advance_activity("idle")
+            self._activity_phase = None
             self.emit(
                 "model_message_end",
                 {

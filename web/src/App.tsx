@@ -39,6 +39,7 @@ import {
   applyAgentEvent,
   eventRequiresSnapshotRefresh,
   hydrateThread,
+  type ActivityState,
   type ApprovalRequest,
 } from "./events";
 import "./styles.css";
@@ -2126,6 +2127,9 @@ function ActiveThreadView({
             />
           ) : null}
         </div>
+        {state.activity !== null ? (
+          <ModelActivityPill activity={state.activity} />
+        ) : null}
         <div className="composer">
           <div className="composer-heading">
             <label htmlFor="agent-composer">询问编码助手</label>
@@ -2505,6 +2509,53 @@ function ConversationFeed({
         </div>
       ) : null}
     </section>
+  );
+}
+
+const ACTIVITY_LABELS: Record<ActivityState["phase"], string> = {
+  thinking: "思考",
+  writing: "生成",
+  acting: "工具调用",
+};
+
+function activitySeconds(activity: ActivityState, now: number): number {
+  const started = Date.parse(activity.since);
+  const anchorStart = Number.isFinite(started) ? started : now;
+  const endedAt =
+    activity.finished && activity.ended_at !== undefined
+      ? Date.parse(activity.ended_at)
+      : Number.NaN;
+  const anchorEnd = Number.isFinite(endedAt) ? endedAt : now;
+  return Math.max(0, anchorEnd - anchorStart) / 1000;
+}
+
+function ModelActivityPill({ activity }: { activity: ActivityState }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (activity.finished) {
+      return;
+    }
+    const timer = window.setInterval(() => setNow(Date.now()), 100);
+    return () => window.clearInterval(timer);
+  }, [activity.finished]);
+
+  const seconds = activitySeconds(activity, now);
+  const label = ACTIVITY_LABELS[activity.phase];
+  const className = `model-activity model-activity-${activity.phase}${
+    activity.finished ? " model-activity-finished" : ""
+  }`;
+  return (
+    <div className={className} role="status" aria-live="polite">
+      {activity.finished ? (
+        <span>
+          {label} · {seconds.toFixed(1)}s
+        </span>
+      ) : (
+        <span className="model-activity-live">
+          {label}中… {seconds.toFixed(1)}s
+        </span>
+      )}
+    </div>
   );
 }
 

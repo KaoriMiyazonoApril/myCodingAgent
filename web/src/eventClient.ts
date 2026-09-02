@@ -26,6 +26,7 @@ const EVENT_TYPES = [
   "turn_started",
   "model_text_delta",
   "model_reasoning_delta",
+  "model_activity",
   "model_tool_call_delta",
   "model_message_end",
   "model_error",

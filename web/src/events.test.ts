@@ -606,3 +606,76 @@ test("keeps rejection detail and carries busy codes verbatim", () => {
     detail: "workspace overlaps an active Turn: /workspace",
   });
 });
+
+function activityEvent(
+  type: string,
+  payload: Record<string, unknown>,
+  suffix = "",
+): AgentEvent {
+  return {
+    schema_version: 1,
+    event_id: `${type}-id${suffix}`,
+    thread_id: "thread-1",
+    turn_id: "turn-1",
+    sequence: 1,
+    type,
+    timestamp: "2026-08-29T00:00:01Z",
+    payload,
+  };
+}
+
+test("model_activity tracks phase changes with a stable since and no text", () => {
+  let state = hydrateThread(view());
+  state = applyAgentEvent(
+    state,
+    activityEvent("turn_started", { user_message: "继续" }),
+  );
+  expect(state.activity).toBeNull();
+
+  state = applyAgentEvent(state, activityEvent("model_activity", { phase: "thinking" }));
+  expect(state.activity).toEqual({
+    phase: "thinking",
+    since: "2026-08-29T00:00:01Z",
+    finished: false,
+  });
+
+  // A stray duplicate of the live phase must not restart the timer.
+  const duplicate = applyAgentEvent(
+    state,
+    activityEvent("model_activity", { phase: "thinking" }, "-dup"),
+  );
+  expect(duplicate.activity).toEqual(state.activity);
+
+  state = applyAgentEvent(state, activityEvent("model_activity", { phase: "writing" }, "-2"));
+  expect(state.activity?.phase).toBe("writing");
+  expect(state.activity?.finished).toBe(false);
+
+  // "idle" freezes the last active phase with its ending timestamp.
+  state = applyAgentEvent(state, activityEvent("model_activity", { phase: "idle" }, "-idle"));
+  expect(state.activity).toEqual({
+    phase: "writing",
+    since: "2026-08-29T00:00:01Z",
+    finished: true,
+    ended_at: "2026-08-29T00:00:01Z",
+  });
+
+  // A fresh model call starts a new live activity after "idle".
+  state = applyAgentEvent(state, activityEvent("model_activity", { phase: "thinking" }, "-3"));
+  expect(state.activity).toEqual({
+    phase: "thinking",
+    since: "2026-08-29T00:00:01Z",
+    finished: false,
+  });
+});
+
+test("model_activity resets when the next turn starts", () => {
+  let state = hydrateThread(view());
+  state = applyAgentEvent(state, activityEvent("model_activity", { phase: "thinking" }));
+  expect(state.activity?.phase).toBe("thinking");
+
+  state = applyAgentEvent(
+    state,
+    activityEvent("turn_started", { user_message: "再来一轮" }, "-2"),
+  );
+  expect(state.activity).toBeNull();
+});

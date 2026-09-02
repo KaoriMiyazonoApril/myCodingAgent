@@ -1238,7 +1238,46 @@ textarea:disabled {
 .approval-actions {
   display: flex;
   flex: 0 0 auto;
+  align-items: center;
   gap: 8px;
+}
+
+/* Both approval buttons share one box: identical padding (the shared
+   primary-button rule carries a stray 14px top margin and wider padding),
+   identical min-width and centered text, so 批准/拒绝 always match. */
+.approval-actions button {
+  min-width: 84px;
+  padding: 0 14px;
+  justify-content: center;
+  text-align: center;
+}
+
+.approval-actions .primary-button {
+  margin-top: 0;
+}
+
+/* Phase-change-only model activity feedback, e.g. "思考中… 12.3s". */
+.model-activity {
+  display: block;
+  width: fit-content;
+  margin: 0 auto 10px;
+  padding: 3px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgb(17 27 46 / 60%);
+  font-size: 12px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.model-activity-thinking:not(.model-activity-finished) {
+  border-color: rgb(255 184 77 / 50%);
+  color: rgb(255 210 140);
+}
+
+.model-activity-finished {
+  opacity: 0.85;
 }
 
 .conversation-file-card {

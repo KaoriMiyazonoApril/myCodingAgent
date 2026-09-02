@@ -65,6 +65,20 @@ export type ProvisionalAssistant = {
   message_end: boolean;
 };
 
+// Phase-change-only model activity (normal Web never receives raw reasoning).
+// Backend announces each phase at most once per transition.
+export type ActivityPhase = "thinking" | "writing" | "acting";
+
+export type ActivityState = {
+  phase: ActivityPhase;
+  /** ISO timestamp when the phase began (the announcing event's timestamp). */
+  since: string;
+  /** True once the model call ended ("idle"); UI freezes the duration. */
+  finished: boolean;
+  /** ISO timestamp of the terminating "idle" event, when finished. */
+  ended_at?: string;
+};
+
 export type FileChange = {
   path: string;
   change_type: string;
@@ -80,6 +94,7 @@ export type EventState = {
   cancel_requested: boolean;
   approval: ApprovalRequest | null;
   provisional: ProvisionalAssistant | null;
+  activity: ActivityState | null;
   seen_event_ids: string[];
   skills: ThreadSkills;
 };
@@ -104,6 +119,7 @@ export function hydrateThread(view: ThreadView): EventState {
     cancel_requested: false,
     approval: null,
     provisional: null,
+    activity: null,
     seen_event_ids: [],
     skills: normalizeSkills(view.snapshot.skills),
   };
@@ -165,6 +181,7 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
             ...state.provisional,
             tool_calls: state.provisional.tool_calls.map((call) => ({ ...call })),
           },
+    activity: state.activity,
     seen_event_ids: [...state.seen_event_ids, event.event_id],
     skills: {
       schema_version: state.skills.schema_version,
@@ -201,9 +218,29 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
       tool_calls: [],
       message_end: false,
     };
+    next.activity = null;
     const text = event.payload.user_message;
     if (typeof text === "string") {
       next.messages.push({ id: event.event_id, role: "user", text });
+    }
+  } else if (event.type === "model_activity") {
+    const phase = event.payload.phase;
+    if (phase === "thinking" || phase === "writing" || phase === "acting") {
+      // Phase-change-only semantics: a stray duplicate of the live phase must
+      // not restart the duration timer.
+      if (next.activity?.phase !== phase || next.activity.finished) {
+        next.activity = {
+          phase,
+          since: event.timestamp,
+          finished: false,
+        };
+      }
+    } else if (phase === "idle" && next.activity !== null) {
+      next.activity = {
+        ...next.activity,
+        finished: true,
+        ended_at: event.timestamp,
+      };
     }
   } else if (event.type === "model_response") {
     next.provisional = null;
@@ -260,6 +297,13 @@ export function applyAgentEvent(state: EventState, event: AgentEvent): EventStat
           ? event.payload.message
           : "模型流式响应失败",
     };
+    if (next.activity !== null && !next.activity.finished) {
+      next.activity = {
+        ...next.activity,
+        finished: true,
+        ended_at: event.timestamp,
+      };
+    }
   } else if (event.type === "tool_requested") {
     const call = event.payload.tool_call;
     if (isRecord(call) && typeof call.id === "string") {

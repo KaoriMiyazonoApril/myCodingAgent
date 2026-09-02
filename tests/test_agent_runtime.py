@@ -1617,18 +1617,28 @@ def test_reasoning_delta_gating_follows_visibility(tmp_path, visibility) -> None
     summary = asyncio.run(runtime.run_turn(thread.thread_id, "Answer."))
 
     assert summary.status is TurnStatus.COMPLETED
-    event_types = [
-        event.type for event in runtime.get_events(thread.thread_id).events
-    ]
+    events = runtime.get_events(thread.thread_id).events
+    event_types = [event.type for event in events]
     if visibility == "hidden":
         assert "model_reasoning_delta" not in event_types
     else:
         reasoning_deltas = [
             event.payload["text"]
-            for event in runtime.get_events(thread.thread_id).events
+            for event in events
             if event.type == "model_reasoning_delta"
         ]
         assert reasoning_deltas == ["private reasoning text"]
+    # Activity feedback is phase-change-only and carries no reasoning text:
+    # one "thinking", one "writing" (first text), one "idle" (response end).
+    activity_phases = [
+        event.payload["phase"]
+        for event in events
+        if event.type == "model_activity"
+    ]
+    assert activity_phases == ["thinking", "writing", "idle"]
+    assert all(
+        "text" not in event.payload for event in events if event.type == "model_activity"
+    )
     # Provider continuity survives the public hiding: the next-turn canonical
     # history keeps the ReasoningBlock even under "hidden".
     turn2 = asyncio.run(runtime.run_turn(thread.thread_id, "Continue."))
